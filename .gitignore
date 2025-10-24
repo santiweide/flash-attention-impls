@@ -4,3 +4,6 @@
 *.out
 hwj*
 .DS_Store
+*.blg
+*.bbl
+*.pdf
