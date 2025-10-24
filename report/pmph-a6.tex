@@ -1,15 +1,14 @@
-% This must be in the first 5 lines to tell arXiv to use pdfLaTeX, which is strongly recommended.
 \pdfoutput=1
-% In particular, the hyperref package requires pdfLaTeX in order to break URLs across lines.
 
 \documentclass[11pt]{article}
 
 
-% Standard package includes
 \usepackage{times}
 \usepackage{latexsym}
 \usepackage{amsmath}
 
+\usepackage{algorithm}
+\usepackage{algorithmic}
 
 \usepackage[T1]{fontenc}
 
@@ -21,14 +20,22 @@
 
 \usepackage{graphicx}
 
+\usepackage{natbib}
+% for citation commands in the .tex, authors can use:
+% \citep, \citet, and \citeyearpar for compatibility with natbib, or
+% \cite, \newcite, and \shortcite for compatibility with older ACL .sty files
+\renewcommand\cite{\citep}  % to get "(Author Year)" with natbib
+\newcommand\shortcite{\citeyearpar}% to get "(Year)" with natbib
+\newcommand\newcite{\citet} % to get "Author (Year)" with natbib
+\newcommand{\citeposs}[1]{\citeauthor{#1}'s (\citeyear{#1})} % to get "Author's (Year)"
+
+\bibliographystyle{acl_natbib}
 
 
-% Listings package for code rendering (No external dependencies)
 \usepackage{listings}  
-\usepackage{xcolor}   % Color support
-\usepackage{tcolorbox} % Box for better appearance
+\usepackage{xcolor} 
+\usepackage{tcolorbox} 
 
-% Define custom colors for code highlighting
 \definecolor{codegreen}{rgb}{0,0.6,0}
 \definecolor{codegray}{rgb}{0.5,0.5,0.5}
 \definecolor{codepurple}{rgb}{0.58,0,0.82}
@@ -83,9 +90,55 @@
 \begin{document}
 \maketitle
 
+\section{Problem Statement}
+
+Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention}. In this report, we implement Flash Attention 1(FA1) forward calculation with different Domain Specific Languages(DSLs).
+
+For \textbf{evaluation metrics}, we focus on Latency speed up across different DSLs, compute efficiency, memory efficiency and throughput.
+
+Latency speedup is assessed using kernel runtime of the execution time $(T)$ of the self-attention forward. Here we choose Baseline as TODO: 
+
+$$\text{Speedup} = \frac{T_{\text{Base}}}{T_{\text{FlashAttention}}}.$$
+
+For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPs): 
+
+$$\text{Achieved TFLOPs} = \frac{\text{Total Floating-Point operations in FA1}}{T_{\text{Execution Time}}}$$.
+
+We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we are using the GPU compute resource efficiently.
+
+For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
+
+$$\text{Achieved Bandwidth} = \frac{\text{Total runtime bandwidth in FA1}}{T_{\text{Execution Time}}}$$.
+
+For throughput we use maximum input batch size with fixed other parameters. This is a more request-oriented index and more end-to-end in Transformer-like model serving.
+
+
+ \begin{comment}
+\begin{algorithm}[htbp]
+  \caption{Standard Attention}
+  \label{alg:standard_attention}
+  \begin{algorithmic}[1]
+    \STATE Load $Q$ and $K$ by blocks from HBM.
+    \STATE Compute $S = (1/\sqrt{d})QK^T$ (GEMM-I).
+    \STATE Write $S$ to HBM.
+    \STATE Read $S$ from HBM.
+    \STATE Compute $S = S - \text{rowmax}(S)$.
+    \STATE Compute $P = \text{softmax}(S)$.
+    \STATE Write $P$ to HBM.
+    \STATE Load $P$ and $V$ by blocks from HBM.
+    \STATE Compute $O = PV$ (GEMM-II).
+    \STATE Write $O$ to HBM.
+  \end{algorithmic}
+\end{algorithm}
+\end{comment}
+
 \section{DSL XX by Your Name TODO}
 \section{DSL XX by Your Name TODO}
 \section{DSL XX by Your Name TODO}
 \section{DSL XX by Your Name TODO}
+
+
+\bibliography{custom}
+
 
 \end{document}

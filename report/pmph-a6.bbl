@@ -1,0 +1,12 @@
+\begin{thebibliography}{1}
+\providecommand{\natexlab}[1]{#1}
+
+\bibitem[{Dao et~al.(2022)Dao, Fu, Ermon, Rudra, and
+  R{\'e}}]{dao2022flashattention}
+Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher R{\'e}. 2022.
+\newblock Flashattention: Fast and memory-efficient exact attention with
+  io-awareness.
+\newblock \emph{Advances in neural information processing systems},
+  35:16344--16359.
+
+\end{thebibliography}
