@@ -108,7 +108,7 @@ We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we
 
 For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
 
-$$\text{Achieved Bandwidth} = \frac{\text{Total runtime bandwidth in FA1}}{T_{\text{Execution Time}}}$$.
+$$\text{Achieved Bandwidth} = \frac{\text{Total runtime memory access in FA1}}{T_{\text{Execution Time}}}$$.
 
 For throughput we use maximum input batch size with fixed other parameters. This is a more request-oriented index and more end-to-end in Transformer-like model serving.
 
