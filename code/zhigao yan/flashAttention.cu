@@ -14,16 +14,17 @@ __global__ void flash_attention_forward(
     if (b >= B || h >= H) return;
 
     int Bc = (int)ceilf((float)M / (4.0f * (float)d));
-    int Br = min(Bc, d);
+    int Br = (Bc < d) ? Bc : d;
 
     int Tr = (N + Br - 1) / Br;
     int Tc = (N + Bc - 1) / Bc;
+
 
     int tile = blockIdx.x;
     if (tile >= Tr) return;
 
     int qi_start = tile * Br;
-    int br_size  = min(Br, N - qi_start);
+    int br_size  = (Br < N - qi_start) ? Br : (N - qi_start);
 
     size_t offset = ((size_t)b * H + h) * (size_t)N * (size_t)d;
     size_t seq_offset  = ((size_t)b * H + h) * (size_t)N;
@@ -43,15 +44,15 @@ __global__ void flash_attention_forward(
     }
     __syncthreads();
 
-    extern __shared__ float memo[];
-    float* Qi = memo;
+    extern __shared__ float shared_mem[];
+    float* Qi = shared_mem;
     float* Kj = Qi + Br * d;
     float* Vj = Kj + Bc * d;
 
 
     for (int j = 0; j < Tc; ++j) {
         int kj_start = j * Bc;
-        int bc_size  = min(Bc, N - kj_start);
+        int bc_size  = (Bc < N - kj_start) ? Bc : (N - kj_start);
         if (bc_size <= 0) break;
 
         for (int t = threadIdx.x; t < bc_size * d; t += blockDim.x) {
@@ -61,47 +62,60 @@ __global__ void flash_attention_forward(
         }
         __syncthreads();
 
-        float q_reg[128];  
+
         for (int r = threadIdx.x; r < br_size; r += blockDim.x) {
             int gi = qi_start + r;
-            for (int t = 0; t < d; ++t) q_reg[t] = Q_bh[gi*d + t];  
+            
 
-            float m_row = m_bh[gi];  
-            float l_row = l_bh[gi];  
-            float O_reg[128];       
-            for (int t = 0; t < d; ++t) O_reg[t] = O_bh[gi*d + t];
+            float q_row[64];
+            for (int t = 0; t < d; ++t) q_row[t] = Q_bh[gi*d + t];
 
-            float s_cache[128]; 
-            float m_til = -INFINITY;
+
+            float m_row = m_bh[gi];
+            float l_row = l_bh[gi];
+            float O_row[64];
+            for (int t = 0; t < d; ++t) O_row[t] = O_bh[gi*d + t];
+
+
+            float s_scores[128];
+            float m_til = -1e9f;
             for (int c = 0; c < bc_size; ++c) {
-                float s = 0.f;
-                for (int t = 0; t < d; ++t) s += q_reg[t] * Kj[c*d + t];
-                s_cache[c] = s;
+                float s = 0.0f;
+                for (int t = 0; t < d; ++t) {
+                    s += q_row[t] * Kj[c*d + t];
+                }
+                s_scores[c] = s;
                 if (s > m_til) m_til = s;
             }
 
-            float l_til = 0.f;
-            for (int c = 0; c < bc_size; ++c)
-                l_til += expf(s_cache[c] - m_til);
 
-            float m_new = (m_row > m_til) ? m_row : m_til;
+            float P_til[128];
+            float l_til = 0.0f;
+            for (int c = 0; c < bc_size; ++c) {
+                P_til[c] = expf(s_scores[c] - m_til);
+                l_til += P_til[c];
+            }
+
+            
+            float m_new = fmaxf(m_row, m_til);
+
+
             float a = expf(m_row - m_new);
             float b = expf(m_til - m_new);
             float l_new = a * l_row + b * l_til;
 
+            
             for (int col = 0; col < d; ++col) {
-                float acc = 0.f;
-                for (int c = 0; c < bc_size; ++c)
-                    acc += expf(s_cache[c] - m_til) * Vj[c*d + col]; 
-                O_reg[col] = (a * l_row * O_reg[col] + b * acc) / l_new;
+                float acc = 0.0f;
+                for (int c = 0; c < bc_size; ++c) {
+                    acc += P_til[c] * Vj[c*d + col];
+                }
+                O_row[col] = (a * l_row * O_row[col] + b * acc) / l_new;
             }
 
-            m_row = m_new;
-            l_row = l_new;
-
-            for (int t = 0; t < d; ++t) O_bh[gi*d + t] = O_reg[t];
-            l_bh[gi] = l_row;
-            m_bh[gi] = m_row;
+            for (int t = 0; t < d; ++t) O_bh[gi*d + t] = O_row[t];
+            l_bh[gi] = l_new;
+            m_bh[gi] = m_new;
         }
         __syncthreads();
     }
@@ -116,12 +130,12 @@ int main(int argc, char** argv) {
     int runs = (argc>6)? atoi(argv[6]) : 50;
 
     int Bc = (int)ceilf((float)M / (4.0f * (float)d));
-    int Br = (Bc < d ? Bc : d);
+    int Br = (Bc < d) ? Bc : d;
     int Tr = (N + Br - 1) / Br;
 
     dim3 grid(Tr, B*H);
     dim3 block(Br);
-    size_t shmem = (size_t)(Br*d + Bc*d + Bc*d + Br*d + Br + Br) * sizeof(float);
+    size_t shmem = (size_t)(Br*d + Bc*d + Bc*d) * sizeof(float);
 
 
     size_t size_QKV = (size_t)B * H * N * d * sizeof(float);
