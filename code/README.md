@@ -22,7 +22,7 @@ readlink -f my-tools/nsight_compute//pkg/ncu #verification of the path of ncu
 echo 'export PATH=$HOME/my-tools/nsight_compute/pkg:$PATH' >> ~/.bashrc
 module load cuda
 nvcc -o matmul_app matmul.cu -lineinfo
-ncu ./matmul_app # 验证是不是撞上了ncu
+ncu ./matmul_app # 验证是不是装上了ncu
 ```
 
 
