@@ -265,20 +265,31 @@ void run_test(const TestConfig& config) {
         printf("\n❌ TEST FAILED (Flash vs Ref error >= %.1f%%)\n", error_threshold * 100);
     }
     
-    // 计算FLOPs
+    // 计算FLOPs和内存带宽
     const int64_t flops = 4LL * config.batch_size * config.num_heads * 
                           config.seq_len * config.seq_len * config.head_dim;
+    const float gflops = flops / 1e9;  // GFLOPs
     const float tflops_baseline = flops / (time_baseline * 1e-3) / 1e12;
     const float tflops_ref = flops / (time_ref * 1e-3) / 1e12;
     const float tflops_flash = flops / (time_flash * 1e-3) / 1e12;
+    
+    // 计算内存带宽利用 (粗略估计)
+    // Q, K, V的读取 + O的写入 = 4 * bytes
+    const size_t memory_ops = 4 * qkv_size * sizeof(cutlass::half_t);
+    const float bandwidth_flash = memory_ops / (time_flash * 1e-3) / 1e9;  // GB/s
     
     printf("\n");
     printf("================================================================================\n");
     printf("Throughput:\n");
     printf("================================================================================\n");
+    printf("Total FLOPs:       %.2f GFLOPs (%.2f million ops)\n", gflops, gflops * 1000);
     printf("Baseline (Naive):  %.2f TFLOPs/s\n", tflops_baseline);
     printf("Reference (Tiled): %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
     printf("Flash Attention:   %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
+    printf("\nMemory Bandwidth:\n");
+    printf("Flash Attention:   %.2f GB/s (A100 HBM peak: ~1555 GB/s)\n", bandwidth_flash);
+    printf("\nNote: Attention is memory-bound. Low TFLOPs is expected for small problems.\n");
+    printf("      To see higher TFLOPs, use larger batch sizes or longer sequences.\n");
     
     // 清理
     CHECK_CUDA(cudaFree(d_Q));
@@ -649,10 +660,12 @@ int main() {
     
     // 测试用例
     std::vector<TestConfig> configs = {
-        {1, 1, 128, 64},    // 小规模
-        {1, 1, 512, 64},    // 中等规模
-        {1, 1, 1024, 64},   // 大规模
-        {2, 8, 512, 64},    // 多batch, 多head
+        {1, 1, 128, 64},     // 小规模 (warm up)
+        {1, 1, 512, 64},     // 中等规模
+        {1, 1, 1024, 64},    // 大规模
+        {2, 8, 512, 64},     // 多batch, 多head
+        {8, 12, 1024, 64},   // 更大规模 (类似BERT-Base)
+        {16, 16, 2048, 64},  // 极大规模 (GPT规模，如果内存够的话)
     };
     
     for (const auto& config : configs) {
