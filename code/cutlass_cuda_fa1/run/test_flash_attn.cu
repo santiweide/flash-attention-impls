@@ -330,11 +330,29 @@ void attention_reference(
     
     size_t smem_size = threads * seq_len * sizeof(float);
     
+    // Set shared memory limit if needed (like Flash Attention does)
+    if (smem_size > 48 * 1024) {  // If exceeds default 48KB
+        cudaFuncSetAttribute(
+            attention_reference_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size
+        );
+    }
+    
     attention_reference_kernel<<<grid, block, smem_size, stream>>>(
         Q, K, V, O,
         softmax_scale,
         batch_size, num_heads, seq_len, head_dim
     );
+    
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Reference kernel launch failed: %s\n", 
+                cudaGetErrorString(err));
+        fprintf(stderr, "  Grid: (%d, %d, %d), Block: (%d), Shared mem: %zu bytes (%.1f KB)\n",
+                grid.x, grid.y, grid.z, block.x, smem_size, smem_size / 1024.0);
+    }
 }
 
 // ==================== Main ====================
