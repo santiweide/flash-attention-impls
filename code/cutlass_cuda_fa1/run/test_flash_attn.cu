@@ -78,6 +78,7 @@ void init_random(cutlass::half_t* data, size_t size, float mean = 0.0f, float st
 }
 
 // 计算两个数组的最大相对误差
+// 使用对称的相对误差公式，对近零值更稳健: |a-b| / (|a| + |b| + eps)
 float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t* b, size_t size) {
     std::vector<cutlass::half_t> host_a(size), host_b(size);
     CHECK_CUDA(cudaMemcpy(host_a.data(), a, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
@@ -85,19 +86,24 @@ float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t
     
     float max_error = 0.0f;
     int error_count = 0;
-    const float threshold = 1e-2;
+    const float error_threshold = 0.01f;  // 1% 相对误差阈值
+    const float epsilon = 1e-5f;          // 防止除零
     
     for (size_t i = 0; i < size; i++) {
         float val_a = float(host_a[i]);
         float val_b = float(host_b[i]);
         float abs_diff = std::abs(val_a - val_b);
-        float rel_error = abs_diff / (std::abs(val_b) + 1e-8f);
         
-        if (rel_error > threshold) {
+        // 对称的相对误差: |a-b| / (|a| + |b| + eps)
+        // 这个公式对近零值更稳健，且有界 [0, 1)
+        float denominator = std::abs(val_a) + std::abs(val_b) + epsilon;
+        float rel_error = abs_diff / denominator;
+        
+        if (rel_error > error_threshold) {
             error_count++;
             if (error_count <= 10) {  // 只打印前10个错误
-                printf("Error at %zu: flash=%.6f, ref=%.6f, rel_err=%.6f\n",
-                       i, val_a, val_b, rel_error);
+                printf("Error at %zu: flash=%.6f, ref=%.6f, abs_diff=%.6f, rel_err=%.6f\n",
+                       i, val_a, val_b, abs_diff, rel_error);
             }
         }
         max_error = std::max(max_error, rel_error);
@@ -208,10 +214,10 @@ void run_test(const TestConfig& config) {
     printf("Flash Attention:  %.3f ms\n", time_flash);
     printf("Reference:        %.3f ms\n", time_ref);
     printf("Speedup:          %.2fx\n", time_ref / time_flash);
-    printf("Max Relative Err: %.6f\n", max_error);
+    printf("Max Rel Error:    %.6f (symmetric formula: |a-b|/(|a|+|b|+eps))\n", max_error);
     
-    // 判断是否通过
-    const float error_threshold = 0.05f;  // 5% 相对误差
+    // 判断是否通过 (FP16精度下1-2%的误差是可以接受的)
+    const float error_threshold = 0.02f;  // 2% 误差阈值
     if (max_error < error_threshold) {
         printf("\n✅ TEST PASSED (error < %.1f%%)\n", error_threshold * 100);
     } else {
