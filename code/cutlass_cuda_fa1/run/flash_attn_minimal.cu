@@ -143,8 +143,8 @@ __device__ void gemm_nt(const T* A, const T* B, float* C, int lda, int ldb, int 
         float sum = 0.0f;
         #pragma unroll 8
         for (int k = 0; k < K; k++) {
-            float a_val = __half2float(A[i * lda + k]);
-            float b_val = __half2float(B[j * ldb + k]);
+            float a_val = float(A[i * lda + k]);
+            float b_val = float(B[j * ldb + k]);
             sum += a_val * b_val;
         }
         C[i * ldc + j] = sum;
@@ -167,10 +167,10 @@ __device__ void gemm_nn(const float* A, const T* B, T* C, int lda, int ldb, int 
         #pragma unroll 8
         for (int k = 0; k < K; k++) {
             float a_val = A[i * lda + k];
-            float b_val = __half2float(B[k * ldb + j]);
+            float b_val = float(B[k * ldb + j]);
             sum += a_val * b_val;
         }
-        C[i * ldc + j] = __float2half(sum);
+        C[i * ldc + j] = T(sum);
     }
     __syncthreads();
 }
@@ -332,7 +332,7 @@ __global__ void flash_attention_kernel(
                 float sum = 0.0f;
                 const float* P_row = shared_mem.P + i * kBlockN;
                 for (int j = 0; j < k_size; j++) {
-                    sum += P_row[j] * __half2float(shared_mem.V[j * kHeadDim + d]);
+                    sum += P_row[j] * float(shared_mem.V[j * kHeadDim + d]);
                 }
                 O_accum[i * kHeadDim + d] += sum;
             }
@@ -345,7 +345,7 @@ __global__ void flash_attention_kernel(
         float scale = safe_divide(1.0f, l_shared[i]);
         for (int d = tid; d < head_dim; d += blockDim.x) {
             float val = O_accum[i * kHeadDim + d] * scale;
-            O_ptr[(q_start + i) * head_dim + d] = __float2half(val);
+            O_ptr[(q_start + i) * head_dim + d] = cutlass::half_t(val);
         }
     }
 }

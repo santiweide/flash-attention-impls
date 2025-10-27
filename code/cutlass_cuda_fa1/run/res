@@ -1,0 +1,143 @@
+==========================================
+Minimal Flash Attention - Quick Start
+==========================================
+
+[0;32m✓[0m CUDA found: 12.8
+[0;32m✓[0m GPU detected: NVIDIA A100-SXM4-40GB
+  Using CUDA architecture: -arch=sm_80
+[0;32m✓[0m Cutlass found at ../csrc/cutlass
+
+==========================================
+Building...
+==========================================
+Using Makefile build system...
+rm -f test_flash_attn *.o
+Compiling test_flash_attn...
+CUDA Architecture: -arch=sm_80
+Cutlass Include: ../csrc/cutlass/include
+nvcc -arch=sm_80 -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda -I../csrc/cutlass/include -I. --use_fast_math -o test_flash_attn test_flash_attn.cu flash_attn_minimal.cu
+Build complete: ./test_flash_attn
+[0;32m✓[0m Build successful!
+
+==========================================
+Running tests...
+==========================================
+
+Flash Attention Minimal Implementation Test
+================================================================================
+GPU: NVIDIA A100-SXM4-40GB
+Compute Capability: 8.0
+================================================================================
+
+================================================================================
+Config: batch=1, heads=1, seqlen=128, headdim=64
+================================================================================
+Memory: 0.02 MB per tensor, 0.06 MB total
+Initializing inputs...
+Running Flash Attention...
+Running Reference Implementation...
+
+Verifying correctness...
+
+--------------------------------------------------------------------------------
+Results:
+--------------------------------------------------------------------------------
+Flash Attention:  0.003 ms
+Reference:        0.000 ms
+Speedup:          0.07x
+Max Relative Err: 0.000000
+
+✅ TEST PASSED (error < 5.0%)
+
+Throughput:
+Flash Attention: 1.49 TFLOPs/s
+Reference:       20.27 TFLOPs/s
+
+================================================================================
+Config: batch=1, heads=1, seqlen=512, headdim=64
+================================================================================
+Memory: 0.06 MB per tensor, 0.25 MB total
+Initializing inputs...
+Running Flash Attention...
+Running Reference Implementation...
+
+Verifying correctness...
+
+--------------------------------------------------------------------------------
+Results:
+--------------------------------------------------------------------------------
+Flash Attention:  0.003 ms
+Reference:        0.000 ms
+Speedup:          0.10x
+Max Relative Err: 0.000000
+
+✅ TEST PASSED (error < 5.0%)
+
+Throughput:
+Flash Attention: 19.23 TFLOPs/s
+Reference:       186.85 TFLOPs/s
+
+================================================================================
+Config: batch=1, heads=1, seqlen=1024, headdim=64
+================================================================================
+Memory: 0.12 MB per tensor, 0.50 MB total
+Initializing inputs...
+Running Flash Attention...
+Running Reference Implementation...
+
+Verifying correctness...
+
+--------------------------------------------------------------------------------
+Results:
+--------------------------------------------------------------------------------
+Flash Attention:  0.003 ms
+Reference:        0.000 ms
+Speedup:          0.11x
+Max Relative Err: 0.000000
+
+✅ TEST PASSED (error < 5.0%)
+
+Throughput:
+Flash Attention: 86.43 TFLOPs/s
+Reference:       758.94 TFLOPs/s
+
+================================================================================
+Config: batch=2, heads=8, seqlen=512, headdim=64
+================================================================================
+Memory: 1.00 MB per tensor, 4.00 MB total
+Initializing inputs...
+Running Flash Attention...
+Running Reference Implementation...
+
+Verifying correctness...
+
+--------------------------------------------------------------------------------
+Results:
+--------------------------------------------------------------------------------
+Flash Attention:  0.003 ms
+Reference:        0.000 ms
+Speedup:          0.12x
+Max Relative Err: 0.000000
+
+✅ TEST PASSED (error < 5.0%)
+
+Throughput:
+Flash Attention: 347.57 TFLOPs/s
+Reference:       2948.22 TFLOPs/s
+
+================================================================================
+All tests completed!
+
+==========================================
+Done!
+==========================================
+
+To rebuild:
+  build_and_run.sh
+
+To use CMake:
+  build_and_run.sh cmake
+
+To clean:
+  make clean
+  rm -rf build/

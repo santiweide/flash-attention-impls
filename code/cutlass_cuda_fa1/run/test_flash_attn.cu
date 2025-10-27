@@ -151,11 +151,9 @@ struct TestConfig {
 
 void run_test(const TestConfig& config) {
     printf("\n");
-    printf("=" * 80);
-    printf("\n");
+    printf("================================================================================\n");
     config.print();
-    printf("=" * 80);
-    printf("\n");
+    printf("================================================================================\n");
     
     const size_t qkv_size = config.get_qkv_size();
     const size_t bytes = qkv_size * sizeof(cutlass::half_t);
@@ -204,10 +202,9 @@ void run_test(const TestConfig& config) {
     
     // 输出结果
     printf("\n");
-    printf("-" * 80);
-    printf("\nResults:\n");
-    printf("-" * 80);
-    printf("\n");
+    printf("--------------------------------------------------------------------------------\n");
+    printf("Results:\n");
+    printf("--------------------------------------------------------------------------------\n");
     printf("Flash Attention:  %.3f ms\n", time_flash);
     printf("Reference:        %.3f ms\n", time_ref);
     printf("Speedup:          %.2fx\n", time_ref / time_flash);
@@ -279,8 +276,8 @@ __global__ void attention_reference_kernel(
     for (int k_idx = 0; k_idx < seq_len; k_idx++) {
         float sum = 0.0f;
         for (int d = 0; d < head_dim; d++) {
-            float q_val = __half2float(Q_ptr[q_idx * head_dim + d]);
-            float k_val = __half2float(K_ptr[k_idx * head_dim + d]);
+            float q_val = float(Q_ptr[q_idx * head_dim + d]);
+            float k_val = float(K_ptr[k_idx * head_dim + d]);
             sum += q_val * k_val;
         }
         my_scores[k_idx] = sum * softmax_scale;
@@ -306,10 +303,10 @@ __global__ void attention_reference_kernel(
     for (int d = 0; d < head_dim; d++) {
         float sum = 0.0f;
         for (int k_idx = 0; k_idx < seq_len; k_idx++) {
-            float v_val = __half2float(V_ptr[k_idx * head_dim + d]);
+            float v_val = float(V_ptr[k_idx * head_dim + d]);
             sum += my_scores[k_idx] * v_val;
         }
-        O_ptr[q_idx * head_dim + d] = __float2half(sum);
+        O_ptr[q_idx * head_dim + d] = cutlass::half_t(sum);
     }
 }
 
@@ -344,8 +341,7 @@ void attention_reference(
 
 int main() {
     printf("Flash Attention Minimal Implementation Test\n");
-    printf("=" * 80);
-    printf("\n");
+    printf("================================================================================\n");
     
     // GPU信息
     int device;
@@ -354,8 +350,7 @@ int main() {
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
     printf("GPU: %s\n", prop.name);
     printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
-    printf("=" * 80);
-    printf("\n");
+    printf("================================================================================\n");
     
     // 测试用例
     std::vector<TestConfig> configs = {
@@ -370,8 +365,7 @@ int main() {
     }
     
     printf("\n");
-    printf("=" * 80);
-    printf("\n");
+    printf("================================================================================\n");
     printf("All tests completed!\n");
     
     return 0;
