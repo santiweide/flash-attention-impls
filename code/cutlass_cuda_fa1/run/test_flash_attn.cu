@@ -18,8 +18,21 @@
 #include <cmath>
 #include <chrono>
 
-// 声明Flash Attention接口
+// 声明Flash Attention接口 (head_dim=64)
 void flash_attention_forward(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
+
+// 声明Flash Attention接口 (head_dim=32, 优化版)
+void flash_attention_forward_dim32(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -46,6 +59,18 @@ void attention_baseline(
 
 // 声明参考实现 (前向声明，实现在后面)
 void attention_reference(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
+
+void attention_reference_dim32(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -212,24 +237,46 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 运行Reference (Tiled)
+    // 运行Reference (Tiled) - 根据head_dim选择实现
     printf("Running Reference (Tiled with shared mem + online softmax)...\n");
     float time_ref = benchmark([&]() {
-        attention_reference(
-            d_Q, d_K, d_V, d_O_ref,
-            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-            0
-        );
+        if (config.head_dim == 32) {
+            attention_reference_dim32(
+                d_Q, d_K, d_V, d_O_ref,
+                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+                0
+            );
+        } else if (config.head_dim == 64) {
+            attention_reference(
+                d_Q, d_K, d_V, d_O_ref,
+                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+                0
+            );
+        } else {
+            fprintf(stderr, "Unsupported head_dim=%d (only 32 and 64 supported)\n", config.head_dim);
+            exit(1);
+        }
     });
     
-    // 运行Flash Attention
+    // 运行Flash Attention - 根据head_dim选择实现
     printf("Running Flash Attention (Optimized)...\n");
     float time_flash = benchmark([&]() {
-        flash_attention_forward(
-            d_Q, d_K, d_V, d_O_flash,
-            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-            0
-        );
+        if (config.head_dim == 32) {
+            flash_attention_forward_dim32(
+                d_Q, d_K, d_V, d_O_flash,
+                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+                0
+            );
+        } else if (config.head_dim == 64) {
+            flash_attention_forward(
+                d_Q, d_K, d_V, d_O_flash,
+                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+                0
+            );
+        } else {
+            fprintf(stderr, "Unsupported head_dim=%d (only 32 and 64 supported)\n", config.head_dim);
+            exit(1);
+        }
     });
     
     // 验证正确性
@@ -304,6 +351,192 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaFree(d_O_flash));
     CHECK_CUDA(cudaFree(d_O_ref));
     CHECK_CUDA(cudaFree(d_O_baseline));
+}
+
+// ==================== 参考实现（Tiled版本，head_dim=32优化） ====================
+
+// Tile sizes for head_dim=32 (可以使用更大的tile)
+constexpr int kRefTileM_32 = 32;  // Query tile size (2x larger)
+constexpr int kRefTileN_32 = 64;  // Key/Value tile size (2x larger)
+constexpr int kRefHeadDim_32 = 32;
+
+__global__ void attention_reference_kernel_dim32(
+    const cutlass::half_t* __restrict__ Q,
+    const cutlass::half_t* __restrict__ K,
+    const cutlass::half_t* __restrict__ V,
+    cutlass::half_t* __restrict__ O,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim
+) {
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    const int q_start = q_block_idx * kRefTileM_32;
+    const int q_end = min(q_start + kRefTileM_32, seq_len);
+    const int q_size = q_end - q_start;
+    
+    if (q_size <= 0) return;
+    
+    const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
+    const cutlass::half_t* Q_ptr = Q + offset;
+    const cutlass::half_t* K_ptr = K + offset;
+    const cutlass::half_t* V_ptr = V + offset;
+    cutlass::half_t* O_ptr = O + offset;
+    
+    extern __shared__ char smem[];
+    cutlass::half_t* Q_tile = (cutlass::half_t*)smem;
+    cutlass::half_t* K_tile = Q_tile + kRefTileM_32 * kRefHeadDim_32;
+    cutlass::half_t* V_tile = K_tile + kRefTileN_32 * kRefHeadDim_32;
+    float* S_tile = (float*)(V_tile + kRefTileN_32 * kRefHeadDim_32);
+    
+    float* m_shared = S_tile + kRefTileM_32 * kRefTileN_32;
+    float* l_shared = m_shared + kRefTileM_32;
+    float* O_accum = l_shared + kRefTileM_32;
+    
+    // Load Q tile
+    for (int idx = tid; idx < q_size * head_dim; idx += blockDim.x) {
+        int i = idx / head_dim;
+        int j = idx % head_dim;
+        Q_tile[i * kRefHeadDim_32 + j] = Q_ptr[(q_start + i) * head_dim + j];
+    }
+    
+    for (int i = tid; i < kRefTileM_32; i += blockDim.x) {
+        m_shared[i] = -INFINITY;
+        l_shared[i] = 0.0f;
+    }
+    for (int i = tid; i < kRefTileM_32 * kRefHeadDim_32; i += blockDim.x) {
+        O_accum[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    const int num_kv_tiles = (seq_len + kRefTileN_32 - 1) / kRefTileN_32;
+    
+    for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
+        const int k_start = kv_tile_idx * kRefTileN_32;
+        const int k_end = min(k_start + kRefTileN_32, seq_len);
+        const int k_size = k_end - k_start;
+        
+        for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
+            int i = idx / head_dim;
+            int j = idx % head_dim;
+            K_tile[i * kRefHeadDim_32 + j] = K_ptr[(k_start + i) * head_dim + j];
+            V_tile[i * kRefHeadDim_32 + j] = V_ptr[(k_start + i) * head_dim + j];
+        }
+        __syncthreads();
+        
+        for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+            int i = idx / k_size;
+            int j = idx % k_size;
+            
+            float sum = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < head_dim; d++) {
+                sum += float(Q_tile[i * kRefHeadDim_32 + d]) * float(K_tile[j * kRefHeadDim_32 + d]);
+            }
+            S_tile[i * kRefTileN_32 + j] = sum * softmax_scale;
+        }
+        __syncthreads();
+        
+        for (int i = 0; i < q_size; i++) {
+            if (tid == 0) {
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, S_tile[i * kRefTileN_32 + j]);
+                }
+                
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    float p = expf(S_tile[i * kRefTileN_32 + j] - m_new);
+                    S_tile[i * kRefTileN_32 + j] = p;
+                    l_new += p;
+                }
+                
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                for (int d = 0; d < head_dim; d++) {
+                    O_accum[i * kRefHeadDim_32 + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
+            }
+        }
+        __syncthreads();
+        
+        for (int i = 0; i < q_size; i++) {
+            for (int d = tid; d < head_dim; d += blockDim.x) {
+                float sum = 0.0f;
+                #pragma unroll 8
+                for (int j = 0; j < k_size; j++) {
+                    sum += S_tile[i * kRefTileN_32 + j] * float(V_tile[j * kRefHeadDim_32 + d]);
+                }
+                O_accum[i * kRefHeadDim_32 + d] += sum;
+            }
+        }
+        __syncthreads();
+    }
+    
+    for (int i = 0; i < q_size; i++) {
+        float scale = 1.0f / l_shared[i];
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = O_accum[i * kRefHeadDim_32 + d] * scale;
+            O_ptr[(q_start + i) * head_dim + d] = cutlass::half_t(val);
+        }
+    }
+}
+
+void attention_reference_dim32(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+) {
+    assert(head_dim == kRefHeadDim_32 && "This reference expects head_dim=32");
+    
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    
+    const int num_q_blocks = (seq_len + kRefTileM_32 - 1) / kRefTileM_32;
+    dim3 grid(num_q_blocks, num_heads, batch_size);
+    dim3 block(128);
+    
+    size_t smem_size = (kRefTileM_32 * kRefHeadDim_32 + kRefTileN_32 * kRefHeadDim_32 * 2) * sizeof(cutlass::half_t) +
+                       (kRefTileM_32 * kRefTileN_32) * sizeof(float) +
+                       (kRefTileM_32 * 2) * sizeof(float) +
+                       (kRefTileM_32 * kRefHeadDim_32) * sizeof(float);
+    
+    if (smem_size > 48 * 1024) {
+        cudaFuncSetAttribute(
+            attention_reference_kernel_dim32,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size
+        );
+    }
+    
+    attention_reference_kernel_dim32<<<grid, block, smem_size, stream>>>(
+        Q, K, V, O,
+        softmax_scale,
+        batch_size, num_heads, seq_len, head_dim
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Reference (dim32) kernel launch failed: %s\n", 
+                cudaGetErrorString(err));
+    }
 }
 
 // ==================== Baseline实现（Naive版本，不用shared memory和online softmax） ====================
@@ -666,32 +899,27 @@ int main() {
     
     printf("\n");
     printf("================================================================================\n");
-    printf("Memory Bottleneck Analysis for Baseline Implementation\n");
+    printf("Flash Attention Performance Test with head_dim Comparison\n");
     printf("================================================================================\n");
-    printf("\nBaseline memory requirements:\n");
-    printf("- Input/Output: O(batch × heads × seq_len × head_dim)\n");
-    printf("- Scores buffer: O(batch × heads × seq_len²)  ← QUADRATIC in seq_len!\n");
-    printf("\nLet's test which dimension impacts performance most:\n");
+    printf("\nSupported configurations:\n");
+    printf("- head_dim=64: Standard, tile size 64x64\n");
+    printf("- head_dim=32: Optimized, tile size 128x128 (2x larger tiles!)\n");
+    printf("\nBaseline memory: O(batch × heads × seq_len²) ← QUADRATIC in seq_len!\n");
     printf("\n");
     
-    // 测试用例 - 专门设计来展示不同维度的影响
+    // 测试用例 - 对比 head_dim=32 和 head_dim=64 的性能
     std::vector<TestConfig> configs = {
-        // 基线配置
-        {1, 1, 512, 64},     // baseline: 1MB scores buffer
+        // head_dim=64 测试
+        {1, 1, 512, 64},     // 基线
+        {1, 1, 1024, 64},    // 长序列
+        {2, 8, 512, 64},     // 多batch+多head
         
-        // 测试seq_len的影响 (平方增长！) ← 最大的瓶颈
-        {1, 1, 256, 64},     // 0.5x seq_len → scores: 0.25MB (4x smaller, time ~1/4)
-        {1, 1, 1024, 64},    // 2x seq_len → scores: 4MB (4x larger, time ~4x)
-        {1, 1, 2048, 64},    // 4x seq_len → scores: 16MB (16x larger, time ~16x)
-        
-        // 测试batch的影响 (线性增长)
-        {2, 1, 512, 64},     // 2x batch → scores: 2MB (2x larger, time ~2x)
-        {4, 1, 512, 64},     // 4x batch → scores: 4MB (4x larger, time ~4x)
-        
-        // 测试heads的影响 (线性增长)
-        {1, 2, 512, 64},     // 2x heads → scores: 2MB (2x larger, time ~2x)
-        {1, 4, 512, 64},     // 4x heads → scores: 4MB (4x larger, time ~4x)
-        {1, 8, 512, 64},     // 8x heads → scores: 8MB (8x larger, time ~8x)
+        // head_dim=32 测试 (优化版本，更大的tile)
+        {1, 1, 512, 32},     // 基线 - 对比64
+        {1, 1, 1024, 32},    // 长序列 - 对比64
+        {1, 1, 2048, 32},    // 超长序列 - head_dim=32可以处理更大的seq_len
+        {2, 8, 512, 32},     // 多batch+多head - 对比64
+        {4, 16, 1024, 32},   // 大规模 (类似实际训练场景)
     };
     
     for (const auto& config : configs) {
