@@ -25,9 +25,14 @@
 
 // ==================== 配置参数 ====================
 
-constexpr int kBlockM = 64;      // Q的块大小 (行)
-constexpr int kBlockN = 64;      // K,V的块大小 (列)
-constexpr int kHeadDim = 64;     // Head维度
+// 如果遇到共享内存不足的问题，可以尝试以下配置：
+// 选项1 (当前): 64x64 块，需要 ~72KB 共享内存
+// 选项2: 32x32 块，只需要 ~20KB 共享内存
+// 选项3: 64x32 块，需要 ~44KB 共享内存
+
+constexpr int kBlockM = 64;      // Q的块大小 (行) - 可以改为32
+constexpr int kBlockN = 64;      // K,V的块大小 (列) - 可以改为32  
+constexpr int kHeadDim = 64;     // Head维度 (固定)
 constexpr int kNThreads = 128;   // 每个block的线程数
 
 // ==================== 工具函数 ====================
@@ -121,8 +126,12 @@ struct SharedMemory {
     }
     
     static constexpr size_t get_size() {
-        return (kBlockM * kHeadDim + kBlockN * kHeadDim * 2) * sizeof(T) +
-               (kBlockM * kBlockN * 2) * sizeof(float);
+        size_t base_size = (kBlockM * kHeadDim + kBlockN * kHeadDim * 2) * sizeof(T) +
+                          (kBlockM * kBlockN * 2) * sizeof(float);
+        // 添加额外的统计量和累加器
+        size_t extra_size = (kBlockM * 2) * sizeof(float) +  // m_shared, l_shared
+                           (kBlockM * kHeadDim) * sizeof(float);  // O_accum
+        return base_size + extra_size;
     }
 };
 
@@ -230,6 +239,13 @@ __global__ void flash_attention_kernel(
     extern __shared__ char smem[];
     SharedMemory<cutlass::half_t> shared_mem(smem);
     
+    // 从动态共享内存中分配额外的数组
+    size_t base_offset = (kBlockM * kHeadDim + kBlockN * kHeadDim * 2) * sizeof(cutlass::half_t) +
+                        (kBlockM * kBlockN * 2) * sizeof(float);
+    float* m_shared = reinterpret_cast<float*>(smem + base_offset);
+    float* l_shared = m_shared + kBlockM;
+    float* O_accum = l_shared + kBlockM;
+    
     // 加载Q block到共享内存
     for (int idx = tid; idx < q_size * head_dim; idx += blockDim.x) {
         int i = idx / head_dim;
@@ -237,11 +253,6 @@ __global__ void flash_attention_kernel(
         shared_mem.Q[i * kHeadDim + j] = Q_ptr[(q_start + i) * head_dim + j];
     }
     __syncthreads();
-    
-    // 初始化输出和softmax统计量
-    __shared__ float m_shared[kBlockM];  // max for each row
-    __shared__ float l_shared[kBlockM];  // sum for each row
-    __shared__ float O_accum[kBlockM * kHeadDim];  // 累加器
     
     // 初始化
     for (int i = tid; i < kBlockM; i += blockDim.x) {
@@ -384,6 +395,37 @@ void flash_attention_forward(
     // 计算共享内存大小
     size_t smem_size = SharedMemory<cutlass::half_t>::get_size();
     
+    // 检查并设置共享内存限制
+    // A100默认48KB，我们需要更多
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    
+    // 设置最大共享内存配置
+    cudaFuncSetAttribute(
+        flash_attention_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+    );
+    
+    // 打印调试信息（首次调用）
+    static bool first_call = true;
+    if (first_call) {
+        printf("Shared memory info:\n");
+        printf("  Required: %zu bytes (%.1f KB)\n", smem_size, smem_size / 1024.0);
+        printf("  Available per block: %zu bytes (%.1f KB)\n", 
+               prop.sharedMemPerBlock, prop.sharedMemPerBlock / 1024.0);
+        printf("  Max per block with opt-in: %zu bytes (%.1f KB)\n",
+               prop.sharedMemPerBlockOptin, prop.sharedMemPerBlockOptin / 1024.0);
+        
+        if (smem_size > prop.sharedMemPerBlock) {
+            printf("  ⚠️  WARNING: Required shared memory exceeds default limit!\n");
+            printf("  Attempting to use opt-in limit...\n");
+        }
+        first_call = false;
+    }
+    
     // 启动kernel
     flash_attention_kernel<<<grid, block, smem_size, stream>>>(
         Q, K, V, O,
@@ -396,6 +438,8 @@ void flash_attention_forward(
     if (err != cudaSuccess) {
         fprintf(stderr, "Flash attention kernel launch failed: %s\n", 
                 cudaGetErrorString(err));
+        fprintf(stderr, "  Grid: (%d, %d), Block: (%d), Shared mem: %zu bytes\n",
+                grid.x, grid.y, block.x, smem_size);
     }
 }
 
