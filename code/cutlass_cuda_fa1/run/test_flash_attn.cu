@@ -236,14 +236,22 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaFree(d_O_ref));
 }
 
-// ==================== 参考实现（简单版） ====================
+// ==================== 参考实现（Tiled版本） ====================
 
 /**
  * 标准Attention实现: O = softmax(Q @ K^T / sqrt(d)) @ V
  * 
- * 这是一个简单的实现，不考虑性能优化
- * 用于验证Flash Attention的正确性
+ * 使用tiled approach来高效使用shared memory
+ * 每个block处理多个query positions，使用在线softmax
+ * 
+ * 这样只需要存储tile而不是整个序列，大大减少shared memory使用
  */
+
+// Tile sizes for reference implementation
+constexpr int kRefTileM = 16;  // Query tile size
+constexpr int kRefTileN = 32;  // Key/Value tile size
+constexpr int kRefHeadDim = 64;
+
 __global__ void attention_reference_kernel(
     const cutlass::half_t* __restrict__ Q,
     const cutlass::half_t* __restrict__ K,
@@ -255,12 +263,17 @@ __global__ void attention_reference_kernel(
     int seq_len,
     int head_dim
 ) {
-    // 每个thread处理一个(batch, head, query_pos)
+    // Each block processes kRefTileM queries
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
-    const int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int q_block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
     
-    if (q_idx >= seq_len) return;
+    const int q_start = q_block_idx * kRefTileM;
+    const int q_end = min(q_start + kRefTileM, seq_len);
+    const int q_size = q_end - q_start;
+    
+    if (q_size <= 0) return;
     
     const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
     const cutlass::half_t* Q_ptr = Q + offset;
@@ -268,45 +281,130 @@ __global__ void attention_reference_kernel(
     const cutlass::half_t* V_ptr = V + offset;
     cutlass::half_t* O_ptr = O + offset;
     
-    // 临时数组（在寄存器/局部内存）
-    extern __shared__ float scores[];
-    float* my_scores = scores + threadIdx.x * seq_len;
+    // Shared memory layout:
+    // - Q_tile: [kRefTileM, kRefHeadDim]
+    // - K_tile: [kRefTileN, kRefHeadDim]
+    // - V_tile: [kRefTileN, kRefHeadDim]
+    // - S_tile: [kRefTileM, kRefTileN] (scores)
+    extern __shared__ char smem[];
+    cutlass::half_t* Q_tile = (cutlass::half_t*)smem;
+    cutlass::half_t* K_tile = Q_tile + kRefTileM * kRefHeadDim;
+    cutlass::half_t* V_tile = K_tile + kRefTileN * kRefHeadDim;
+    float* S_tile = (float*)(V_tile + kRefTileN * kRefHeadDim);
     
-    // 计算 scores = Q[q_idx] @ K^T
-    for (int k_idx = 0; k_idx < seq_len; k_idx++) {
-        float sum = 0.0f;
-        for (int d = 0; d < head_dim; d++) {
-            float q_val = float(Q_ptr[q_idx * head_dim + d]);
-            float k_val = float(K_ptr[k_idx * head_dim + d]);
-            sum += q_val * k_val;
+    // Per-query statistics and accumulator (in shared memory)
+    float* m_shared = S_tile + kRefTileM * kRefTileN;
+    float* l_shared = m_shared + kRefTileM;
+    float* O_accum = l_shared + kRefTileM;  // [kRefTileM, kRefHeadDim]
+    
+    // Load Q tile
+    for (int idx = tid; idx < q_size * head_dim; idx += blockDim.x) {
+        int i = idx / head_dim;
+        int j = idx % head_dim;
+        Q_tile[i * kRefHeadDim + j] = Q_ptr[(q_start + i) * head_dim + j];
+    }
+    
+    // Initialize statistics and output accumulator
+    for (int i = tid; i < kRefTileM; i += blockDim.x) {
+        m_shared[i] = -INFINITY;
+        l_shared[i] = 0.0f;
+    }
+    for (int i = tid; i < kRefTileM * kRefHeadDim; i += blockDim.x) {
+        O_accum[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Iterate over K/V tiles
+    const int num_kv_tiles = (seq_len + kRefTileN - 1) / kRefTileN;
+    
+    for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
+        const int k_start = kv_tile_idx * kRefTileN;
+        const int k_end = min(k_start + kRefTileN, seq_len);
+        const int k_size = k_end - k_start;
+        
+        // Load K tile
+        for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
+            int i = idx / head_dim;
+            int j = idx % head_dim;
+            K_tile[i * kRefHeadDim + j] = K_ptr[(k_start + i) * head_dim + j];
         }
-        my_scores[k_idx] = sum * softmax_scale;
-    }
-    
-    // Softmax
-    float max_score = -INFINITY;
-    for (int i = 0; i < seq_len; i++) {
-        max_score = fmaxf(max_score, my_scores[i]);
-    }
-    
-    float sum_exp = 0.0f;
-    for (int i = 0; i < seq_len; i++) {
-        my_scores[i] = expf(my_scores[i] - max_score);
-        sum_exp += my_scores[i];
-    }
-    
-    for (int i = 0; i < seq_len; i++) {
-        my_scores[i] /= sum_exp;
-    }
-    
-    // 计算 O = scores @ V
-    for (int d = 0; d < head_dim; d++) {
-        float sum = 0.0f;
-        for (int k_idx = 0; k_idx < seq_len; k_idx++) {
-            float v_val = float(V_ptr[k_idx * head_dim + d]);
-            sum += my_scores[k_idx] * v_val;
+        
+        // Load V tile
+        for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
+            int i = idx / head_dim;
+            int j = idx % head_dim;
+            V_tile[i * kRefHeadDim + j] = V_ptr[(k_start + i) * head_dim + j];
         }
-        O_ptr[q_idx * head_dim + d] = cutlass::half_t(sum);
+        __syncthreads();
+        
+        // Compute S = Q @ K^T for this tile
+        for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+            int i = idx / k_size;  // query index in tile
+            int j = idx % k_size;  // key index in tile
+            
+            float sum = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                sum += float(Q_tile[i * kRefHeadDim + d]) * float(K_tile[j * kRefHeadDim + d]);
+            }
+            S_tile[i * kRefTileN + j] = sum * softmax_scale;
+        }
+        __syncthreads();
+        
+        // Online softmax update for each query
+        for (int i = 0; i < q_size; i++) {
+            if (tid == 0) {
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                // Find new max
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, S_tile[i * kRefTileN + j]);
+                }
+                
+                // Compute exp and new sum
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    float p = expf(S_tile[i * kRefTileN + j] - m_new);
+                    S_tile[i * kRefTileN + j] = p;  // Store P values
+                    l_new += p;
+                }
+                
+                // Correction factor for old accumulator
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                // Apply correction to accumulator
+                for (int d = 0; d < head_dim; d++) {
+                    O_accum[i * kRefHeadDim + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
+            }
+        }
+        __syncthreads();
+        
+        // Accumulate O += P @ V
+        for (int i = 0; i < q_size; i++) {
+            for (int d = tid; d < head_dim; d += blockDim.x) {
+                float sum = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    sum += S_tile[i * kRefTileN + j] * float(V_tile[j * kRefHeadDim + d]);
+                }
+                O_accum[i * kRefHeadDim + d] += sum;
+            }
+        }
+        __syncthreads();
+    }
+    
+    // Final normalization and write back
+    for (int i = 0; i < q_size; i++) {
+        float scale = 1.0f / l_shared[i];
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = O_accum[i * kRefHeadDim + d] * scale;
+            O_ptr[(q_start + i) * head_dim + d] = cutlass::half_t(val);
+        }
     }
 }
 
@@ -321,17 +419,22 @@ void attention_reference(
     int head_dim,
     cudaStream_t stream
 ) {
+    assert(head_dim == kRefHeadDim && "Reference implementation expects head_dim=64");
+    
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     
-    const int threads = 256;
-    const int blocks_x = (seq_len + threads - 1) / threads;
-    dim3 grid(blocks_x, num_heads, batch_size);
-    dim3 block(threads);
+    const int num_q_blocks = (seq_len + kRefTileM - 1) / kRefTileM;
+    dim3 grid(num_q_blocks, num_heads, batch_size);
+    dim3 block(128);  // 128 threads per block
     
-    size_t smem_size = threads * seq_len * sizeof(float);
+    // Calculate shared memory size
+    size_t smem_size = (kRefTileM * kRefHeadDim + kRefTileN * kRefHeadDim * 2) * sizeof(cutlass::half_t) +
+                       (kRefTileM * kRefTileN) * sizeof(float) +  // S_tile
+                       (kRefTileM * 2) * sizeof(float) +          // m_shared, l_shared
+                       (kRefTileM * kRefHeadDim) * sizeof(float); // O_accum
     
-    // Set shared memory limit if needed (like Flash Attention does)
-    if (smem_size > 48 * 1024) {  // If exceeds default 48KB
+    // Set shared memory limit if needed
+    if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(
             attention_reference_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
