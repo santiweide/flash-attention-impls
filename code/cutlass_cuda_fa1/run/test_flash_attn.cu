@@ -31,7 +31,20 @@ void flash_attention_forward(
     cudaStream_t stream
 );
 
-// 声明参考实现
+// 声明Baseline实现 (前向声明，实现在后面)
+void attention_baseline(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
+
+// 声明参考实现 (前向声明，实现在后面)
 void attention_reference(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
@@ -169,12 +182,13 @@ void run_test(const TestConfig& config) {
            bytes * 4 / 1024.0 / 1024.0);  // Q, K, V, O
     
     // 分配device memory
-    cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref;
+    cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline;
     CHECK_CUDA(cudaMalloc(&d_Q, bytes));
     CHECK_CUDA(cudaMalloc(&d_K, bytes));
     CHECK_CUDA(cudaMalloc(&d_V, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_flash, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_ref, bytes));
+    CHECK_CUDA(cudaMalloc(&d_O_baseline, bytes));
     
     // 初始化输入
     printf("Initializing inputs...\n");
@@ -182,18 +196,18 @@ void run_test(const TestConfig& config) {
     init_random(d_K, qkv_size);
     init_random(d_V, qkv_size);
     
-    // 运行Flash Attention
-    printf("Running Flash Attention...\n");
-    float time_flash = benchmark([&]() {
-        flash_attention_forward(
-            d_Q, d_K, d_V, d_O_flash,
+    // 运行Baseline (Naive)
+    printf("Running Baseline (Naive, no shared mem, no online softmax)...\n");
+    float time_baseline = benchmark([&]() {
+        attention_baseline(
+            d_Q, d_K, d_V, d_O_baseline,
             config.batch_size, config.num_heads, config.seq_len, config.head_dim,
             0
         );
     });
     
-    // 运行参考实现
-    printf("Running Reference Implementation...\n");
+    // 运行Reference (Tiled)
+    printf("Running Reference (Tiled with shared mem + online softmax)...\n");
     float time_ref = benchmark([&]() {
         attention_reference(
             d_Q, d_K, d_V, d_O_ref,
@@ -202,37 +216,69 @@ void run_test(const TestConfig& config) {
         );
     });
     
+    // 运行Flash Attention
+    printf("Running Flash Attention (Optimized)...\n");
+    float time_flash = benchmark([&]() {
+        flash_attention_forward(
+            d_Q, d_K, d_V, d_O_flash,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
+    });
+    
     // 验证正确性
     printf("\nVerifying correctness...\n");
-    float max_error = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
+    printf("Comparing Flash vs Reference (Tiled):\n");
+    float error_flash_vs_ref = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
+    
+    printf("\nComparing Baseline vs Reference (Tiled):\n");
+    float error_baseline_vs_ref = compute_max_relative_error(d_O_baseline, d_O_ref, qkv_size);
+    
+    printf("\nComparing Flash vs Baseline:\n");
+    float error_flash_vs_baseline = compute_max_relative_error(d_O_flash, d_O_baseline, qkv_size);
     
     // 输出结果
     printf("\n");
-    printf("--------------------------------------------------------------------------------\n");
-    printf("Results:\n");
-    printf("--------------------------------------------------------------------------------\n");
-    printf("Flash Attention:  %.3f ms\n", time_flash);
-    printf("Reference:        %.3f ms\n", time_ref);
-    printf("Speedup:          %.2fx\n", time_ref / time_flash);
-    printf("Max Rel Error:    %.6f (symmetric formula: |a-b|/(|a|+|b|+eps))\n", max_error);
+    printf("================================================================================\n");
+    printf("Performance Results:\n");
+    printf("================================================================================\n");
+    printf("%-25s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Baseline (Naive):", time_baseline, 1.0f);
+    printf("%-25s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Reference (Tiled):", time_ref, time_baseline / time_ref);
+    printf("%-25s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Flash Attention:", time_flash, time_baseline / time_flash);
+    
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Accuracy Results (symmetric relative error):\n");
+    printf("================================================================================\n");
+    printf("Flash vs Reference:    %.6f\n", error_flash_vs_ref);
+    printf("Baseline vs Reference: %.6f\n", error_baseline_vs_ref);
+    printf("Flash vs Baseline:     %.6f\n", error_flash_vs_baseline);
     
     // 判断是否通过 (FP16精度下1-2%的误差是可以接受的)
     const float error_threshold = 0.02f;  // 2% 误差阈值
-    if (max_error < error_threshold) {
-        printf("\n✅ TEST PASSED (error < %.1f%%)\n", error_threshold * 100);
+    if (error_flash_vs_ref < error_threshold) {
+        printf("\n✅ TEST PASSED (Flash vs Ref error < %.1f%%)\n", error_threshold * 100);
     } else {
-        printf("\n❌ TEST FAILED (error >= %.1f%%)\n", error_threshold * 100);
+        printf("\n❌ TEST FAILED (Flash vs Ref error >= %.1f%%)\n", error_threshold * 100);
     }
     
     // 计算FLOPs
     const int64_t flops = 4LL * config.batch_size * config.num_heads * 
                           config.seq_len * config.seq_len * config.head_dim;
-    const float tflops_flash = flops / (time_flash * 1e-3) / 1e12;
+    const float tflops_baseline = flops / (time_baseline * 1e-3) / 1e12;
     const float tflops_ref = flops / (time_ref * 1e-3) / 1e12;
+    const float tflops_flash = flops / (time_flash * 1e-3) / 1e12;
     
-    printf("\nThroughput:\n");
-    printf("Flash Attention: %.2f TFLOPs/s\n", tflops_flash);
-    printf("Reference:       %.2f TFLOPs/s\n", tflops_ref);
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Throughput:\n");
+    printf("================================================================================\n");
+    printf("Baseline (Naive):  %.2f TFLOPs/s\n", tflops_baseline);
+    printf("Reference (Tiled): %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
+    printf("Flash Attention:   %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
     
     // 清理
     CHECK_CUDA(cudaFree(d_Q));
@@ -240,6 +286,128 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaFree(d_V));
     CHECK_CUDA(cudaFree(d_O_flash));
     CHECK_CUDA(cudaFree(d_O_ref));
+    CHECK_CUDA(cudaFree(d_O_baseline));
+}
+
+// ==================== Baseline实现（Naive版本，不用shared memory和online softmax） ====================
+
+/**
+ * 最简单的Attention实现，用于性能和精度对比
+ * 
+ * 特点：
+ * - 不使用shared memory（只用全局内存）
+ * - 不使用online softmax（标准的两遍扫描）
+ * - 每个thread处理一个query position
+ * - 分配全局内存来存储attention scores
+ * 
+ * 这是最直观的实现，但性能最差（大量全局内存访问）
+ */
+__global__ void attention_baseline_kernel(
+    const cutlass::half_t* __restrict__ Q,
+    const cutlass::half_t* __restrict__ K,
+    const cutlass::half_t* __restrict__ V,
+    cutlass::half_t* __restrict__ O,
+    float* __restrict__ scores_buffer,  // 全局内存: [batch, heads, seq, seq]
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim
+) {
+    // 每个thread处理一个query position
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (q_idx >= seq_len) return;
+    
+    const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
+    const cutlass::half_t* Q_ptr = Q + offset;
+    const cutlass::half_t* K_ptr = K + offset;
+    const cutlass::half_t* V_ptr = V + offset;
+    cutlass::half_t* O_ptr = O + offset;
+    
+    // 计算这个query在scores buffer中的位置
+    const int64_t scores_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_idx) * seq_len;
+    float* my_scores = scores_buffer + scores_offset;
+    
+    // Step 1: 计算 S = Q[q_idx] @ K^T (存到全局内存)
+    for (int k_idx = 0; k_idx < seq_len; k_idx++) {
+        float sum = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            float q_val = float(Q_ptr[q_idx * head_dim + d]);
+            float k_val = float(K_ptr[k_idx * head_dim + d]);
+            sum += q_val * k_val;
+        }
+        my_scores[k_idx] = sum * softmax_scale;
+    }
+    
+    // Step 2: Softmax - 第一遍：找max
+    float max_score = -INFINITY;
+    for (int i = 0; i < seq_len; i++) {
+        max_score = fmaxf(max_score, my_scores[i]);
+    }
+    
+    // Step 3: Softmax - 第二遍：计算exp和sum
+    float sum_exp = 0.0f;
+    for (int i = 0; i < seq_len; i++) {
+        my_scores[i] = expf(my_scores[i] - max_score);
+        sum_exp += my_scores[i];
+    }
+    
+    // Step 4: Softmax - 归一化
+    for (int i = 0; i < seq_len; i++) {
+        my_scores[i] /= sum_exp;
+    }
+    
+    // Step 5: 计算 O = softmax(S) @ V
+    for (int d = 0; d < head_dim; d++) {
+        float sum = 0.0f;
+        for (int k_idx = 0; k_idx < seq_len; k_idx++) {
+            float v_val = float(V_ptr[k_idx * head_dim + d]);
+            sum += my_scores[k_idx] * v_val;
+        }
+        O_ptr[q_idx * head_dim + d] = cutlass::half_t(sum);
+    }
+}
+
+void attention_baseline(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+) {
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    
+    const int threads = 256;
+    const int blocks_x = (seq_len + threads - 1) / threads;
+    dim3 grid(blocks_x, num_heads, batch_size);
+    dim3 block(threads);
+    
+    // 分配全局内存来存储所有的attention scores
+    size_t scores_size = (size_t)batch_size * num_heads * seq_len * seq_len * sizeof(float);
+    float* d_scores_buffer;
+    CHECK_CUDA(cudaMalloc(&d_scores_buffer, scores_size));
+    
+    attention_baseline_kernel<<<grid, block, 0, stream>>>(
+        Q, K, V, O,
+        d_scores_buffer,
+        softmax_scale,
+        batch_size, num_heads, seq_len, head_dim
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Baseline kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+    
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaFree(d_scores_buffer));
 }
 
 // ==================== 参考实现（Tiled版本） ====================
