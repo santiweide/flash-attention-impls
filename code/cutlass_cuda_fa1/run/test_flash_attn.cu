@@ -177,9 +177,15 @@ void run_test(const TestConfig& config) {
     const size_t qkv_size = config.get_qkv_size();
     const size_t bytes = qkv_size * sizeof(cutlass::half_t);
     
-    printf("Memory: %.2f MB per tensor, %.2f MB total\n", 
-           bytes / 1024.0 / 1024.0,
-           bytes * 4 / 1024.0 / 1024.0);  // Q, K, V, O
+    // 计算baseline的scores buffer大小
+    const size_t scores_buffer_size = (size_t)config.batch_size * config.num_heads * 
+                                      config.seq_len * config.seq_len * sizeof(float);
+    
+    printf("Memory per tensor: %.2f MB (Q/K/V/O)\n", bytes / 1024.0 / 1024.0);
+    printf("Baseline scores buffer: %.2f MB (batch×heads×seq²×4bytes)\n", 
+           scores_buffer_size / 1024.0 / 1024.0);
+    printf("Total memory: %.2f MB\n", 
+           (bytes * 4 + scores_buffer_size) / 1024.0 / 1024.0);
     
     // 分配device memory
     cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline;
@@ -658,14 +664,34 @@ int main() {
     printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
     printf("================================================================================\n");
     
-    // 测试用例
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Memory Bottleneck Analysis for Baseline Implementation\n");
+    printf("================================================================================\n");
+    printf("\nBaseline memory requirements:\n");
+    printf("- Input/Output: O(batch × heads × seq_len × head_dim)\n");
+    printf("- Scores buffer: O(batch × heads × seq_len²)  ← QUADRATIC in seq_len!\n");
+    printf("\nLet's test which dimension impacts performance most:\n");
+    printf("\n");
+    
+    // 测试用例 - 专门设计来展示不同维度的影响
     std::vector<TestConfig> configs = {
-        {1, 1, 128, 64},     // 小规模 (warm up)
-        {1, 1, 512, 64},     // 中等规模
-        {1, 1, 1024, 64},    // 大规模
-        {2, 8, 512, 64},     // 多batch, 多head
-        {8, 12, 1024, 64},   // 更大规模 (类似BERT-Base)
-        {16, 16, 2048, 64},  // 极大规模 (GPT规模，如果内存够的话)
+        // 基线配置
+        {1, 1, 512, 64},     // baseline: 1MB scores buffer
+        
+        // 测试seq_len的影响 (平方增长！) ← 最大的瓶颈
+        {1, 1, 256, 64},     // 0.5x seq_len → scores: 0.25MB (4x smaller, time ~1/4)
+        {1, 1, 1024, 64},    // 2x seq_len → scores: 4MB (4x larger, time ~4x)
+        {1, 1, 2048, 64},    // 4x seq_len → scores: 16MB (16x larger, time ~16x)
+        
+        // 测试batch的影响 (线性增长)
+        {2, 1, 512, 64},     // 2x batch → scores: 2MB (2x larger, time ~2x)
+        {4, 1, 512, 64},     // 4x batch → scores: 4MB (4x larger, time ~4x)
+        
+        // 测试heads的影响 (线性增长)
+        {1, 2, 512, 64},     // 2x heads → scores: 2MB (2x larger, time ~2x)
+        {1, 4, 512, 64},     // 4x heads → scores: 4MB (4x larger, time ~4x)
+        {1, 8, 512, 64},     // 8x heads → scores: 8MB (8x larger, time ~8x)
     };
     
     for (const auto& config : configs) {
