@@ -35,17 +35,20 @@ Total: ~72 KB
 ### head_dim=32 优化配置
 
 ```cpp
-Tile Size: 128×128 (2x larger!)
+Tile Size: 96×96 (1.5x larger, fits in shared memory!)
 Threads: 256 (2x more!)
 Shared Memory Usage:
-- Q: 128×32×2 = 8 KB
-- K: 128×32×2 = 8 KB  
-- V: 128×32×2 = 8 KB
-- S: 128×128×4 = 64 KB
-- P: 128×128×4 = 64 KB
-- Other: ~16 KB
-Total: ~168 KB (still under 164 KB limit!)
+- Q: 96×32×2 = 6 KB
+- K: 96×32×2 = 6 KB  
+- V: 96×32×2 = 6 KB
+- S: 96×96×4 = 36 KB
+- P: 96×96×4 = 36 KB
+- Other: ~13 KB
+Total: ~103 KB (comfortably under 163 KB limit!)
 ```
+
+**Note**: 原本设计了128×128的tile（2x larger），但需要173KB shared memory，
+超过了A100的163KB限制。96×96是一个平衡的选择，既比64×64大，又在内存限制内。
 
 ## 关键优势
 
@@ -56,15 +59,15 @@ Total: ~168 KB (still under 164 KB limit!)
 | head_dim | Tile Size | Tiles per seq | Total Tiles | 
 |----------|-----------|---------------|-------------|
 | 64 | 64×64 | 32 | 32×32 = 1024 |
-| **32** | **128×128** | **16** | **16×16 = 256** |
+| **32** | **96×96** | **22** | **22×22 = 484** |
 
-**4倍减少！** → 更少的 HBM 访问，更少的 kernel 启动开销
+**~2倍减少！** → 更少的 HBM 访问，更少的 kernel 重复执行
 
 ### 2. **更好的并行度**
 
 ```
 head_dim=64: 128 threads 处理 64×64 tile = 每线程 32 elements
-head_dim=32: 256 threads 处理 128×128 tile = 每线程 64 elements
+head_dim=32: 256 threads 处理 96×96 tile = 每线程 36 elements
 ```
 
 更多 threads → 更好的 GPU occupancy → 更高的吞吐量
@@ -73,7 +76,7 @@ head_dim=32: 256 threads 处理 128×128 tile = 每线程 64 elements
 
 Tile 越大，计算/访存比越高：
 - 64×64 tile: 读取 2×64×64 = 8192 half，计算 64×64×64 = 262K ops → 32 ops/load
-- 128×128 tile: 读取 2×128×32 = 8192 half，计算 128×128×32 = 524K ops → **64 ops/load** (2倍!)
+- 96×96 tile: 读取 2×96×32 = 6144 half，计算 96×96×32 = 295K ops → **48 ops/load** (1.5倍!)
 
 ### 4. **相同的寄存器压力**
 
@@ -87,9 +90,11 @@ Tile 越大，计算/访存比越高：
 
 | 场景 | 预期提升 | 原因 |
 |------|---------|------|
-| seq_len ≤ 512 | ~1.2-1.5x | Tile overhead 降低 |
-| seq_len = 1024 | ~1.5-2.0x | 更少的 tile，更好的并行度 |
-| seq_len ≥ 2048 | ~2.0-2.5x | Tile 数量减少 4 倍 |
+| seq_len ≤ 512 | ~1.1-1.3x | Tile overhead 降低，更多线程 |
+| seq_len = 1024 | ~1.3-1.5x | 更少的 tile，更好的并行度 |
+| seq_len ≥ 2048 | ~1.5-2.0x | Tile 数量减少 ~2 倍 |
+
+**实际提升**取决于具体硬件和 batch/heads 配置，但在长序列场景下优势明显。
 
 ## 实际应用场景
 

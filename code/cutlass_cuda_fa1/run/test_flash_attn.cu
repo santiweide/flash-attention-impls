@@ -355,9 +355,9 @@ void run_test(const TestConfig& config) {
 
 // ==================== 参考实现（Tiled版本，head_dim=32优化） ====================
 
-// Tile sizes for head_dim=32 (可以使用更大的tile)
-constexpr int kRefTileM_32 = 32;  // Query tile size (2x larger)
-constexpr int kRefTileN_32 = 64;  // Key/Value tile size (2x larger)
+// Tile sizes for head_dim=32 (使用适中的tile以保持在shared memory限制内)
+constexpr int kRefTileM_32 = 24;  // Query tile size (1.5x larger than dim64's 16)
+constexpr int kRefTileN_32 = 48;  // Key/Value tile size (1.5x larger than dim64's 32)
 constexpr int kRefHeadDim_32 = 32;
 
 __global__ void attention_reference_kernel_dim32(
@@ -902,9 +902,10 @@ int main() {
     printf("Flash Attention Performance Test with head_dim Comparison\n");
     printf("================================================================================\n");
     printf("\nSupported configurations:\n");
-    printf("- head_dim=64: Standard, tile size 64x64\n");
-    printf("- head_dim=32: Optimized, tile size 128x128 (2x larger tiles!)\n");
+    printf("- head_dim=64: Standard, Flash tile 64x64, Ref tile 16x32\n");
+    printf("- head_dim=32: Optimized, Flash tile 96x96, Ref tile 24x48 (~1.5x larger!)\n");
     printf("\nBaseline memory: O(batch × heads × seq_len²) ← QUADRATIC in seq_len!\n");
+    printf("Flash/Ref use tiling: O(tile_size²) memory only\n");
     printf("\n");
     
     // 测试用例 - 对比 head_dim=32 和 head_dim=64 的性能

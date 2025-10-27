@@ -18,10 +18,11 @@
 // ==================== 配置参数 (为 head_dim=32 优化) ====================
 
 // head_dim=32 时我们可以使用更大的 tile，因为 shared memory 需求减半
-constexpr int kBlockM_32 = 128;     // Q的块大小 (2x larger than dim64)
-constexpr int kBlockN_32 = 128;     // K,V的块大小 (2x larger than dim64)
+// 96×96 tile 保证在 163KB shared memory 限制内
+constexpr int kBlockM_32 = 96;      // Q的块大小 (~1.5x larger than dim64)
+constexpr int kBlockN_32 = 96;      // K,V的块大小 (~1.5x larger than dim64)
 constexpr int kHeadDim_32 = 32;     // Head维度 (固定为32)
-constexpr int kNThreads_32 = 256;   // 更多线程来处理更大的tile
+constexpr int kNThreads_32 = 256;   // 更多线程来处理tile
 
 // ==================== 工具函数 ====================
 
@@ -280,11 +281,16 @@ void flash_attention_forward_dim32(
     static bool first_call = true;
     if (first_call) {
         printf("Flash Attention (head_dim=32) Configuration:\n");
-        printf("  Tile size: %dx%d (2x larger than dim64 version)\n", kBlockM_32, kBlockN_32);
+        printf("  Tile size: %dx%d (1.5x larger than dim64's 64x64)\n", kBlockM_32, kBlockN_32);
         printf("  Threads per block: %d\n", kNThreads_32);
         printf("  Shared memory: %zu bytes (%.1f KB)\n", smem_size, smem_size / 1024.0);
         printf("  Max shared mem available: %zu bytes (%.1f KB)\n",
                prop.sharedMemPerBlockOptin, prop.sharedMemPerBlockOptin / 1024.0);
+        if (smem_size <= prop.sharedMemPerBlockOptin) {
+            printf("  ✓ Shared memory requirement satisfied\n");
+        } else {
+            printf("  ✗ WARNING: Shared memory exceeds limit!\n");
+        }
         first_call = false;
     }
     
