@@ -1,0 +1,595 @@
+/******************************************************************************
+ * Unified Flash Attention Implementation
+ * 
+ * 特点：
+ * - 模板化设计，支持任意 head_dim
+ * - 编译时自动计算最优 tile size
+ * - 单一代码库，无重复逻辑
+ ******************************************************************************/
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/arch/memory.h>
+#include <cmath>
+#include <algorithm>
+
+// ==================== Tile Size 计算工具 ====================
+
+/**
+ * 编译时计算最优 tile size
+ * 
+ * 约束：
+ * - A100 shared memory limit: 163 KB (opt-in)
+ * - 需要存储: Q[M,D], K[N,D], V[N,D], S[M,N], P[M,N], 统计量, 累加器
+ * 
+ * 策略：
+ * - head_dim 越小，可以用越大的 tile
+ * - 保证 shared memory < 160 KB (留一些余量)
+ */
+template<int HEAD_DIM>
+struct TileConfig {
+    // 计算最大可能的 tile size
+    static constexpr int compute_max_tile_size() {
+        // Shared memory budget (bytes)
+        constexpr size_t MAX_SMEM = 160 * 1024;
+        
+        // 对于正方形 tile [M, M]:
+        // QKV: M * HEAD_DIM * 2 * 3 (half_t)
+        // S,P: M * M * 4 * 2 (float)
+        // Stats + Accum: M * 2 * 4 + M * HEAD_DIM * 4
+        
+        // 从大到小尝试
+        for (int tile = 128; tile >= 32; tile -= 8) {
+            size_t qkv_size = tile * HEAD_DIM * sizeof(cutlass::half_t) * 3;
+            size_t sp_size = tile * tile * sizeof(float) * 2;
+            size_t extra = tile * 2 * sizeof(float) + tile * HEAD_DIM * sizeof(float);
+            size_t total = qkv_size + sp_size + extra;
+            
+            if (total < MAX_SMEM) {
+                return tile;
+            }
+        }
+        return 32; // 最小值
+    }
+    
+    static constexpr int kTileM = compute_max_tile_size();
+    static constexpr int kTileN = compute_max_tile_size();
+    static constexpr int kHeadDim = HEAD_DIM;
+    
+    // 线程数：根据 tile 大小选择
+    static constexpr int kThreads = (kTileM >= 96) ? 256 : 
+                                     (kTileM >= 64) ? 128 : 64;
+    
+    // 打印配置信息
+    static void print_config() {
+        printf("  Tile Config for head_dim=%d:\n", HEAD_DIM);
+        printf("    Tile size: %dx%d\n", kTileM, kTileN);
+        printf("    Threads: %d\n", kThreads);
+        printf("    Shared memory: %.1f KB\n", get_smem_size() / 1024.0);
+    }
+    
+    static constexpr size_t get_smem_size() {
+        return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
+               (kTileM * kTileN * 2) * sizeof(float) +
+               (kTileM * 2) * sizeof(float) +
+               (kTileM * kHeadDim) * sizeof(float);
+    }
+};
+
+// 显式实例化常用配置以验证
+static_assert(TileConfig<32>::kTileM >= 64, "head_dim=32 should support at least 64x64 tile");
+static_assert(TileConfig<64>::kTileM >= 64, "head_dim=64 should support at least 64x64 tile");
+static_assert(TileConfig<128>::kTileM >= 32, "head_dim=128 should support at least 32x32 tile");
+
+// ==================== 共享内存管理（模板化） ====================
+
+template<typename T, int TILE_M, int TILE_N, int HEAD_DIM>
+struct SharedMemory {
+    T* Q;      // [TILE_M, HEAD_DIM]
+    T* K;      // [TILE_N, HEAD_DIM]
+    T* V;      // [TILE_N, HEAD_DIM]
+    float* S;  // [TILE_M, TILE_N]
+    float* P;  // [TILE_M, TILE_N]
+    
+    __device__ SharedMemory(void* ptr) {
+        char* base = reinterpret_cast<char*>(ptr);
+        size_t offset = 0;
+        
+        Q = reinterpret_cast<T*>(base + offset);
+        offset += TILE_M * HEAD_DIM * sizeof(T);
+        
+        K = reinterpret_cast<T*>(base + offset);
+        offset += TILE_N * HEAD_DIM * sizeof(T);
+        
+        V = reinterpret_cast<T*>(base + offset);
+        offset += TILE_N * HEAD_DIM * sizeof(T);
+        
+        S = reinterpret_cast<float*>(base + offset);
+        offset += TILE_M * TILE_N * sizeof(float);
+        
+        P = reinterpret_cast<float*>(base + offset);
+    }
+};
+
+// ==================== GEMM（模板化） ====================
+
+template<typename T, int M, int N, int K>
+__device__ void gemm_nt_unified(const T* A, const T* B, float* C) {
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+    
+    for (int idx = tid; idx < M * N; idx += num_threads) {
+        int i = idx / N;
+        int j = idx % N;
+        
+        float sum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < K; k++) {
+            sum += float(A[i * K + k]) * float(B[j * K + k]);
+        }
+        C[i * N + j] = sum;
+    }
+    __syncthreads();
+}
+
+// ==================== 核心Kernel（模板化） ====================
+
+template<int HEAD_DIM>
+__global__ void flash_attention_kernel_unified(
+    const cutlass::half_t* __restrict__ Q,
+    const cutlass::half_t* __restrict__ K,
+    const cutlass::half_t* __restrict__ V,
+    cutlass::half_t* __restrict__ O,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len
+) {
+    using Config = TileConfig<HEAD_DIM>;
+    constexpr int kTileM = Config::kTileM;
+    constexpr int kTileN = Config::kTileN;
+    
+    const int batch_head_idx = blockIdx.y;
+    const int q_block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    const int batch_idx = batch_head_idx / num_heads;
+    const int head_idx = batch_head_idx % num_heads;
+    
+    const int q_start = q_block_idx * kTileM;
+    const int q_end = min(q_start + kTileM, seq_len);
+    const int q_size = q_end - q_start;
+    
+    if (q_size <= 0) return;
+    
+    const int64_t qkv_offset = (batch_idx * num_heads + head_idx) * seq_len * HEAD_DIM;
+    const cutlass::half_t* Q_ptr = Q + qkv_offset;
+    const cutlass::half_t* K_ptr = K + qkv_offset;
+    const cutlass::half_t* V_ptr = V + qkv_offset;
+    cutlass::half_t* O_ptr = O + qkv_offset;
+    
+    extern __shared__ char smem[];
+    SharedMemory<cutlass::half_t, kTileM, kTileN, HEAD_DIM> shared_mem(smem);
+    
+    // 统计量和累加器的位置
+    size_t base_offset = (kTileM * HEAD_DIM + kTileN * HEAD_DIM * 2) * sizeof(cutlass::half_t) +
+                        (kTileM * kTileN * 2) * sizeof(float);
+    float* m_shared = reinterpret_cast<float*>(smem + base_offset);
+    float* l_shared = m_shared + kTileM;
+    float* O_accum = l_shared + kTileM;
+    
+    // 加载Q
+    for (int idx = tid; idx < q_size * HEAD_DIM; idx += blockDim.x) {
+        int i = idx / HEAD_DIM;
+        int j = idx % HEAD_DIM;
+        shared_mem.Q[i * HEAD_DIM + j] = Q_ptr[(q_start + i) * HEAD_DIM + j];
+    }
+    __syncthreads();
+    
+    // 初始化
+    for (int i = tid; i < kTileM; i += blockDim.x) {
+        m_shared[i] = -INFINITY;
+        l_shared[i] = 0.0f;
+    }
+    for (int i = tid; i < kTileM * HEAD_DIM; i += blockDim.x) {
+        O_accum[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // 遍历K/V tiles
+    const int num_k_blocks = (seq_len + kTileN - 1) / kTileN;
+    
+    for (int k_block_idx = 0; k_block_idx < num_k_blocks; k_block_idx++) {
+        const int k_start = k_block_idx * kTileN;
+        const int k_end = min(k_start + kTileN, seq_len);
+        const int k_size = k_end - k_start;
+        
+        // 加载K和V
+        for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
+            int i = idx / HEAD_DIM;
+            int j = idx % HEAD_DIM;
+            shared_mem.K[i * HEAD_DIM + j] = K_ptr[(k_start + i) * HEAD_DIM + j];
+            shared_mem.V[i * HEAD_DIM + j] = V_ptr[(k_start + i) * HEAD_DIM + j];
+        }
+        __syncthreads();
+        
+        // S = Q @ K^T
+        gemm_nt_unified<cutlass::half_t, kTileM, kTileN, HEAD_DIM>(
+            shared_mem.Q, shared_mem.K, shared_mem.S
+        );
+        
+        // Apply softmax scale
+        for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+            shared_mem.S[idx] *= softmax_scale;
+        }
+        __syncthreads();
+        
+        // Online softmax
+        for (int i = 0; i < q_size; i++) {
+            if (tid == 0) {
+                float* scores = shared_mem.S + i * kTileN;
+                float* P = shared_mem.P + i * kTileN;
+                
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, scores[j]);
+                }
+                
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    P[j] = expf(scores[j] - m_new);
+                    l_new += P[j];
+                }
+                
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    O_accum[i * HEAD_DIM + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
+            }
+        }
+        __syncthreads();
+        
+        // O += P @ V
+        for (int i = 0; i < q_size; i++) {
+            for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+                float sum = 0.0f;
+                const float* P_row = shared_mem.P + i * kTileN;
+                #pragma unroll 8
+                for (int j = 0; j < k_size; j++) {
+                    sum += P_row[j] * float(shared_mem.V[j * HEAD_DIM + d]);
+                }
+                O_accum[i * HEAD_DIM + d] += sum;
+            }
+        }
+        __syncthreads();
+    }
+    
+    // 最终归一化
+    for (int i = 0; i < q_size; i++) {
+        float scale = (l_shared[i] == 0.0f) ? 0.0f : 1.0f / l_shared[i];
+        for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+            float val = O_accum[i * HEAD_DIM + d] * scale;
+            O_ptr[(q_start + i) * HEAD_DIM + d] = cutlass::half_t(val);
+        }
+    }
+}
+
+// ==================== Host接口（模板化） ====================
+
+template<int HEAD_DIM>
+void flash_attention_forward_unified(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    cudaStream_t stream = 0
+) {
+    using Config = TileConfig<HEAD_DIM>;
+    
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+    
+    const int num_q_blocks = (seq_len + Config::kTileM - 1) / Config::kTileM;
+    dim3 grid(num_q_blocks, batch_size * num_heads);
+    dim3 block(Config::kThreads);
+    
+    size_t smem_size = Config::get_smem_size();
+    
+    // 设置shared memory限制
+    cudaFuncSetAttribute(
+        flash_attention_kernel_unified<HEAD_DIM>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+    );
+    
+    // 打印配置（首次调用）
+    static bool first_call = true;
+    if (first_call) {
+        printf("\n");
+        printf("================================================================================\n");
+        printf("Flash Attention Unified (head_dim=%d)\n", HEAD_DIM);
+        printf("================================================================================\n");
+        Config::print_config();
+        printf("================================================================================\n");
+        first_call = false;
+    }
+    
+    flash_attention_kernel_unified<HEAD_DIM><<<grid, block, smem_size, stream>>>(
+        Q, K, V, O,
+        softmax_scale,
+        batch_size, num_heads, seq_len
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Flash attention kernel launch failed: %s\n", 
+                cudaGetErrorString(err));
+    }
+}
+
+// ==================== Reference实现配置 ====================
+
+// Reference使用更保守的tile size以保证正确性
+template<int HEAD_DIM>
+struct RefTileConfig {
+    static constexpr int compute_ref_tile_size() {
+        // Reference使用约为Flash Attention 50%的tile size
+        constexpr int flash_tile = TileConfig<HEAD_DIM>::kTileM;
+        return (flash_tile * 3) / 4;  // 75% of flash tile
+    }
+    
+    static constexpr int kTileM = compute_ref_tile_size() / 2;  // M方向更小
+    static constexpr int kTileN = compute_ref_tile_size();       // N方向保持
+    static constexpr int kHeadDim = HEAD_DIM;
+    static constexpr int kThreads = 128;
+    
+    static constexpr size_t get_smem_size() {
+        return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
+               (kTileM * kTileN) * sizeof(float) +
+               (kTileM * 2) * sizeof(float) +
+               (kTileM * kHeadDim) * sizeof(float);
+    }
+};
+
+// ==================== Reference Kernel（统一模板） ====================
+
+template<int HEAD_DIM>
+__global__ void attention_reference_kernel_unified(
+    const cutlass::half_t* __restrict__ Q,
+    const cutlass::half_t* __restrict__ K,
+    const cutlass::half_t* __restrict__ V,
+    cutlass::half_t* __restrict__ O,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len
+) {
+    using Config = RefTileConfig<HEAD_DIM>;
+    constexpr int kTileM = Config::kTileM;
+    constexpr int kTileN = Config::kTileN;
+    
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    const int q_start = q_block_idx * kTileM;
+    const int q_end = min(q_start + kTileM, seq_len);
+    const int q_size = q_end - q_start;
+    
+    if (q_size <= 0) return;
+    
+    const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * HEAD_DIM;
+    const cutlass::half_t* Q_ptr = Q + offset;
+    const cutlass::half_t* K_ptr = K + offset;
+    const cutlass::half_t* V_ptr = V + offset;
+    cutlass::half_t* O_ptr = O + offset;
+    
+    extern __shared__ char smem[];
+    SharedMemory<cutlass::half_t, kTileM, kTileN, HEAD_DIM> shared_mem(smem);
+    
+    size_t stats_offset = (kTileM * HEAD_DIM + kTileN * HEAD_DIM * 2) * sizeof(cutlass::half_t) +
+                          (kTileM * kTileN * 2) * sizeof(float);
+    float* m_shared = reinterpret_cast<float*>(smem + stats_offset);
+    float* l_shared = m_shared + kTileM;
+    float* O_accum = l_shared + kTileM;
+    
+    // 加载Q
+    for (int idx = tid; idx < q_size * HEAD_DIM; idx += blockDim.x) {
+        int i = idx / HEAD_DIM;
+        int j = idx % HEAD_DIM;
+        shared_mem.Q[i * HEAD_DIM + j] = Q_ptr[(q_start + i) * HEAD_DIM + j];
+    }
+    
+    // 初始化
+    for (int i = tid; i < kTileM; i += blockDim.x) {
+        m_shared[i] = -INFINITY;
+        l_shared[i] = 0.0f;
+    }
+    for (int i = tid; i < kTileM * HEAD_DIM; i += blockDim.x) {
+        O_accum[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // 遍历K/V tiles
+    const int num_kv_tiles = (seq_len + kTileN - 1) / kTileN;
+    
+    for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
+        const int k_start = kv_tile_idx * kTileN;
+        const int k_end = min(k_start + kTileN, seq_len);
+        const int k_size = k_end - k_start;
+        
+        for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
+            int i = idx / HEAD_DIM;
+            int j = idx % HEAD_DIM;
+            shared_mem.K[i * HEAD_DIM + j] = K_ptr[(k_start + i) * HEAD_DIM + j];
+            shared_mem.V[i * HEAD_DIM + j] = V_ptr[(k_start + i) * HEAD_DIM + j];
+        }
+        __syncthreads();
+        
+        gemm_nt_unified<cutlass::half_t, kTileM, kTileN, HEAD_DIM>(
+            shared_mem.Q, shared_mem.K, shared_mem.S
+        );
+        
+        for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+            shared_mem.S[idx] *= softmax_scale;
+        }
+        __syncthreads();
+        
+        // Online softmax
+        for (int i = 0; i < q_size; i++) {
+            if (tid == 0) {
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, shared_mem.S[i * kTileN + j]);
+                }
+                
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    float p = expf(shared_mem.S[i * kTileN + j] - m_new);
+                    shared_mem.S[i * kTileN + j] = p;
+                    l_new += p;
+                }
+                
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    O_accum[i * HEAD_DIM + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
+            }
+        }
+        __syncthreads();
+        
+        for (int i = 0; i < q_size; i++) {
+            for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+                float sum = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    sum += shared_mem.S[i * kTileN + j] * float(shared_mem.V[j * HEAD_DIM + d]);
+                }
+                O_accum[i * HEAD_DIM + d] += sum;
+            }
+        }
+        __syncthreads();
+    }
+    
+    for (int i = 0; i < q_size; i++) {
+        float scale = (l_shared[i] == 0.0f) ? 0.0f : 1.0f / l_shared[i];
+        for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+            float val = O_accum[i * HEAD_DIM + d] * scale;
+            O_ptr[(q_start + i) * HEAD_DIM + d] = cutlass::half_t(val);
+        }
+    }
+}
+
+template<int HEAD_DIM>
+void attention_reference_unified(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    cudaStream_t stream
+) {
+    using Config = RefTileConfig<HEAD_DIM>;
+    
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+    
+    const int num_q_blocks = (seq_len + Config::kTileM - 1) / Config::kTileM;
+    dim3 grid(num_q_blocks, num_heads, batch_size);
+    dim3 block(Config::kThreads);
+    
+    size_t smem_size = Config::get_smem_size();
+    
+    if (smem_size > 48 * 1024) {
+        cudaFuncSetAttribute(
+            attention_reference_kernel_unified<HEAD_DIM>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size
+        );
+    }
+    
+    attention_reference_kernel_unified<HEAD_DIM><<<grid, block, smem_size, stream>>>(
+        Q, K, V, O,
+        softmax_scale,
+        batch_size, num_heads, seq_len
+    );
+}
+
+// ==================== 分发函数 ====================
+
+void flash_attention_forward_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream = 0
+) {
+    // 运行时分发到对应的模板实例
+    switch (head_dim) {
+        case 32:
+            flash_attention_forward_unified<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        case 64:
+            flash_attention_forward_unified<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        case 128:
+            flash_attention_forward_unified<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        default:
+            fprintf(stderr, "Unsupported head_dim=%d (supported: 32, 64, 128)\n", head_dim);
+            break;
+    }
+}
+
+void attention_reference_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream = 0
+) {
+    switch (head_dim) {
+        case 32:
+            attention_reference_unified<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        case 64:
+            attention_reference_unified<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        case 128:
+            attention_reference_unified<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        default:
+            fprintf(stderr, "Unsupported head_dim=%d (supported: 32, 64, 128)\n", head_dim);
+            break;
+    }
+}
+

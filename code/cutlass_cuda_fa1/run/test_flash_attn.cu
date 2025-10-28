@@ -18,8 +18,8 @@
 #include <cmath>
 #include <chrono>
 
-// 声明Flash Attention接口 (head_dim=64)
-void flash_attention_forward(
+// 声明统一的Flash Attention接口（自动根据head_dim选择最优配置）
+void flash_attention_forward_dispatch(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -31,8 +31,8 @@ void flash_attention_forward(
     cudaStream_t stream
 );
 
-// 声明Flash Attention接口 (head_dim=32, 优化版)
-void flash_attention_forward_dim32(
+// 声明统一的Reference接口（自动根据head_dim选择最优配置）
+void attention_reference_dispatch(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -46,31 +46,6 @@ void flash_attention_forward_dim32(
 
 // 声明Baseline实现 (前向声明，实现在后面)
 void attention_baseline(
-    const cutlass::half_t* Q,
-    const cutlass::half_t* K,
-    const cutlass::half_t* V,
-    cutlass::half_t* O,
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim,
-    cudaStream_t stream
-);
-
-// 声明参考实现 (前向声明，实现在后面)
-void attention_reference(
-    const cutlass::half_t* Q,
-    const cutlass::half_t* K,
-    const cutlass::half_t* V,
-    cutlass::half_t* O,
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim,
-    cudaStream_t stream
-);
-
-void attention_reference_dim32(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -237,46 +212,24 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 运行Reference (Tiled) - 根据head_dim选择实现
+    // 运行Reference (Tiled) - 统一接口会自动选择最优配置
     printf("Running Reference (Tiled with shared mem + online softmax)...\n");
     float time_ref = benchmark([&]() {
-        if (config.head_dim == 32) {
-            attention_reference_dim32(
-                d_Q, d_K, d_V, d_O_ref,
-                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-                0
-            );
-        } else if (config.head_dim == 64) {
-            attention_reference(
-                d_Q, d_K, d_V, d_O_ref,
-                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-                0
-            );
-        } else {
-            fprintf(stderr, "Unsupported head_dim=%d (only 32 and 64 supported)\n", config.head_dim);
-            exit(1);
-        }
+        attention_reference_dispatch(
+            d_Q, d_K, d_V, d_O_ref,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
     });
     
-    // 运行Flash Attention - 根据head_dim选择实现
-    printf("Running Flash Attention (Optimized)...\n");
+    // 运行Flash Attention - 统一接口会自动选择最优配置
+    printf("Running Flash Attention (Optimized with auto tile selection)...\n");
     float time_flash = benchmark([&]() {
-        if (config.head_dim == 32) {
-            flash_attention_forward_dim32(
-                d_Q, d_K, d_V, d_O_flash,
-                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-                0
-            );
-        } else if (config.head_dim == 64) {
-            flash_attention_forward(
-                d_Q, d_K, d_V, d_O_flash,
-                config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-                0
-            );
-        } else {
-            fprintf(stderr, "Unsupported head_dim=%d (only 32 and 64 supported)\n", config.head_dim);
-            exit(1);
-        }
+        flash_attention_forward_dispatch(
+            d_Q, d_K, d_V, d_O_flash,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
     });
     
     // 验证正确性
