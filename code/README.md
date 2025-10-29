@@ -30,16 +30,12 @@ ncu ./matmul_app # 验证是不是装上了ncu
 
 ### Latency
 latency统一测试参数：
-
-num_attention_heads=16
-
-hidden_size=512
-
-hidden_dim=512/16=32
-
-seqlen=1024
-
+```
 batch_size=1
+num_attention_heads=32
+seqlen=8192
+hidden_dim=128
+```
 
 
 跑通之后可以调整batch size看一下显存瓶颈的最大batch size
