@@ -1,12 +1,12 @@
 /******************************************************************************
- * Flash Attention 测试程序
+ * Flash Attention Test Program
  * 
- * 功能：
- * 1. 生成随机输入
- * 2. 运行Flash Attention
- * 3. 运行参考实现
- * 4. 对比结果
- * 5. 测量性能
+ * Features:
+ * 1. Generate random input
+ * 2. Run Flash Attention
+ * 3. Run reference implementation
+ * 4. Compare results
+ * 5. Measure performance
  ******************************************************************************/
 
 #include <cuda_runtime.h>
@@ -31,7 +31,7 @@ void flash_attention_forward_dispatch(
     cudaStream_t stream
 );
 
-// 声明Small Tile接口
+// Declare Small Tile interface
 void attention_reference_dispatch(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
@@ -44,7 +44,7 @@ void attention_reference_dispatch(
     cudaStream_t stream
 );
 
-// 声明CUTLASS Tensor Core接口
+// Declare CUTLASS Tensor Core interface
 void flash_attention_cutlass_dispatch(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
@@ -57,7 +57,7 @@ void flash_attention_cutlass_dispatch(
     cudaStream_t stream
 );
 
-// 声明Baseline实现 (前向声明，实现在后面)
+// Declare Baseline implementation (forward declaration, implemented later)
 void attention_baseline(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
@@ -70,7 +70,7 @@ void attention_baseline(
     cudaStream_t stream
 );
 
-// ==================== 辅助函数 ====================
+// ==================== Helper Functions ====================
 
 #define CHECK_CUDA(call) \
     do { \
@@ -82,17 +82,17 @@ void attention_baseline(
         } \
     } while(0)
 
-// 初始化随机数据
+// Initialize random data
 void init_random(cutlass::half_t* data, size_t size, float mean = 0.0f, float stddev = 0.02f) {
     std::vector<float> host_data(size);
-    std::mt19937 gen(42);  // 固定seed以便复现
+    std::mt19937 gen(42);  // fixed seed for reproducibility
     std::normal_distribution<float> dist(mean, stddev);
     
     for (size_t i = 0; i < size; i++) {
         host_data[i] = dist(gen);
     }
     
-    // 转换为half并复制到device
+    // convert to half and copy to device
     std::vector<cutlass::half_t> host_data_half(size);
     for (size_t i = 0; i < size; i++) {
         host_data_half[i] = cutlass::half_t(host_data[i]);
@@ -103,8 +103,8 @@ void init_random(cutlass::half_t* data, size_t size, float mean = 0.0f, float st
                           cudaMemcpyHostToDevice));
 }
 
-// 计算两个数组的最大相对误差
-// 使用对称的相对误差公式，对近零值更稳健: |a-b| / (|a| + |b| + eps)
+// Compute the maximum relative error between two arrays
+// Use the symmetric relative error formula, which is more robust for near-zero values: |a-b| / (|a| + |b| + eps)
 float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t* b, size_t size) {
     std::vector<cutlass::half_t> host_a(size), host_b(size);
     CHECK_CUDA(cudaMemcpy(host_a.data(), a, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
@@ -112,22 +112,22 @@ float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t
     
     float max_error = 0.0f;
     int error_count = 0;
-    const float error_threshold = 0.01f;  // 1% 相对误差阈值
-    const float epsilon = 1e-5f;          // 防止除零
+    const float error_threshold = 0.01f;  // 1% relative error threshold
+    const float epsilon = 1e-5f;          // prevent division by zero
     
     for (size_t i = 0; i < size; i++) {
         float val_a = float(host_a[i]);
         float val_b = float(host_b[i]);
         float abs_diff = std::abs(val_a - val_b);
         
-        // 对称的相对误差: |a-b| / (|a| + |b| + eps)
-        // 这个公式对近零值更稳健，且有界 [0, 1)
+        // Symmetric relative error: |a-b| / (|a| + |b| + eps)
+        // This formula is more robust for near-zero values and bounded [0, 1)
         float denominator = std::abs(val_a) + std::abs(val_b) + epsilon;
         float rel_error = abs_diff / denominator;
         
         if (rel_error > error_threshold) {
             error_count++;
-            if (error_count <= 10) {  // 只打印前10个错误
+            if (error_count <= 10) {  // only print the first 10 errors
                 printf("Error at %zu: flash=%.6f, ref=%.6f, abs_diff=%.6f, rel_err=%.6f\n",
                        i, val_a, val_b, abs_diff, rel_error);
             }
@@ -142,7 +142,7 @@ float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t
     return max_error;
 }
 
-// Benchmark函数
+// Benchmark function
 template<typename Func>
 float benchmark(Func func, int warmup = 5, int repeats = 20) {
     // Warmup
@@ -151,7 +151,7 @@ float benchmark(Func func, int warmup = 5, int repeats = 20) {
     }
     CHECK_CUDA(cudaDeviceSynchronize());
     
-    // 计时
+    // time measurement
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < repeats; i++) {
         func();
@@ -163,7 +163,7 @@ float benchmark(Func func, int warmup = 5, int repeats = 20) {
     return duration.count() / repeats;
 }
 
-// ==================== 测试用例 ====================
+// ==================== Test Cases ====================
 
 struct TestConfig {
     int batch_size;
@@ -190,7 +190,7 @@ void run_test(const TestConfig& config) {
     const size_t qkv_size = config.get_qkv_size();
     const size_t bytes = qkv_size * sizeof(cutlass::half_t);
     
-    // 计算baseline的scores buffer大小
+    // compute the size of the scores buffer for the baseline
     const size_t scores_buffer_size = (size_t)config.batch_size * config.num_heads * 
                                       config.seq_len * config.seq_len * sizeof(float);
     
@@ -200,7 +200,7 @@ void run_test(const TestConfig& config) {
     printf("Total memory: %.2f MB (+ 1 MB for CUTLASS output)\n", 
            (bytes * 4 + scores_buffer_size) / 1024.0 / 1024.0);
     
-    // 分配device memory (including CUTLASS output)
+    // allocate device memory (including CUTLASS output)
     cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline, *d_O_cutlass;
     CHECK_CUDA(cudaMalloc(&d_Q, bytes));
     CHECK_CUDA(cudaMalloc(&d_K, bytes));
@@ -210,13 +210,13 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaMalloc(&d_O_baseline, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_cutlass, bytes));
     
-    // 初始化输入
+    // initialize inputs
     printf("Initializing inputs...\n");
     init_random(d_Q, qkv_size);
     init_random(d_K, qkv_size);
     init_random(d_V, qkv_size);
     
-    // 运行Baseline (Naive)
+    // run Baseline (Naive)
     printf("Running Baseline (Naive, no shared mem, no online softmax)...\n");
     float time_baseline = benchmark([&]() {
         attention_baseline(
@@ -226,7 +226,7 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 运行Small Tile - 保守的tile配置以提高occupancy
+    // run Small Tile - conservative tile configuration to improve occupancy
     printf("Running Flash Attention (Small Tile: conservative config)...\n");
     float time_ref = benchmark([&]() {
         attention_reference_dispatch(
@@ -236,7 +236,7 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 运行Large Tile - 激进的tile配置以最大化数据重用
+    // run Large Tile - aggressive tile configuration to maximize data reuse
     printf("Running Flash Attention (Large Tile: aggressive config)...\n");
     float time_flash = benchmark([&]() {
         flash_attention_forward_dispatch(
@@ -246,7 +246,7 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 运行CUTLASS Tensor Core版本 - 使用与Small Tile相同配置但启用tensor cores
+    // run CUTLASS Tensor Core version - using the same configuration as Small Tile but enabling tensor cores
     printf("Running Flash Attention (CUTLASS Tensor Core: same tile as Small)...\n");
     float time_cutlass = benchmark([&]() {
         flash_attention_cutlass_dispatch(
@@ -256,7 +256,7 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 验证正确性
+    // verify correctness
     printf("\nVerifying correctness...\n");
     printf("Comparing Large Tile vs Small Tile:\n");
     float error_flash_vs_ref = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
@@ -270,7 +270,7 @@ void run_test(const TestConfig& config) {
     printf("\nComparing Large Tile vs Baseline:\n");
     float error_flash_vs_baseline = compute_max_relative_error(d_O_flash, d_O_baseline, qkv_size);
     
-    // 输出结果
+    // output results
     printf("\n");
     printf("================================================================================\n");
     printf("Performance Results:\n");
@@ -293,7 +293,7 @@ void run_test(const TestConfig& config) {
     printf("Baseline vs Small Tile:    %.6f\n", error_baseline_vs_ref);
     printf("Large Tile vs Baseline:    %.6f\n", error_flash_vs_baseline);
     
-    // 判断是否通过 (FP16精度下1-2%的误差是可以接受的)
+    // check if passed (1-2% error in FP16 is acceptable)
     const float error_threshold = 0.02f;  // 2% 误差阈值
     bool test_passed = (error_flash_vs_ref < error_threshold) && 
                        (error_cutlass_vs_ref < error_threshold);
@@ -304,7 +304,7 @@ void run_test(const TestConfig& config) {
         printf("\n❌ TEST FAILED (Some implementations differ by >= %.1f%%)\n", error_threshold * 100);
     }
     
-    // 计算FLOPs和内存带宽
+    // compute FLOPs and memory bandwidth
     const int64_t flops = 4LL * config.batch_size * config.num_heads * 
                           config.seq_len * config.seq_len * config.head_dim;
     const float gflops = flops / 1e9;  // GFLOPs
@@ -313,8 +313,8 @@ void run_test(const TestConfig& config) {
     const float tflops_cutlass = flops / (time_cutlass * 1e-3) / 1e12;
     const float tflops_flash = flops / (time_flash * 1e-3) / 1e12;
     
-    // 计算内存带宽利用 (粗略估计)
-    // Q, K, V的读取 + O的写入 = 4 * bytes
+    // compute memory bandwidth utilization (rough estimate)
+    // read Q, K, V + write O = 4 * bytes
     const size_t memory_ops = 4 * qkv_size * sizeof(cutlass::half_t);
     const float bandwidth_cutlass = memory_ops / (time_cutlass * 1e-3) / 1e9;  // GB/s
     const float bandwidth_flash = memory_ops / (time_flash * 1e-3) / 1e9;  // GB/s
@@ -336,7 +336,7 @@ void run_test(const TestConfig& config) {
     printf("\nNote: Attention is memory-bound. CUTLASS tensor cores help but limited by bandwidth.\n");
     printf("      To see higher TFLOPs, use larger batch sizes or longer sequences.\n");
     
-    // 清理
+    // clean up
     CHECK_CUDA(cudaFree(d_Q));
     CHECK_CUDA(cudaFree(d_K));
     CHECK_CUDA(cudaFree(d_V));
@@ -346,9 +346,9 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaFree(d_O_cutlass));
 }
 
-// ==================== 参考实现（Tiled版本，head_dim=32优化） ====================
+// ==================== Reference Implementation (Tiled version, head_dim=32 optimized) ====================
 
-// Tile sizes for head_dim=32 (使用适中的tile以保持在shared memory限制内)
+// Tile sizes for head_dim=32 (use moderate tiles to stay within shared memory limit)
 constexpr int kRefTileM_32 = 24;  // Query tile size (1.5x larger than dim64's 16)
 constexpr int kRefTileN_32 = 48;  // Key/Value tile size (1.5x larger than dim64's 32)
 constexpr int kRefHeadDim_32 = 32;
@@ -532,7 +532,7 @@ void attention_reference_dim32(
     }
 }
 
-// ==================== Baseline实现（Naive版本，不用shared memory和online softmax） ====================
+// ==================== Baseline Implementation (Naive version, no shared memory and online softmax) ====================
 
 /**
  * 最简单的Attention实现，用于性能和精度对比
@@ -904,18 +904,18 @@ int main() {
     printf("    → Aggressive config, standard CUDA cores\n\n");
     printf("  Baseline:      O(batch × heads × seq_len²) memory ← QUADRATIC!\n\n");
     
-    // 测试用例 - 对比 head_dim=32 和 head_dim=64 的性能
+    // test cases - compare head_dim=32 and head_dim=64 performance
     std::vector<TestConfig> configs = {
-        // // head_dim=64 测试
-        // {1, 1, 512, 64},     // 基线
-        // {1, 1, 1024, 64},    // 长序列
-        // {2, 8, 512, 64},     // 多batch+多head
+        // // head_dim=64 test
+        // {1, 1, 512, 64},     // baseline
+        // {1, 1, 1024, 64},    // long sequence
+        // {2, 8, 512, 64},     // multiple batch+multiple head
         
-        // // head_dim=32 测试 (优化版本，更大的tile)
-        // {1, 1, 512, 32},     // 基线 - 对比64
-        // {1, 1, 1024, 32},    // 长序列 - 对比64
-        // {1, 1, 2048, 32},    // 超长序列 - head_dim=32可以处理更大的seq_len
-        // {2, 8, 512, 32},     // 多batch+多head - 对比64
+        // // head_dim=32 test (optimized version, larger tiles)
+        // {1, 1, 512, 32},     // baseline - compare 64
+        // {1, 1, 1024, 32},    // long sequence - compare 64
+        // {1, 1, 2048, 32},    // super long sequence - head_dim=32 can handle larger seq_len
+        // {2, 8, 512, 32},     // multiple batch+multiple head - compare 64
         {1, 32, 8192, 128}, 
     };
     

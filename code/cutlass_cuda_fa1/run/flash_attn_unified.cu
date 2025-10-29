@@ -15,32 +15,31 @@
 #include <cmath>
 #include <algorithm>
 
-// ==================== Tile Size 计算工具 ====================
+// ==================== Tile Size Helper ====================
 
 /**
- * 编译时计算最优 tile size
+ * compute_max_tile_size computes the maximum possible tile size at compile time
  * 
- * 约束：
+ * Constraints:
  * - A100 shared memory limit: 163 KB (opt-in)
- * - 需要存储: Q[M,D], K[N,D], V[N,D], S[M,N], P[M,N], 统计量, 累加器
+ * - Need to store: Q[M,D], K[N,D], V[N,D], S[M,N], P[M,N], stats, accumulator
  * 
- * 策略：
- * - head_dim 越小，可以用越大的 tile
- * - 保证 shared memory < 160 KB (留一些余量)
+ * Strategy:
+ * - smaller head_dim allows larger tiles
+ * - ensure shared memory < 160 KB (leave some margin)
  */
 template<int HEAD_DIM>
 struct TileConfig {
-    // 计算最大可能的 tile size
+    // compute_max_tile_size gets the maximum possible tile size
     static constexpr int compute_max_tile_size() {
         // Shared memory budget (bytes)
         constexpr size_t MAX_SMEM = 160 * 1024;
         
-        // 对于正方形 tile [M, M]:
+        // for a square tile [M, M]:
         // QKV: M * HEAD_DIM * 2 * 3 (half_t)
         // S,P: M * M * 4 * 2 (float)
         // Stats + Accum: M * 2 * 4 + M * HEAD_DIM * 4
-        
-        // 从大到小尝试
+
         for (int tile = 128; tile >= 32; tile -= 8) {
             size_t qkv_size = tile * HEAD_DIM * sizeof(cutlass::half_t) * 3;
             size_t sp_size = tile * tile * sizeof(float) * 2;
@@ -51,18 +50,19 @@ struct TileConfig {
                 return tile;
             }
         }
-        return 32; // 最小值
+        return 32; // min tile size is 32
     }
     
     static constexpr int kTileM = compute_max_tile_size();
     static constexpr int kTileN = compute_max_tile_size();
     static constexpr int kHeadDim = HEAD_DIM;
     
-    // 线程数：根据 tile 大小选择
-    static constexpr int kThreads = (kTileM >= 96) ? 256 : 
-                                     (kTileM >= 64) ? 128 : 64;
+    // max thread.x per block number is 1024 for A100. But here we use 128 as the max
+    static constexpr int kThreads = (HEAD_DIM * 2 < 64) ? 64 : 
+                                     (HEAD_DIM * 2 > 128) ? 128 : 
+                                     (HEAD_DIM * 2);
     
-    // 打印配置信息
+    // print configuration information
     static void print_config() {
         printf("  Tile Config for head_dim=%d:\n", HEAD_DIM);
         printf("    Tile size: %dx%d\n", kTileM, kTileN);
@@ -78,20 +78,20 @@ struct TileConfig {
     }
 };
 
-// 显式实例化常用配置以验证
+// explicitly instantiate common configurations to verify
 static_assert(TileConfig<32>::kTileM >= 64, "head_dim=32 should support at least 64x64 tile");
 static_assert(TileConfig<64>::kTileM >= 64, "head_dim=64 should support at least 64x64 tile");
 static_assert(TileConfig<128>::kTileM >= 32, "head_dim=128 should support at least 32x32 tile");
 
-// ==================== 共享内存管理（模板化） ====================
+// ==================== Shared Memory Management (Template) ====================
 
 template<typename T, int TILE_M, int TILE_N, int HEAD_DIM>
 struct SharedMemory {
-    T* Q;      // [TILE_M, HEAD_DIM]
-    T* K;      // [TILE_N, HEAD_DIM]
-    T* V;      // [TILE_N, HEAD_DIM]
-    float* S;  // [TILE_M, TILE_N]
-    float* P;  // [TILE_M, TILE_N]
+    T* Q;      // [TILE_M, HEAD_DIM] Q matrix
+    T* K;      // [TILE_N, HEAD_DIM] K matrix
+    T* V;      // [TILE_N, HEAD_DIM] V matrix
+    float* S;  // [TILE_M, TILE_N] S matrix
+    float* P;  // [TILE_M, TILE_N] P matrix
     
     __device__ SharedMemory(void* ptr) {
         char* base = reinterpret_cast<char*>(ptr);
@@ -113,7 +113,7 @@ struct SharedMemory {
     }
 };
 
-// ==================== GEMM（模板化） ====================
+// ==================== GEMM (Template) ====================
 
 template<typename T, int M, int N, int K>
 __device__ void gemm_nt_unified(const T* A, const T* B, float* C) {
@@ -175,14 +175,14 @@ __global__ void flash_attn_large_tile_kernel(
     extern __shared__ char smem[];
     SharedMemory<cutlass::half_t, kTileM, kTileN, HEAD_DIM> shared_mem(smem);
     
-    // 统计量和累加器的位置
+    // positions of stats and accumulator
     size_t base_offset = (kTileM * HEAD_DIM + kTileN * HEAD_DIM * 2) * sizeof(cutlass::half_t) +
                         (kTileM * kTileN * 2) * sizeof(float);
     float* m_shared = reinterpret_cast<float*>(smem + base_offset);
     float* l_shared = m_shared + kTileM;
     float* O_accum = l_shared + kTileM;
     
-    // 加载Q
+    // load Q
     for (int idx = tid; idx < q_size * HEAD_DIM; idx += blockDim.x) {
         int i = idx / HEAD_DIM;
         int j = idx % HEAD_DIM;
@@ -190,7 +190,7 @@ __global__ void flash_attn_large_tile_kernel(
     }
     __syncthreads();
     
-    // 初始化
+    // initialize
     for (int i = tid; i < kTileM; i += blockDim.x) {
         m_shared[i] = -INFINITY;
         l_shared[i] = 0.0f;
@@ -200,7 +200,7 @@ __global__ void flash_attn_large_tile_kernel(
     }
     __syncthreads();
     
-    // 遍历K/V tiles
+    // iterate over K/V tiles
     const int num_k_blocks = (seq_len + kTileN - 1) / kTileN;
     
     for (int k_block_idx = 0; k_block_idx < num_k_blocks; k_block_idx++) {
@@ -208,7 +208,7 @@ __global__ void flash_attn_large_tile_kernel(
         const int k_end = min(k_start + kTileN, seq_len);
         const int k_size = k_end - k_start;
         
-        // 加载K和V
+        // load K and V
         for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
             int i = idx / HEAD_DIM;
             int j = idx % HEAD_DIM;
@@ -278,7 +278,7 @@ __global__ void flash_attn_large_tile_kernel(
         __syncthreads();
     }
     
-    // 最终归一化
+    // final normalization
     for (int i = 0; i < q_size; i++) {
         float scale = (l_shared[i] == 0.0f) ? 0.0f : 1.0f / l_shared[i];
         for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
@@ -311,14 +311,14 @@ void flash_attn_large_tile_forward(
     
     size_t smem_size = Config::get_smem_size();
     
-    // 设置shared memory限制
+    // set shared memory limit
     cudaFuncSetAttribute(
         flash_attn_large_tile_kernel<HEAD_DIM>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         smem_size
     );
     
-    // 打印配置（首次调用）
+    // print configuration (first call)
     static bool first_call = true;
     if (first_call) {
         printf("\n");
@@ -355,8 +355,8 @@ struct SmallTileConfig {
         return (large_tile * 3) / 4;  // 75% of large tile
     }
     
-    static constexpr int kTileM = compute_small_tile_size() / 2;  // M方向更小
-    static constexpr int kTileN = compute_small_tile_size();       // N方向保持
+    static constexpr int kTileM = compute_small_tile_size() / 2;  // smaller M direction
+    static constexpr int kTileN = compute_small_tile_size();       // keep N direction
     static constexpr int kHeadDim = HEAD_DIM;
     static constexpr int kThreads = 128;
     
@@ -412,14 +412,14 @@ __global__ void flash_attn_small_tile_kernel(
     float* l_shared = m_shared + kTileM;
     float* O_accum = l_shared + kTileM;
     
-    // 加载Q
+    // load Q
     for (int idx = tid; idx < q_size * HEAD_DIM; idx += blockDim.x) {
         int i = idx / HEAD_DIM;
         int j = idx % HEAD_DIM;
         shared_mem.Q[i * HEAD_DIM + j] = Q_ptr[(q_start + i) * HEAD_DIM + j];
     }
     
-    // 初始化
+    // initialize
     for (int i = tid; i < kTileM; i += blockDim.x) {
         m_shared[i] = -INFINITY;
         l_shared[i] = 0.0f;
@@ -429,7 +429,7 @@ __global__ void flash_attn_small_tile_kernel(
     }
     __syncthreads();
     
-    // 遍历K/V tiles
+    // iterate over K/V tiles
     const int num_kv_tiles = (seq_len + kTileN - 1) / kTileN;
     
     for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
