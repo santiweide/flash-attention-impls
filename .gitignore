@@ -7,3 +7,7 @@ hwj*
 *.blg
 *.bbl
 *.pdf
+
+test_flash_attn
+perf
+res
