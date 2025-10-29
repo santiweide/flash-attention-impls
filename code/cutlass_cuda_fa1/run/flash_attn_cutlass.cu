@@ -160,11 +160,14 @@ __device__ __forceinline__ void cutlass_gemm_qk(
     // Use tensor cores for aligned portions, fallback for remainder
     if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
         // Tensor core path for well-aligned data
+        // We compute Q @ K^T where:
+        //   Q is [M, K] row-major
+        //   K is [N, K] row-major, need to treat as K^T [K, N]
         for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
             for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
                 // Declare fragments
                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;  // K^T is col-major!
                 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
                 
                 // Initialize accumulator to zero
@@ -172,11 +175,15 @@ __device__ __forceinline__ void cutlass_gemm_qk(
                 
                 // Multiply-accumulate over K dimension
                 for (int k = 0; k < (DIM_K / WMMA_K) * WMMA_K; k += WMMA_K) {
-                    // Load A (Q) and B (K^T, but stored as K)
+                    // Load A (Q[m:m+16, k:k+16]) - row major
                     wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
+                    
+                    // Load B (K^T[k:k+16, n:n+16]) = K[n:n+16, k:k+16] as col-major
+                    // K is stored row-major as [N, K], so K[n, k] is at K + n*DIM_K + k
+                    // To interpret as col-major for K^T, stride is DIM_K
                     wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
                     
-                    // Perform tensor core multiply-accumulate
+                    // Perform tensor core multiply-accumulate: C = A @ B^T + C
                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
                 }
                 
@@ -184,6 +191,8 @@ __device__ __forceinline__ void cutlass_gemm_qk(
                 wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
             }
         }
+        
+        __syncthreads();
     }
     
     // Handle remainder with standard CUDA cores
@@ -196,7 +205,8 @@ __device__ __forceinline__ void cutlass_gemm_qk(
         if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
             int m_base = (i / WMMA_M) * WMMA_M;
             int n_base = (j / WMMA_N) * WMMA_N;
-            if (i < m_base + WMMA_M && j < n_base + WMMA_N && 
+            if (i >= m_base && i < m_base + WMMA_M && 
+                j >= n_base && j < n_base + WMMA_N && 
                 m_base < (q_size / WMMA_M) * WMMA_M && 
                 n_base < (k_size / WMMA_N) * WMMA_N) {
                 continue;  // Already computed by tensor cores
