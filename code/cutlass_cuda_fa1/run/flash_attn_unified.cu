@@ -220,9 +220,11 @@ __global__ void flash_attention_kernel_unified(
             shared_mem.Q, shared_mem.K, shared_mem.S
         );
         
-        // Apply softmax scale
+        // Apply softmax scale (use 2D indexing!)
         for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
-            shared_mem.S[idx] *= softmax_scale;
+            int i = idx / k_size;
+            int j = idx % k_size;
+            shared_mem.S[i * kTileN + j] *= softmax_scale;
         }
         __syncthreads();
         
