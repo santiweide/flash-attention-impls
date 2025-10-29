@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mma.h>  // CUDA WMMA API for tensor cores
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/gemm/device/gemm.h>
@@ -14,6 +15,8 @@
 #include <cutlass/arch/mma.h>
 #include <cmath>
 #include <algorithm>
+
+using namespace nvcuda;
 
 // ==================== CUTLASS GEMM Configuration ====================
 
@@ -125,11 +128,10 @@ struct SharedMemoryCutlass {
     }
 };
 
-// ==================== CUTLASS-based GEMM Wrappers ====================
+// ==================== WMMA Tensor Core GEMM ====================
 
-// Wrapper for Q @ K^T using CUTLASS
-// NOTE: This is a placeholder - uses standard CUDA cores, not tensor cores
-// Matches Small Tile's GEMM exactly for fair comparison
+// Wrapper for Q @ K^T using WMMA Tensor Cores
+// A100 supports m16n8k16 for FP16 inputs with FP32 accumulation
 template<int TILE_M, int TILE_N, int DIM_K>
 __device__ __forceinline__ void cutlass_gemm_qk(
     const cutlass::half_t* Q,  // [TILE_M, DIM_K]
@@ -138,19 +140,70 @@ __device__ __forceinline__ void cutlass_gemm_qk(
     int q_size,                 // Valid rows (≤ TILE_M)
     int k_size                  // Valid cols (≤ TILE_N)
 ) {
-    // Note: CUTLASS device GEMM can't be called from device code directly
-    // Instead, we'll use a simple implementation that mimics tensor core operations
-    // For a true CUTLASS implementation, we'd need to use warp-level primitives
+    // WMMA tile dimensions for A100
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
     
-    // CRITICAL: Only compute the VALID region (q_size × k_size), not full tile!
-    // Otherwise padding contains garbage that breaks softmax
+    const int warpId = threadIdx.x / 32;
+    const int laneId = threadIdx.x % 32;
+    const int numWarps = blockDim.x / 32;
+    
+    // Use WMMA for tensor core acceleration
+    // Each warp processes a 16x16 output tile using multiple 16x16x16 MMA operations
+    
+    // For simplicity and correctness, fall back to standard computation for edges
+    // A full WMMA implementation would handle partial tiles
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
+    // Use tensor cores for aligned portions, fallback for remainder
+    if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+        // Tensor core path for well-aligned data
+        for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
+            for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
+                // Declare fragments
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+                
+                // Initialize accumulator to zero
+                wmma::fill_fragment(c_frag, 0.0f);
+                
+                // Multiply-accumulate over K dimension
+                for (int k = 0; k < (DIM_K / WMMA_K) * WMMA_K; k += WMMA_K) {
+                    // Load A (Q) and B (K^T, but stored as K)
+                    wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
+                    wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
+                    
+                    // Perform tensor core multiply-accumulate
+                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                }
+                
+                // Store result
+                wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
+            }
+        }
+    }
+    
+    // Handle remainder with standard CUDA cores
+    // This handles: partial tiles, edge cases, and any K dimension remainder
     for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
-        int i = idx / k_size;  // Row in valid region
-        int j = idx % k_size;  // Col in valid region
+        int i = idx / k_size;
+        int j = idx % k_size;
         
+        // Skip if already computed by WMMA
+        if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+            int m_base = (i / WMMA_M) * WMMA_M;
+            int n_base = (j / WMMA_N) * WMMA_N;
+            if (i < m_base + WMMA_M && j < n_base + WMMA_N && 
+                m_base < (q_size / WMMA_M) * WMMA_M && 
+                n_base < (k_size / WMMA_N) * WMMA_N) {
+                continue;  // Already computed by tensor cores
+            }
+        }
+        
+        // Compute remainder using CUDA cores
         float sum = 0.0f;
         #pragma unroll
         for (int k = 0; k < DIM_K; k++) {
@@ -161,9 +214,8 @@ __device__ __forceinline__ void cutlass_gemm_qk(
     __syncthreads();
 }
 
-// Wrapper for P @ V using CUTLASS  
-// NOTE: This is a placeholder - uses standard CUDA cores, not tensor cores
-// Matches Small Tile's P@V exactly for fair comparison
+// Wrapper for P @ V using WMMA Tensor Cores
+// P is float, V is half_t - need to convert P to half for WMMA
 template<int TILE_M, int TILE_N, int DIM_K>
 __device__ __forceinline__ void cutlass_gemm_pv(
     const float* P,               // [TILE_M, TILE_N]
@@ -172,18 +224,26 @@ __device__ __forceinline__ void cutlass_gemm_pv(
     int q_size,                   // Valid rows (≤ TILE_M)
     int k_size                    // Valid cols (≤ TILE_N)
 ) {
+    // Note: P @ V is more complex because P is in float, not half
+    // For maximum performance, would need to keep P in half
+    // For now, use CUDA cores for simplicity and correctness
+    
+    // WMMA requires FP16 inputs, but P (attention probs) are in FP32
+    // Converting would add overhead, so use CUDA cores here
+    // Future optimization: store P as half_t if precision allows
+    
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
-    // Only process valid rows - matches Small Tile exactly
+    // Process using CUDA cores (P@V is less compute-intensive than Q@K^T anyway)
     for (int i = 0; i < q_size; i++) {
         for (int d = tid; d < DIM_K; d += num_threads) {
             float sum = 0.0f;
             #pragma unroll 8
-            for (int j = 0; j < k_size; j++) {  // Only valid columns
+            for (int j = 0; j < k_size; j++) {
                 sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
             }
-            O[i * DIM_K + d] += sum;  // Accumulate (beta=1 implicit)
+            O[i * DIM_K + d] += sum;
         }
     }
     __syncthreads();
@@ -365,12 +425,14 @@ void flash_attn_cutlass_forward(
     if (first_call) {
         printf("\n");
         printf("================================================================================\n");
-        printf("Flash Attention - CUTLASS Tensor Core (head_dim=%d)\n", HEAD_DIM);
+        printf("Flash Attention - WMMA Tensor Core (head_dim=%d)\n", HEAD_DIM);
         printf("================================================================================\n");
         printf("  Tile size: %dx%d (same as Small Tile)\n", Config::kTileM, Config::kTileN);
-        printf("  Threads: %d\n", Config::kThreads);
+        printf("  Threads: %d (%d warps)\n", Config::kThreads, Config::kThreads / 32);
         printf("  Shared memory: %.1f KB\n", smem_size / 1024.0);
-        printf("  Tensor Cores: ENABLED (mma.sync.aligned.m16n8k16)\n");
+        printf("  Tensor Cores: ENABLED via WMMA API\n");
+        printf("    → Q@K^T: wmma::mma_sync (16x16x16 tiles, FP16→FP32)\n");
+        printf("    → P@V:   CUDA cores (FP32 input limitation)\n");
         printf("================================================================================\n");
         first_call = false;
     }
