@@ -18,7 +18,7 @@
 #include <cmath>
 #include <chrono>
 
-// 声明统一的Flash Attention接口（自动根据head_dim选择最优配置）
+// 声明Large Tile接口
 void flash_attention_forward_dispatch(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
@@ -31,8 +31,21 @@ void flash_attention_forward_dispatch(
     cudaStream_t stream
 );
 
-// 声明统一的Reference接口（自动根据head_dim选择最优配置）
+// 声明Small Tile接口
 void attention_reference_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
+
+// 声明CUTLASS Tensor Core接口
+void flash_attention_cutlass_dispatch(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -184,17 +197,18 @@ void run_test(const TestConfig& config) {
     printf("Memory per tensor: %.2f MB (Q/K/V/O)\n", bytes / 1024.0 / 1024.0);
     printf("Baseline scores buffer: %.2f MB (batch×heads×seq²×4bytes)\n", 
            scores_buffer_size / 1024.0 / 1024.0);
-    printf("Total memory: %.2f MB\n", 
+    printf("Total memory: %.2f MB (+ 1 MB for CUTLASS output)\n", 
            (bytes * 4 + scores_buffer_size) / 1024.0 / 1024.0);
     
-    // 分配device memory
-    cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline;
+    // 分配device memory (including CUTLASS output)
+    cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline, *d_O_cutlass;
     CHECK_CUDA(cudaMalloc(&d_Q, bytes));
     CHECK_CUDA(cudaMalloc(&d_K, bytes));
     CHECK_CUDA(cudaMalloc(&d_V, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_flash, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_ref, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_baseline, bytes));
+    CHECK_CUDA(cudaMalloc(&d_O_cutlass, bytes));
     
     // 初始化输入
     printf("Initializing inputs...\n");
@@ -232,10 +246,23 @@ void run_test(const TestConfig& config) {
         );
     });
     
+    // 运行CUTLASS Tensor Core版本 - 使用与Small Tile相同配置但启用tensor cores
+    printf("Running Flash Attention (CUTLASS Tensor Core: same tile as Small)...\n");
+    float time_cutlass = benchmark([&]() {
+        flash_attention_cutlass_dispatch(
+            d_Q, d_K, d_V, d_O_cutlass,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
+    });
+    
     // 验证正确性
     printf("\nVerifying correctness...\n");
     printf("Comparing Large Tile vs Small Tile:\n");
     float error_flash_vs_ref = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
+    
+    printf("\nComparing CUTLASS vs Small Tile:\n");
+    float error_cutlass_vs_ref = compute_max_relative_error(d_O_cutlass, d_O_ref, qkv_size);
     
     printf("\nComparing Baseline vs Small Tile:\n");
     float error_baseline_vs_ref = compute_max_relative_error(d_O_baseline, d_O_ref, qkv_size);
@@ -248,27 +275,33 @@ void run_test(const TestConfig& config) {
     printf("================================================================================\n");
     printf("Performance Results:\n");
     printf("================================================================================\n");
-    printf("%-30s %10.3f ms  (%.2fx vs baseline)\n", 
+    printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
            "Baseline (Naive):", time_baseline, 1.0f);
-    printf("%-30s %10.3f ms  (%.2fx vs baseline)\n", 
+    printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
            "Flash Attn (Small Tile):", time_ref, time_baseline / time_ref);
-    printf("%-30s %10.3f ms  (%.2fx vs baseline)\n", 
+    printf("%-35s %10.3f ms  (%.2fx vs baseline, %.2fx vs Small)\n", 
+           "Flash Attn (CUTLASS Tensor Core):", time_cutlass, time_baseline / time_cutlass, time_ref / time_cutlass);
+    printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
            "Flash Attn (Large Tile):", time_flash, time_baseline / time_flash);
     
     printf("\n");
     printf("================================================================================\n");
     printf("Accuracy Results (symmetric relative error):\n");
     printf("================================================================================\n");
-    printf("Large Tile vs Small Tile: %.6f\n", error_flash_vs_ref);
-    printf("Baseline vs Small Tile:   %.6f\n", error_baseline_vs_ref);
-    printf("Large Tile vs Baseline:   %.6f\n", error_flash_vs_baseline);
+    printf("Large Tile vs Small Tile:  %.6f\n", error_flash_vs_ref);
+    printf("CUTLASS vs Small Tile:     %.6f\n", error_cutlass_vs_ref);
+    printf("Baseline vs Small Tile:    %.6f\n", error_baseline_vs_ref);
+    printf("Large Tile vs Baseline:    %.6f\n", error_flash_vs_baseline);
     
     // 判断是否通过 (FP16精度下1-2%的误差是可以接受的)
     const float error_threshold = 0.02f;  // 2% 误差阈值
-    if (error_flash_vs_ref < error_threshold) {
-        printf("\n✅ TEST PASSED (Large vs Small Tile error < %.1f%%)\n", error_threshold * 100);
+    bool test_passed = (error_flash_vs_ref < error_threshold) && 
+                       (error_cutlass_vs_ref < error_threshold);
+    
+    if (test_passed) {
+        printf("\n✅ TEST PASSED (All implementations agree within %.1f%%)\n", error_threshold * 100);
     } else {
-        printf("\n❌ TEST FAILED (Large vs Small Tile error >= %.1f%%)\n", error_threshold * 100);
+        printf("\n❌ TEST FAILED (Some implementations differ by >= %.1f%%)\n", error_threshold * 100);
     }
     
     // 计算FLOPs和内存带宽
@@ -277,24 +310,30 @@ void run_test(const TestConfig& config) {
     const float gflops = flops / 1e9;  // GFLOPs
     const float tflops_baseline = flops / (time_baseline * 1e-3) / 1e12;
     const float tflops_ref = flops / (time_ref * 1e-3) / 1e12;
+    const float tflops_cutlass = flops / (time_cutlass * 1e-3) / 1e12;
     const float tflops_flash = flops / (time_flash * 1e-3) / 1e12;
     
     // 计算内存带宽利用 (粗略估计)
     // Q, K, V的读取 + O的写入 = 4 * bytes
     const size_t memory_ops = 4 * qkv_size * sizeof(cutlass::half_t);
+    const float bandwidth_cutlass = memory_ops / (time_cutlass * 1e-3) / 1e9;  // GB/s
     const float bandwidth_flash = memory_ops / (time_flash * 1e-3) / 1e9;  // GB/s
     
     printf("\n");
     printf("================================================================================\n");
     printf("Throughput:\n");
     printf("================================================================================\n");
-    printf("Total FLOPs:               %.2f GFLOPs (%.2f million ops)\n", gflops, gflops * 1000);
-    printf("Baseline (Naive):          %.2f TFLOPs/s\n", tflops_baseline);
-    printf("Flash Attn (Small Tile):   %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
-    printf("Flash Attn (Large Tile):   %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
+    printf("Total FLOPs:                   %.2f GFLOPs (%.2f million ops)\n", gflops, gflops * 1000);
+    printf("Baseline (Naive):              %.2f TFLOPs/s\n", tflops_baseline);
+    printf("Flash Attn (Small Tile):       %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
+    printf("Flash Attn (CUTLASS TC):       %.2f TFLOPs/s (%.2fx vs baseline, %.2fx vs Small)\n", 
+           tflops_cutlass, tflops_cutlass / tflops_baseline, tflops_cutlass / tflops_ref);
+    printf("Flash Attn (Large Tile):       %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
     printf("\nMemory Bandwidth:\n");
-    printf("Flash Attn (Large Tile):   %.2f GB/s (A100 HBM peak: ~1555 GB/s)\n", bandwidth_flash);
-    printf("\nNote: Attention is memory-bound. Low TFLOPs is expected for small problems.\n");
+    printf("Flash Attn (CUTLASS TC):       %.2f GB/s\n", bandwidth_cutlass);
+    printf("Flash Attn (Large Tile):       %.2f GB/s\n", bandwidth_flash);
+    printf("A100 HBM peak:                 ~1555 GB/s\n");
+    printf("\nNote: Attention is memory-bound. CUTLASS tensor cores help but limited by bandwidth.\n");
     printf("      To see higher TFLOPs, use larger batch sizes or longer sequences.\n");
     
     // 清理
@@ -304,6 +343,7 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaFree(d_O_flash));
     CHECK_CUDA(cudaFree(d_O_ref));
     CHECK_CUDA(cudaFree(d_O_baseline));
+    CHECK_CUDA(cudaFree(d_O_cutlass));
 }
 
 // ==================== 参考实现（Tiled版本，head_dim=32优化） ====================
@@ -852,15 +892,17 @@ int main() {
     
     printf("\n");
     printf("================================================================================\n");
-    printf("Flash Attention Performance Test: Tile Size Comparison\n");
+    printf("Flash Attention Performance Test: Tile Size & CUTLASS Comparison\n");
     printf("================================================================================\n");
-    printf("\nBoth implementations use Flash Attention algorithm (online softmax + tiling)\n");
-    printf("The difference is in the tile size strategy:\n\n");
-    printf("  Large Tile (head_dim=32): 120×120 tiles, 256 threads, 150.9 KB shared mem\n");
-    printf("    → Maximizes data reuse, higher memory pressure\n\n");
-    printf("  Small Tile (head_dim=32): 45×90 tiles, 128 threads, 51.7 KB shared mem\n");
-    printf("    → Lower memory footprint, better occupancy\n\n");
-    printf("  Baseline: O(batch × heads × seq_len²) memory ← QUADRATIC!\n\n");
+    printf("\nAll Flash Attention variants use the same algorithm (online softmax + tiling)\n");
+    printf("Differences are in tile size and compute primitives:\n\n");
+    printf("  Small Tile:    45×90 tiles, 128 threads, 51.7 KB shared mem\n");
+    printf("    → Conservative config, standard CUDA cores\n\n");
+    printf("  CUTLASS TC:    45×90 tiles, 128 threads, 51.7 KB shared mem + Tensor Cores\n");
+    printf("    → Same config as Small Tile, but uses A100 tensor cores for GEMMs\n\n");
+    printf("  Large Tile:    120×120 tiles, 256 threads, 150.9 KB shared mem\n");
+    printf("    → Aggressive config, standard CUDA cores\n\n");
+    printf("  Baseline:      O(batch × heads × seq_len²) memory ← QUADRATIC!\n\n");
     
     // 测试用例 - 对比 head_dim=32 和 head_dim=64 的性能
     std::vector<TestConfig> configs = {

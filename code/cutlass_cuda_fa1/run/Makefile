@@ -25,7 +25,7 @@ NVCC_FLAGS := $(CUDA_ARCH) $(CXX_FLAGS) \
 
 # 目标
 TARGET := test_flash_attn
-SOURCES := test_flash_attn.cu flash_attn_unified.cu
+SOURCES := test_flash_attn.cu flash_attn_unified.cu flash_attn_cutlass.cu
 
 .PHONY: all clean run info
 
