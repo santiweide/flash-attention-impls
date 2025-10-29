@@ -1,20 +1,19 @@
 # Minimal Flash Attention Makefile
-# 快速编译，不依赖CMake
+# Quick compile, no dependencies on CMake
 
-# 配置
+# configure
 NVCC := nvcc
-CUDA_ARCH := -arch=sm_80  # A100架构，根据需要修改为 sm_86 (RTX3090) 或 sm_89 (RTX4090)
+CUDA_ARCH := -arch=sm_80  # A100 architecture, modify as needed to sm_86 (RTX3090) or sm_89 (RTX4090)
 CXX_FLAGS := -std=c++17
 CUTLASS_DIR := ../csrc/cutlass
 
-# 检查Cutlass是否存在
 CUTLASS_INCLUDE := $(CUTLASS_DIR)/include
 ifeq (,$(wildcard $(CUTLASS_INCLUDE)))
     $(warning Cutlass not found at $(CUTLASS_DIR))
     $(warning Please update CUTLASS_DIR in Makefile or run: git submodule update --init csrc/cutlass)
 endif
 
-# 编译选项
+# compile options
 NVCC_FLAGS := $(CUDA_ARCH) $(CXX_FLAGS) \
               -O3 \
               --expt-relaxed-constexpr \
@@ -23,7 +22,7 @@ NVCC_FLAGS := $(CUDA_ARCH) $(CXX_FLAGS) \
               -I. \
               --use_fast_math
 
-# 目标
+# target
 TARGET := test_flash_attn
 SOURCES := test_flash_attn.cu flash_attn_unified.cu flash_attn_cutlass.cu
 
@@ -31,7 +30,7 @@ SOURCES := test_flash_attn.cu flash_attn_unified.cu flash_attn_cutlass.cu
 
 all: $(TARGET)
 
-# 编译
+# compile
 $(TARGET): $(SOURCES)
 	@echo "Compiling $(TARGET)..."
 	@echo "CUDA Architecture: $(CUDA_ARCH)"
@@ -39,16 +38,16 @@ $(TARGET): $(SOURCES)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^
 	@echo "Build complete: ./$(TARGET)"
 
-# 运行
+# run
 run: $(TARGET)
 	@echo "Running $(TARGET)..."
 	./$(TARGET)
 
-# 清理
+# clean
 clean:
 	rm -f $(TARGET) *.o
 
-# 显示信息
+# show information
 info:
 	@echo "=== Build Information ==="
 	@echo "NVCC: $(NVCC)"
@@ -64,8 +63,8 @@ info:
 	@echo "  make info    - Show this information"
 	@echo ""
 	@echo "To change GPU architecture:"
-	@echo "  make CUDA_ARCH=-arch=sm_86  # For RTX 3090/A6000"
-	@echo "  make CUDA_ARCH=-arch=sm_89  # For RTX 4090"
+	@echo "  make CUDA_ARCH=-arch=sm_86  # for RTX 3090/A6000"
+	@echo "  make CUDA_ARCH=-arch=sm_89  # for RTX 4090"
 
 help: info
 

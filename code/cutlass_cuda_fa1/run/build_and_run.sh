@@ -1,20 +1,19 @@
 #!/bin/bash
-# 快速构建和运行脚本
 
-set -e  # 遇到错误立即退出
+    set -e  # exit on error
 
 echo "=========================================="
 echo "Minimal Flash Attention - Quick Start"
 echo "=========================================="
 echo ""
 
-# 颜色输出
+# color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# 检查CUDA
+# check CUDA
 if ! command -v nvcc &> /dev/null; then
     echo -e "${RED}✗${NC} nvcc not found! Please install CUDA Toolkit."
     exit 1
@@ -23,12 +22,12 @@ fi
 CUDA_VERSION=$(nvcc --version | grep "release" | awk '{print $5}' | tr -d ',')
 echo -e "${GREEN}✓${NC} CUDA found: $CUDA_VERSION"
 
-# 检测GPU架构
+# detect GPU architecture
 if command -v nvidia-smi &> /dev/null; then
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
     echo -e "${GREEN}✓${NC} GPU detected: $GPU_NAME"
     
-    # 根据GPU选择架构
+    # select architecture based on GPU
     if [[ $GPU_NAME == *"A100"* ]]; then
         CUDA_ARCH="-arch=sm_80"
     elif [[ $GPU_NAME == *"4090"* ]] || [[ $GPU_NAME == *"4080"* ]]; then
@@ -36,7 +35,7 @@ if command -v nvidia-smi &> /dev/null; then
     elif [[ $GPU_NAME == *"3090"* ]] || [[ $GPU_NAME == *"A6000"* ]]; then
         CUDA_ARCH="-arch=sm_86"
     else
-        CUDA_ARCH="-arch=sm_80"  # 默认
+        CUDA_ARCH="-arch=sm_80"  # default
         echo -e "${YELLOW}⚠${NC} Unknown GPU, using default arch: sm_80"
     fi
     echo "  Using CUDA architecture: $CUDA_ARCH"
@@ -45,7 +44,7 @@ else
     echo -e "${YELLOW}⚠${NC} nvidia-smi not found, using default arch: $CUDA_ARCH"
 fi
 
-# 检查Cutlass
+# check Cutlass
 CUTLASS_DIR="../csrc/cutlass"
 if [ ! -d "$CUTLASS_DIR/include" ]; then
     echo -e "${YELLOW}⚠${NC} Cutlass not found at $CUTLASS_DIR"
@@ -70,8 +69,8 @@ echo "=========================================="
 echo "Building..."
 echo "=========================================="
 
-# 选择构建方式
-BUILD_METHOD=${1:-make}  # 默认使用make
+# select build method
+BUILD_METHOD=${1:-make}  # default use make
 
 if [ "$BUILD_METHOD" = "cmake" ]; then
     echo "Using CMake build system..."
