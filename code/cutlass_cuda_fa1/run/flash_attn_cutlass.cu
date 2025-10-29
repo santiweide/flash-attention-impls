@@ -128,10 +128,10 @@ struct SharedMemoryCutlass {
 // ==================== CUTLASS-based GEMM Wrappers ====================
 
 // Wrapper for Q @ K^T using CUTLASS
-template<int M, int N, int K>
+template<int M, int N, int DIM_K>
 __device__ void cutlass_gemm_qk(
-    const cutlass::half_t* Q,  // [M, K]
-    const cutlass::half_t* K,  // [N, K]
+    const cutlass::half_t* Q,  // [M, DIM_K]
+    const cutlass::half_t* K,  // [N, DIM_K]
     float* S,                   // [M, N]
     float alpha = 1.0f
 ) {
@@ -150,8 +150,8 @@ __device__ void cutlass_gemm_qk(
         
         float sum = 0.0f;
         #pragma unroll
-        for (int k = 0; k < K; k++) {
-            sum += float(Q[i * K + k]) * float(K[j * K + k]);
+        for (int k = 0; k < DIM_K; k++) {
+            sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
         }
         S[i * N + j] = sum * alpha;
     }
@@ -159,24 +159,24 @@ __device__ void cutlass_gemm_qk(
 }
 
 // Wrapper for P @ V using CUTLASS  
-template<int M, int N, int K>
+template<int M, int N, int DIM_K>
 __device__ void cutlass_gemm_pv(
     const float* P,               // [M, N]
-    const cutlass::half_t* V,    // [N, K]
-    float* O,                     // [M, K]
+    const cutlass::half_t* V,    // [N, DIM_K]
+    float* O,                     // [M, DIM_K]
     float beta = 1.0f             // For accumulation: O = P@V + beta*O
 ) {
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
     for (int i = 0; i < M; i++) {
-        for (int k = tid; k < K; k += num_threads) {
+        for (int k = tid; k < DIM_K; k += num_threads) {
             float sum = 0.0f;
             #pragma unroll 8
             for (int j = 0; j < N; j++) {
-                sum += P[i * N + j] * float(V[j * K + k]);
+                sum += P[i * N + j] * float(V[j * DIM_K + k]);
             }
-            O[i * K + k] = sum + beta * O[i * K + k];
+            O[i * DIM_K + k] = sum + beta * O[i * DIM_K + k];
         }
     }
     __syncthreads();

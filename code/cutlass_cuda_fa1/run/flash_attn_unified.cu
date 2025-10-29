@@ -382,7 +382,7 @@ __global__ void flash_attn_small_tile_kernel(
     int num_heads,
     int seq_len
 ) {
-    using Config = RefTileConfig<HEAD_DIM>;
+    using Config = SmallTileConfig<HEAD_DIM>;
     constexpr int kTileM = Config::kTileM;
     constexpr int kTileN = Config::kTileN;
     
