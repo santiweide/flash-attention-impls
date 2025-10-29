@@ -134,10 +134,12 @@ __device__ void gemm_nt_unified(const T* A, const T* B, float* C) {
     __syncthreads();
 }
 
-// ==================== 核心Kernel（模板化） ====================
+// ==================== Flash Attention: Large Tile Kernel ====================
+// Uses aggressive tile sizes (e.g., 120×120 for head_dim=32) to maximize
+// data reuse at the cost of higher shared memory usage
 
 template<int HEAD_DIM>
-__global__ void flash_attention_kernel_unified(
+__global__ void flash_attn_large_tile_kernel(
     const cutlass::half_t* __restrict__ Q,
     const cutlass::half_t* __restrict__ K,
     const cutlass::half_t* __restrict__ V,
@@ -286,10 +288,10 @@ __global__ void flash_attention_kernel_unified(
     }
 }
 
-// ==================== Host接口（模板化） ====================
+// ==================== Host Interface: Large Tile ====================
 
 template<int HEAD_DIM>
-void flash_attention_forward_unified(
+void flash_attn_large_tile_forward(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -311,7 +313,7 @@ void flash_attention_forward_unified(
     
     // 设置shared memory限制
     cudaFuncSetAttribute(
-        flash_attention_kernel_unified<HEAD_DIM>,
+        flash_attn_large_tile_kernel<HEAD_DIM>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         smem_size
     );
@@ -321,14 +323,14 @@ void flash_attention_forward_unified(
     if (first_call) {
         printf("\n");
         printf("================================================================================\n");
-        printf("Flash Attention Unified (head_dim=%d)\n", HEAD_DIM);
+        printf("Flash Attention - Large Tile Configuration (head_dim=%d)\n", HEAD_DIM);
         printf("================================================================================\n");
         Config::print_config();
         printf("================================================================================\n");
         first_call = false;
     }
     
-    flash_attention_kernel_unified<HEAD_DIM><<<grid, block, smem_size, stream>>>(
+    flash_attn_large_tile_kernel<HEAD_DIM><<<grid, block, smem_size, stream>>>(
         Q, K, V, O,
         softmax_scale,
         batch_size, num_heads, seq_len
@@ -341,19 +343,20 @@ void flash_attention_forward_unified(
     }
 }
 
-// ==================== Reference实现配置 ====================
+// ==================== Flash Attention: Small Tile Configuration ====================
+// Uses conservative tile sizes (e.g., 45×90 for head_dim=32) to reduce
+// shared memory pressure and improve occupancy
 
-// Reference使用更保守的tile size以保证正确性
 template<int HEAD_DIM>
-struct RefTileConfig {
-    static constexpr int compute_ref_tile_size() {
-        // Reference使用约为Flash Attention 50%的tile size
-        constexpr int flash_tile = TileConfig<HEAD_DIM>::kTileM;
-        return (flash_tile * 3) / 4;  // 75% of flash tile
+struct SmallTileConfig {
+    static constexpr int compute_small_tile_size() {
+        // Small tile uses ~75% of large tile size, with asymmetric M/N
+        constexpr int large_tile = TileConfig<HEAD_DIM>::kTileM;
+        return (large_tile * 3) / 4;  // 75% of large tile
     }
     
-    static constexpr int kTileM = compute_ref_tile_size() / 2;  // M方向更小
-    static constexpr int kTileN = compute_ref_tile_size();       // N方向保持
+    static constexpr int kTileM = compute_small_tile_size() / 2;  // M方向更小
+    static constexpr int kTileN = compute_small_tile_size();       // N方向保持
     static constexpr int kHeadDim = HEAD_DIM;
     static constexpr int kThreads = 128;
     
@@ -365,10 +368,11 @@ struct RefTileConfig {
     }
 };
 
-// ==================== Reference Kernel（统一模板） ====================
+// ==================== Flash Attention: Small Tile Kernel ====================
+// Same algorithm as large tile, but uses smaller tiles for better occupancy
 
 template<int HEAD_DIM>
-__global__ void attention_reference_kernel_unified(
+__global__ void flash_attn_small_tile_kernel(
     const cutlass::half_t* __restrict__ Q,
     const cutlass::half_t* __restrict__ K,
     const cutlass::half_t* __restrict__ V,
@@ -505,7 +509,7 @@ __global__ void attention_reference_kernel_unified(
 }
 
 template<int HEAD_DIM>
-void attention_reference_unified(
+void flash_attn_small_tile_forward(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -515,7 +519,7 @@ void attention_reference_unified(
     int seq_len,
     cudaStream_t stream
 ) {
-    using Config = RefTileConfig<HEAD_DIM>;
+    using Config = SmallTileConfig<HEAD_DIM>;
     
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
     
@@ -527,20 +531,21 @@ void attention_reference_unified(
     
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(
-            attention_reference_kernel_unified<HEAD_DIM>,
+            flash_attn_small_tile_kernel<HEAD_DIM>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size
         );
     }
     
-    attention_reference_kernel_unified<HEAD_DIM><<<grid, block, smem_size, stream>>>(
+    flash_attn_small_tile_kernel<HEAD_DIM><<<grid, block, smem_size, stream>>>(
         Q, K, V, O,
         softmax_scale,
         batch_size, num_heads, seq_len
     );
 }
 
-// ==================== 分发函数 ====================
+// ==================== Dispatch Functions ====================
+// Public API: Automatically selects appropriate kernel based on head_dim
 
 void flash_attention_forward_dispatch(
     const cutlass::half_t* Q,
@@ -553,22 +558,53 @@ void flash_attention_forward_dispatch(
     int head_dim,
     cudaStream_t stream = 0
 ) {
-    // 运行时分发到对应的模板实例
+    // Runtime dispatch to large tile implementation
     switch (head_dim) {
         case 32:
-            flash_attention_forward_unified<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            flash_attn_large_tile_forward<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
             break;
         case 64:
-            flash_attention_forward_unified<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            flash_attn_large_tile_forward<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
             break;
         case 128:
-            flash_attention_forward_unified<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            flash_attn_large_tile_forward<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
             break;
         default:
             fprintf(stderr, "Unsupported head_dim=%d (supported: 32, 64, 128)\n", head_dim);
             break;
     }
 }
+
+void flash_attention_small_tile_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream = 0
+) {
+    // Runtime dispatch to small tile implementation
+    switch (head_dim) {
+        case 32:
+            flash_attn_small_tile_forward<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        case 64:
+            flash_attn_small_tile_forward<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        case 128:
+            flash_attn_small_tile_forward<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            break;
+        default:
+            fprintf(stderr, "Unsupported head_dim=%d (supported: 32, 64, 128)\n", head_dim);
+            break;
+    }
+}
+
+// ==================== Backward Compatibility Aliases ====================
+// Keep old function name for existing code that uses it
 
 void attention_reference_dispatch(
     const cutlass::half_t* Q,
@@ -581,19 +617,7 @@ void attention_reference_dispatch(
     int head_dim,
     cudaStream_t stream = 0
 ) {
-    switch (head_dim) {
-        case 32:
-            attention_reference_unified<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
-            break;
-        case 64:
-            attention_reference_unified<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
-            break;
-        case 128:
-            attention_reference_unified<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
-            break;
-        default:
-            fprintf(stderr, "Unsupported head_dim=%d (supported: 32, 64, 128)\n", head_dim);
-            break;
-    }
+    // Redirect to the small tile implementation
+    flash_attention_small_tile_dispatch(Q, K, V, O, batch_size, num_heads, seq_len, head_dim, stream);
 }
 

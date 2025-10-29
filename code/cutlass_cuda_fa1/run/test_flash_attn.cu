@@ -212,8 +212,8 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 运行Reference (Tiled) - 统一接口会自动选择最优配置
-    printf("Running Reference (Tiled with shared mem + online softmax)...\n");
+    // 运行Small Tile - 保守的tile配置以提高occupancy
+    printf("Running Flash Attention (Small Tile: conservative config)...\n");
     float time_ref = benchmark([&]() {
         attention_reference_dispatch(
             d_Q, d_K, d_V, d_O_ref,
@@ -222,8 +222,8 @@ void run_test(const TestConfig& config) {
         );
     });
     
-    // 运行Flash Attention - 统一接口会自动选择最优配置
-    printf("Running Flash Attention (Optimized with auto tile selection)...\n");
+    // 运行Large Tile - 激进的tile配置以最大化数据重用
+    printf("Running Flash Attention (Large Tile: aggressive config)...\n");
     float time_flash = benchmark([&]() {
         flash_attention_forward_dispatch(
             d_Q, d_K, d_V, d_O_flash,
@@ -234,13 +234,13 @@ void run_test(const TestConfig& config) {
     
     // 验证正确性
     printf("\nVerifying correctness...\n");
-    printf("Comparing Flash vs Reference (Tiled):\n");
+    printf("Comparing Large Tile vs Small Tile:\n");
     float error_flash_vs_ref = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
     
-    printf("\nComparing Baseline vs Reference (Tiled):\n");
+    printf("\nComparing Baseline vs Small Tile:\n");
     float error_baseline_vs_ref = compute_max_relative_error(d_O_baseline, d_O_ref, qkv_size);
     
-    printf("\nComparing Flash vs Baseline:\n");
+    printf("\nComparing Large Tile vs Baseline:\n");
     float error_flash_vs_baseline = compute_max_relative_error(d_O_flash, d_O_baseline, qkv_size);
     
     // 输出结果
@@ -248,27 +248,27 @@ void run_test(const TestConfig& config) {
     printf("================================================================================\n");
     printf("Performance Results:\n");
     printf("================================================================================\n");
-    printf("%-25s %10.3f ms  (%.2fx vs baseline)\n", 
+    printf("%-30s %10.3f ms  (%.2fx vs baseline)\n", 
            "Baseline (Naive):", time_baseline, 1.0f);
-    printf("%-25s %10.3f ms  (%.2fx vs baseline)\n", 
-           "Reference (Tiled):", time_ref, time_baseline / time_ref);
-    printf("%-25s %10.3f ms  (%.2fx vs baseline)\n", 
-           "Flash Attention:", time_flash, time_baseline / time_flash);
+    printf("%-30s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Flash Attn (Small Tile):", time_ref, time_baseline / time_ref);
+    printf("%-30s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Flash Attn (Large Tile):", time_flash, time_baseline / time_flash);
     
     printf("\n");
     printf("================================================================================\n");
     printf("Accuracy Results (symmetric relative error):\n");
     printf("================================================================================\n");
-    printf("Flash vs Reference:    %.6f\n", error_flash_vs_ref);
-    printf("Baseline vs Reference: %.6f\n", error_baseline_vs_ref);
-    printf("Flash vs Baseline:     %.6f\n", error_flash_vs_baseline);
+    printf("Large Tile vs Small Tile: %.6f\n", error_flash_vs_ref);
+    printf("Baseline vs Small Tile:   %.6f\n", error_baseline_vs_ref);
+    printf("Large Tile vs Baseline:   %.6f\n", error_flash_vs_baseline);
     
     // 判断是否通过 (FP16精度下1-2%的误差是可以接受的)
     const float error_threshold = 0.02f;  // 2% 误差阈值
     if (error_flash_vs_ref < error_threshold) {
-        printf("\n✅ TEST PASSED (Flash vs Ref error < %.1f%%)\n", error_threshold * 100);
+        printf("\n✅ TEST PASSED (Large vs Small Tile error < %.1f%%)\n", error_threshold * 100);
     } else {
-        printf("\n❌ TEST FAILED (Flash vs Ref error >= %.1f%%)\n", error_threshold * 100);
+        printf("\n❌ TEST FAILED (Large vs Small Tile error >= %.1f%%)\n", error_threshold * 100);
     }
     
     // 计算FLOPs和内存带宽
@@ -288,12 +288,12 @@ void run_test(const TestConfig& config) {
     printf("================================================================================\n");
     printf("Throughput:\n");
     printf("================================================================================\n");
-    printf("Total FLOPs:       %.2f GFLOPs (%.2f million ops)\n", gflops, gflops * 1000);
-    printf("Baseline (Naive):  %.2f TFLOPs/s\n", tflops_baseline);
-    printf("Reference (Tiled): %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
-    printf("Flash Attention:   %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
+    printf("Total FLOPs:               %.2f GFLOPs (%.2f million ops)\n", gflops, gflops * 1000);
+    printf("Baseline (Naive):          %.2f TFLOPs/s\n", tflops_baseline);
+    printf("Flash Attn (Small Tile):   %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
+    printf("Flash Attn (Large Tile):   %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
     printf("\nMemory Bandwidth:\n");
-    printf("Flash Attention:   %.2f GB/s (A100 HBM peak: ~1555 GB/s)\n", bandwidth_flash);
+    printf("Flash Attn (Large Tile):   %.2f GB/s (A100 HBM peak: ~1555 GB/s)\n", bandwidth_flash);
     printf("\nNote: Attention is memory-bound. Low TFLOPs is expected for small problems.\n");
     printf("      To see higher TFLOPs, use larger batch sizes or longer sequences.\n");
     
@@ -852,14 +852,15 @@ int main() {
     
     printf("\n");
     printf("================================================================================\n");
-    printf("Flash Attention Performance Test with head_dim Comparison\n");
+    printf("Flash Attention Performance Test: Tile Size Comparison\n");
     printf("================================================================================\n");
-    printf("\nSupported configurations:\n");
-    printf("- head_dim=64: Standard, Flash tile 64x64, Ref tile 16x32\n");
-    printf("- head_dim=32: Optimized, Flash tile 96x96, Ref tile 24x48 (~1.5x larger!)\n");
-    printf("\nBaseline memory: O(batch × heads × seq_len²) ← QUADRATIC in seq_len!\n");
-    printf("Flash/Ref use tiling: O(tile_size²) memory only\n");
-    printf("\n");
+    printf("\nBoth implementations use Flash Attention algorithm (online softmax + tiling)\n");
+    printf("The difference is in the tile size strategy:\n\n");
+    printf("  Large Tile (head_dim=32): 120×120 tiles, 256 threads, 150.9 KB shared mem\n");
+    printf("    → Maximizes data reuse, higher memory pressure\n\n");
+    printf("  Small Tile (head_dim=32): 45×90 tiles, 128 threads, 51.7 KB shared mem\n");
+    printf("    → Lower memory footprint, better occupancy\n\n");
+    printf("  Baseline: O(batch × heads × seq_len²) memory ← QUADRATIC!\n\n");
     
     // 测试用例 - 对比 head_dim=32 和 head_dim=64 的性能
     std::vector<TestConfig> configs = {
