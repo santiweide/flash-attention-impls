@@ -535,29 +535,29 @@ void attention_reference_dim32(
 // ==================== Baseline Implementation (Naive version, no shared memory and online softmax) ====================
 
 /**
- * 最简单的Attention实现，用于性能和精度对比
+* Simplest Attention implementation, for performance and accuracy comparison
  * 
- * 特点：
- * - 不使用shared memory（只用全局内存）
- * - 不使用online softmax（标准的两遍扫描）
- * - 每个thread处理一个query position
- * - 分配全局内存来存储attention scores
+ * Features:
+ * - No shared memory (only global memory)
+ * - No online softmax (standard two-pass scan)
+ * - Each thread processes one query position
+ * - Allocate global memory to store attention scores
  * 
- * 这是最直观的实现，但性能最差（大量全局内存访问）
+ * This is the most straightforward implementation, but the worst performance, many HBM access
  */
 __global__ void attention_baseline_kernel(
     const cutlass::half_t* __restrict__ Q,
     const cutlass::half_t* __restrict__ K,
     const cutlass::half_t* __restrict__ V,
     cutlass::half_t* __restrict__ O,
-    float* __restrict__ scores_buffer,  // 全局内存: [batch, heads, seq, seq]
+    float* __restrict__ scores_buffer,  // global memory: [batch, heads, seq, seq]
     float softmax_scale,
     int batch_size,
     int num_heads,
     int seq_len,
     int head_dim
 ) {
-    // 每个thread处理一个query position
+    // each thread processes one query position
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
     const int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -570,11 +570,11 @@ __global__ void attention_baseline_kernel(
     const cutlass::half_t* V_ptr = V + offset;
     cutlass::half_t* O_ptr = O + offset;
     
-    // 计算这个query在scores buffer中的位置
+    // calculate the position of this query in the scores buffer
     const int64_t scores_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_idx) * seq_len;
     float* my_scores = scores_buffer + scores_offset;
     
-    // Step 1: 计算 S = Q[q_idx] @ K^T (存到全局内存)
+    // Step 1: calculate S = Q[q_idx] @ K^T (store in global memory)
     for (int k_idx = 0; k_idx < seq_len; k_idx++) {
         float sum = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -585,25 +585,25 @@ __global__ void attention_baseline_kernel(
         my_scores[k_idx] = sum * softmax_scale;
     }
     
-    // Step 2: Softmax - 第一遍：找max
+    // Step 2: Softmax - first pass: find max
     float max_score = -INFINITY;
     for (int i = 0; i < seq_len; i++) {
         max_score = fmaxf(max_score, my_scores[i]);
     }
     
-    // Step 3: Softmax - 第二遍：计算exp和sum
+    // Step 3: Softmax - second pass: calculate exp and sum
     float sum_exp = 0.0f;
     for (int i = 0; i < seq_len; i++) {
         my_scores[i] = expf(my_scores[i] - max_score);
         sum_exp += my_scores[i];
     }
     
-    // Step 4: Softmax - 归一化
+    // Step 4: Softmax - normalization
     for (int i = 0; i < seq_len; i++) {
         my_scores[i] /= sum_exp;
     }
     
-    // Step 5: 计算 O = softmax(S) @ V
+    // Step 5: calculate O = softmax(S) @ V
     for (int d = 0; d < head_dim; d++) {
         float sum = 0.0f;
         for (int k_idx = 0; k_idx < seq_len; k_idx++) {
@@ -632,11 +632,9 @@ void attention_baseline(
     dim3 grid(blocks_x, num_heads, batch_size);
     dim3 block(threads);
     
-    // 分配全局内存来存储所有的attention scores
     size_t scores_size = (size_t)batch_size * num_heads * seq_len * seq_len * sizeof(float);
     float* d_scores_buffer;
     CHECK_CUDA(cudaMalloc(&d_scores_buffer, scores_size));
-    
     attention_baseline_kernel<<<grid, block, 0, stream>>>(
         Q, K, V, O,
         d_scores_buffer,
@@ -653,15 +651,15 @@ void attention_baseline(
     CHECK_CUDA(cudaFree(d_scores_buffer));
 }
 
-// ==================== 参考实现（Tiled版本） ====================
+// ==================== Reference Implementation (Tiled version) ====================
 
 /**
- * 标准Attention实现: O = softmax(Q @ K^T / sqrt(d)) @ V
+ * Standard Attention implementation: O = softmax(Q @ K^T / sqrt(d)) @ V
  * 
- * 使用tiled approach来高效使用shared memory
- * 每个block处理多个query positions，使用在线softmax
+ * Use tiled approach to efficiently use shared memory
+ * Each block processes multiple query positions, using online softmax
  * 
- * 这样只需要存储tile而不是整个序列，大大减少shared memory使用
+ * This only stores tiles instead of the entire sequence, greatly reducing shared memory usage
  */
 
 // Tile sizes for reference implementation
@@ -824,58 +822,6 @@ __global__ void attention_reference_kernel(
         }
     }
 }
-
-void attention_reference(
-    const cutlass::half_t* Q,
-    const cutlass::half_t* K,
-    const cutlass::half_t* V,
-    cutlass::half_t* O,
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim,
-    cudaStream_t stream
-) {
-    assert(head_dim == kRefHeadDim && "Reference implementation expects head_dim=64");
-    
-    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-    
-    const int num_q_blocks = (seq_len + kRefTileM - 1) / kRefTileM;
-    dim3 grid(num_q_blocks, num_heads, batch_size);
-    dim3 block(128);  // 128 threads per block
-    
-    // Calculate shared memory size
-    size_t smem_size = (kRefTileM * kRefHeadDim + kRefTileN * kRefHeadDim * 2) * sizeof(cutlass::half_t) +
-                       (kRefTileM * kRefTileN) * sizeof(float) +  // S_tile
-                       (kRefTileM * 2) * sizeof(float) +          // m_shared, l_shared
-                       (kRefTileM * kRefHeadDim) * sizeof(float); // O_accum
-    
-    // Set shared memory limit if needed
-    if (smem_size > 48 * 1024) {
-        cudaFuncSetAttribute(
-            attention_reference_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_size
-        );
-    }
-    
-    attention_reference_kernel<<<grid, block, smem_size, stream>>>(
-        Q, K, V, O,
-        softmax_scale,
-        batch_size, num_heads, seq_len, head_dim
-    );
-    
-    // Check for kernel launch errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "Reference kernel launch failed: %s\n", 
-                cudaGetErrorString(err));
-        fprintf(stderr, "  Grid: (%d, %d, %d), Block: (%d), Shared mem: %zu bytes (%.1f KB)\n",
-                grid.x, grid.y, grid.z, block.x, smem_size, smem_size / 1024.0);
-    }
-}
-
-// ==================== Main ====================
 
 int main() {
     printf("Flash Attention Minimal Implementation Test\n");
