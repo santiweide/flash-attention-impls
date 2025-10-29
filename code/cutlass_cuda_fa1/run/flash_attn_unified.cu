@@ -57,9 +57,9 @@ struct TileConfig {
     static constexpr int kTileN = compute_max_tile_size();
     static constexpr int kHeadDim = HEAD_DIM;
     
-    // max thread.x per block number is 1024 for A100. But here we use 128 as the max
+    // max thread.x per block number is 1024 for A100. But here we use 256 as the max
     static constexpr int kThreads = (HEAD_DIM * 2 < 64) ? 64 : 
-                                     (HEAD_DIM * 2 > 128) ? 128 : 
+                                     (HEAD_DIM * 2 > 256) ? 256 : 
                                      (HEAD_DIM * 2);
     
     // print configuration information
@@ -358,7 +358,7 @@ struct SmallTileConfig {
     static constexpr int kTileM = compute_small_tile_size() / 2;  // smaller M direction
     static constexpr int kTileN = compute_small_tile_size();       // keep N direction
     static constexpr int kHeadDim = HEAD_DIM;
-    static constexpr int kThreads = 128;
+    static constexpr int kThreads = 256;
     
     static constexpr size_t get_smem_size() {
         return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +

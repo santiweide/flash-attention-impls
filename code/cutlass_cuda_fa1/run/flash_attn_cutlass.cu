@@ -88,7 +88,7 @@ struct CutlassSmallTileConfig {
     static constexpr int kTileM = compute_small_tile_size() / 2;  // M方向更小
     static constexpr int kTileN = compute_small_tile_size();       // N方向保持
     static constexpr int kHeadDim = HEAD_DIM;
-    static constexpr int kThreads = 128;
+    static constexpr int kThreads = 256;
     
     static constexpr size_t get_smem_size() {
         return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
