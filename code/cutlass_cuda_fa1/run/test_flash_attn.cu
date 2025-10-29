@@ -842,11 +842,11 @@ int main() {
     printf("================================================================================\n");
     printf("\nAll Flash Attention variants use the same algorithm (online softmax + tiling)\n");
     printf("Differences are in tile size and compute primitives:\n\n");
-    printf("  Small Tile:    45×90 tiles, 128 threads, 51.7 KB shared mem\n");
+    printf("  Small Tile:    45×90 tiles, 256 threads, 51.7 KB shared mem\n");
     printf("    → Conservative config, standard CUDA cores\n\n");
-    printf("  CUTLASS TC:    45×90 tiles, 128 threads, 51.7 KB shared mem + Tensor Cores\n");
+    printf("  CUTLASS TC:    45×90 tiles, 256 threads, 51.7 KB shared mem + Tensor Cores\n");
     printf("    → Same config as Small Tile, but uses A100 tensor cores for GEMMs\n\n");
-    printf("  Large Tile:    120×120 tiles, 256 threads, 150.9 KB shared mem\n");
+    printf("  Large Tile:    120×120 tiles, 64 threads, 150.9 KB shared mem\n");
     printf("    → Aggressive config, standard CUDA cores\n\n");
     printf("  Baseline:      O(batch × heads × seq_len²) memory ← QUADRATIC!\n\n");
     
