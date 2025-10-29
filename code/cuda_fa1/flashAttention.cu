@@ -15,7 +15,7 @@ __global__ void flash_attention_forward(
 
     int Bc = (int)ceilf((float)M / (4.0f * (float)d));
     int Br = (Bc < d) ? Bc : d;
-
+    
     int Tr = (N + Br - 1) / Br;
     int Tc = (N + Bc - 1) / Bc;
 
@@ -67,25 +67,26 @@ __global__ void flash_attention_forward(
             int gi = qi_start + r;
             
 
-            float q_row[64];
+            float q_row[128];
             for (int t = 0; t < d; ++t) q_row[t] = Q_bh[gi*d + t];
 
 
             float m_row = m_bh[gi];
             float l_row = l_bh[gi];
-            float O_row[64];
+            float O_row[128];
             for (int t = 0; t < d; ++t) O_row[t] = O_bh[gi*d + t];
 
 
             float s_scores[128];
             float m_til = -1e9f;
+            float scale = 1.0f / sqrtf((float)d);  // 添加缩放因子 1/sqrt(d)
             for (int c = 0; c < bc_size; ++c) {
                 float s = 0.0f;
                 for (int t = 0; t < d; ++t) {
                     s += q_row[t] * Kj[c*d + t];
                 }
-                s_scores[c] = s;
-                if (s > m_til) m_til = s;
+                s_scores[c] = s * scale;  // 应用缩放因子
+                if (s_scores[c] > m_til) m_til = s_scores[c];
             }
 
 
@@ -121,72 +122,3 @@ __global__ void flash_attention_forward(
     }
 }
 
-int main(int argc, char** argv) {
-    int B    = (argc>1)? atoi(argv[1]) : 1;
-    int H    = (argc>2)? atoi(argv[2]) : 8;
-    int N    = (argc>3)? atoi(argv[3]) : 512;
-    int d    = (argc>4)? atoi(argv[4]) : 64;
-    int M    = (argc>5)? atoi(argv[5]) : 4096;
-    int runs = (argc>6)? atoi(argv[6]) : 50;
-
-    int Bc = (int)ceilf((float)M / (4.0f * (float)d));
-    int Br = (Bc < d) ? Bc : d;
-    int Tr = (N + Br - 1) / Br;
-
-    dim3 grid(Tr, B*H);
-    dim3 block(Br);
-    size_t shmem = (size_t)(Br*d + Bc*d + Bc*d) * sizeof(float);
-
-
-    size_t size_QKV = (size_t)B * H * N * d * sizeof(float);
-    size_t size_LM  = (size_t)B * H * N * sizeof(float);
-    float *Q,*K,*V,*O,*l,*m;
-    cudaMalloc(&Q,size_QKV);
-    cudaMalloc(&K,size_QKV);
-    cudaMalloc(&V,size_QKV);
-    cudaMalloc(&O,size_QKV);
-    cudaMalloc(&l,size_LM);
-    cudaMalloc(&m,size_LM);
-
-
-    cudaMemset(Q, 0, size_QKV);
-    cudaMemset(K, 0, size_QKV);
-    cudaMemset(V, 0, size_QKV);
-    cudaMemset(O, 0, size_QKV);
-    cudaMemset(l, 0, size_LM);
-    cudaMemset(m, 0, size_LM);
-
-    flash_attention_forward<<<grid, block, shmem>>>(Q,K,V,O,l,m,B,H,N,d,M);
-    cudaDeviceSynchronize();
-
-    timeval t0, t1;
-    gettimeofday(&t0, nullptr);
-    for (int i=0;i<runs;i++) {
-        flash_attention_forward<<<grid, block, shmem>>>(Q,K,V,O,l,m,B,H,N,d,M);
-    }
-    cudaDeviceSynchronize();
-    gettimeofday(&t1, nullptr);
-
-    long sec = t1.tv_sec - t0.tv_sec;
-    long usec = t1.tv_usec - t0.tv_usec;
-    double avg_us = (sec*1e6 + usec) / (double)runs;
-
-    double bytes_per_call =
-        3.0 * size_QKV +   
-        1.0 * size_QKV +  
-        2.0 * size_LM;     
-
-    double GBps = (bytes_per_call / (avg_us * 1e-6)) / 1e9;
-
-    printf("Avg latency: %.2f ms\n", avg_us/1000.0);
-    printf("throughput: %.2f GB/s\n", GBps);
-
-    double flops = 4.0 * (double)B * H * N * N * d;        
-    double gflops_per_s = (flops / (avg_us * 1e-6)) / 1e9; 
-
-    printf("compute: %.3f GFLOPs/s\n", gflops_per_s);
-
-    cudaFree(Q); cudaFree(K); cudaFree(V);
-    cudaFree(O); cudaFree(l); cudaFree(m);
-    return 0;
-}
