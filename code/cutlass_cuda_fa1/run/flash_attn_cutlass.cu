@@ -128,55 +128,62 @@ struct SharedMemoryCutlass {
 // ==================== CUTLASS-based GEMM Wrappers ====================
 
 // Wrapper for Q @ K^T using CUTLASS
-template<int M, int N, int DIM_K>
+// NOTE: This is a placeholder - uses standard CUDA cores, not tensor cores
+template<int TILE_M, int TILE_N, int DIM_K>
 __device__ void cutlass_gemm_qk(
-    const cutlass::half_t* Q,  // [M, DIM_K]
-    const cutlass::half_t* K,  // [N, DIM_K]
-    float* S,                   // [M, N]
+    const cutlass::half_t* Q,  // [TILE_M, DIM_K]
+    const cutlass::half_t* K,  // [TILE_N, DIM_K]
+    float* S,                   // [TILE_M, TILE_N]
+    int q_size,                 // Valid rows (≤ TILE_M)
+    int k_size,                 // Valid cols (≤ TILE_N)
     float alpha = 1.0f
 ) {
     // Note: CUTLASS device GEMM can't be called from device code directly
     // Instead, we'll use a simple implementation that mimics tensor core operations
     // For a true CUTLASS implementation, we'd need to use warp-level primitives
     
-    // For now, fall back to optimized shared memory approach
-    // A full CUTLASS integration would require reorganizing the kernel structure
+    // CRITICAL: Only compute the VALID region (q_size × k_size), not full tile!
+    // Otherwise padding contains garbage that breaks softmax
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
-    for (int idx = tid; idx < M * N; idx += num_threads) {
-        int i = idx / N;
-        int j = idx % N;
+    for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
+        int i = idx / k_size;  // Row in valid region
+        int j = idx % k_size;  // Col in valid region
         
         float sum = 0.0f;
         #pragma unroll
         for (int k = 0; k < DIM_K; k++) {
             sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
         }
-        S[i * N + j] = sum * alpha;
+        S[i * TILE_N + j] = sum * alpha;
     }
     __syncthreads();
 }
 
 // Wrapper for P @ V using CUTLASS  
-template<int M, int N, int DIM_K>
+// NOTE: This is a placeholder - uses standard CUDA cores, not tensor cores
+template<int TILE_M, int TILE_N, int DIM_K>
 __device__ void cutlass_gemm_pv(
-    const float* P,               // [M, N]
-    const cutlass::half_t* V,    // [N, DIM_K]
-    float* O,                     // [M, DIM_K]
+    const float* P,               // [TILE_M, TILE_N]
+    const cutlass::half_t* V,    // [TILE_N, DIM_K]
+    float* O,                     // [TILE_M, DIM_K]
+    int q_size,                   // Valid rows (≤ TILE_M)
+    int k_size,                   // Valid cols (≤ TILE_N)
     float beta = 1.0f             // For accumulation: O = P@V + beta*O
 ) {
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
-    for (int i = 0; i < M; i++) {
-        for (int k = tid; k < DIM_K; k += num_threads) {
+    // Only process valid rows
+    for (int i = 0; i < q_size; i++) {
+        for (int d = tid; d < DIM_K; d += num_threads) {
             float sum = 0.0f;
             #pragma unroll 8
-            for (int j = 0; j < N; j++) {
-                sum += P[i * N + j] * float(V[j * DIM_K + k]);
+            for (int j = 0; j < k_size; j++) {  // Only valid columns
+                sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
             }
-            O[i * DIM_K + k] = sum + beta * O[i * DIM_K + k];
+            O[i * DIM_K + d] = sum + beta * O[i * DIM_K + d];
         }
     }
     __syncthreads();
@@ -261,7 +268,7 @@ __global__ void flash_attn_cutlass_kernel(
         
         // S = Q @ K^T using CUTLASS (with softmax_scale)
         cutlass_gemm_qk<kTileM, kTileN, HEAD_DIM>(
-            shared_mem.Q, shared_mem.K, shared_mem.S, softmax_scale
+            shared_mem.Q, shared_mem.K, shared_mem.S, q_size, k_size, softmax_scale
         );
         
         // Online softmax
@@ -300,7 +307,7 @@ __global__ void flash_attn_cutlass_kernel(
         
         // O += P @ V using CUTLASS
         cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
-            shared_mem.P, shared_mem.V, O_accum, 1.0f
+            shared_mem.P, shared_mem.V, O_accum, q_size, k_size, 1.0f
         );
     }
     
