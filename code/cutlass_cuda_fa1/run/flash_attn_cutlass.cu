@@ -129,14 +129,14 @@ struct SharedMemoryCutlass {
 
 // Wrapper for Q @ K^T using CUTLASS
 // NOTE: This is a placeholder - uses standard CUDA cores, not tensor cores
+// Matches Small Tile's GEMM exactly for fair comparison
 template<int TILE_M, int TILE_N, int DIM_K>
-__device__ void cutlass_gemm_qk(
+__device__ __forceinline__ void cutlass_gemm_qk(
     const cutlass::half_t* Q,  // [TILE_M, DIM_K]
     const cutlass::half_t* K,  // [TILE_N, DIM_K]
     float* S,                   // [TILE_M, TILE_N]
     int q_size,                 // Valid rows (≤ TILE_M)
-    int k_size,                 // Valid cols (≤ TILE_N)
-    float alpha = 1.0f
+    int k_size                  // Valid cols (≤ TILE_N)
 ) {
     // Note: CUTLASS device GEMM can't be called from device code directly
     // Instead, we'll use a simple implementation that mimics tensor core operations
@@ -156,26 +156,26 @@ __device__ void cutlass_gemm_qk(
         for (int k = 0; k < DIM_K; k++) {
             sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
         }
-        S[i * TILE_N + j] = sum * alpha;
+        S[i * TILE_N + j] = sum;
     }
     __syncthreads();
 }
 
 // Wrapper for P @ V using CUTLASS  
 // NOTE: This is a placeholder - uses standard CUDA cores, not tensor cores
+// Matches Small Tile's P@V exactly for fair comparison
 template<int TILE_M, int TILE_N, int DIM_K>
-__device__ void cutlass_gemm_pv(
+__device__ __forceinline__ void cutlass_gemm_pv(
     const float* P,               // [TILE_M, TILE_N]
     const cutlass::half_t* V,    // [TILE_N, DIM_K]
     float* O,                     // [TILE_M, DIM_K]
     int q_size,                   // Valid rows (≤ TILE_M)
-    int k_size,                   // Valid cols (≤ TILE_N)
-    float beta = 1.0f             // For accumulation: O = P@V + beta*O
+    int k_size                    // Valid cols (≤ TILE_N)
 ) {
     const int tid = threadIdx.x;
     const int num_threads = blockDim.x;
     
-    // Only process valid rows
+    // Only process valid rows - matches Small Tile exactly
     for (int i = 0; i < q_size; i++) {
         for (int d = tid; d < DIM_K; d += num_threads) {
             float sum = 0.0f;
@@ -183,7 +183,7 @@ __device__ void cutlass_gemm_pv(
             for (int j = 0; j < k_size; j++) {  // Only valid columns
                 sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
             }
-            O[i * DIM_K + d] = sum + beta * O[i * DIM_K + d];
+            O[i * DIM_K + d] += sum;  // Accumulate (beta=1 implicit)
         }
     }
     __syncthreads();
@@ -266,10 +266,18 @@ __global__ void flash_attn_cutlass_kernel(
         }
         __syncthreads();
         
-        // S = Q @ K^T using CUTLASS (with softmax_scale)
+        // S = Q @ K^T using CUTLASS
         cutlass_gemm_qk<kTileM, kTileN, HEAD_DIM>(
-            shared_mem.Q, shared_mem.K, shared_mem.S, q_size, k_size, softmax_scale
+            shared_mem.Q, shared_mem.K, shared_mem.S, q_size, k_size
         );
+        
+        // Apply softmax scale (separate step, like Small Tile)
+        for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+            int i = idx / k_size;
+            int j = idx % k_size;
+            shared_mem.S[i * kTileN + j] *= softmax_scale;
+        }
+        __syncthreads();
         
         // Online softmax
         for (int i = 0; i < q_size; i++) {
@@ -307,7 +315,7 @@ __global__ void flash_attn_cutlass_kernel(
         
         // O += P @ V using CUTLASS
         cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
-            shared_mem.P, shared_mem.V, O_accum, q_size, k_size, 1.0f
+            shared_mem.P, shared_mem.V, O_accum, q_size, k_size
         );
     }
     
