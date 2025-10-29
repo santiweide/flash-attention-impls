@@ -1,0 +1,142 @@
+==========================================
+Minimal Flash Attention - Quick Start
+==========================================
+
+[0;32m✓[0m CUDA found: 12.8
+[0;32m✓[0m GPU detected: NVIDIA A100-SXM4-40GB
+  Using CUDA architecture: -arch=sm_80
+[0;32m✓[0m Cutlass found at ../csrc/cutlass
+
+==========================================
+Building...
+==========================================
+Using Makefile build system...
+rm -f test_flash_attn *.o
+Compiling test_flash_attn...
+CUDA Architecture: -arch=sm_80
+Cutlass Include: ../csrc/cutlass/include
+nvcc -arch=sm_80 -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda -I../csrc/cutlass/include -I. --use_fast_math -o test_flash_attn test_flash_attn.cu flash_attn_unified.cu flash_attn_cutlass.cu
+Build complete: ./test_flash_attn
+[0;32m✓[0m Build successful!
+
+==========================================
+Running tests...
+==========================================
+
+Flash Attention Minimal Implementation Test
+================================================================================
+GPU: NVIDIA A100-SXM4-40GB
+Compute Capability: 8.0
+================================================================================
+
+================================================================================
+Flash Attention Performance Test: Tile Size & CUTLASS Comparison
+================================================================================
+
+All Flash Attention variants use the same algorithm (online softmax + tiling)
+Differences are in tile size and compute primitives:
+
+  Small Tile:    45×90 tiles, 128 threads, 51.7 KB shared mem
+    → Conservative config, standard CUDA cores
+
+  CUTLASS TC:    45×90 tiles, 128 threads, 51.7 KB shared mem + Tensor Cores
+    → Same config as Small Tile, but uses A100 tensor cores for GEMMs
+
+  Large Tile:    120×120 tiles, 256 threads, 150.9 KB shared mem
+    → Aggressive config, standard CUDA cores
+
+  Baseline:      O(batch × heads × seq_len²) memory ← QUADRATIC!
+
+
+================================================================================
+Config: batch=1, heads=1, seqlen=1024, headdim=64
+================================================================================
+Memory per tensor: 0.12 MB (Q/K/V/O)
+Baseline scores buffer: 4.00 MB (batch×heads×seq²×4bytes)
+Total memory: 4.50 MB (+ 1 MB for CUTLASS output)
+Initializing inputs...
+Running Baseline (Naive, no shared mem, no online softmax)...
+Running Flash Attention (Small Tile: conservative config)...
+Running Flash Attention (Large Tile: aggressive config)...
+
+================================================================================
+Flash Attention - Large Tile Configuration (head_dim=64)
+================================================================================
+  Tile Config for head_dim=64:
+    Tile size: 104x104
+    Threads: 128
+    Shared memory: 150.3 KB
+================================================================================
+Running Flash Attention (CUTLASS Tensor Core: same tile as Small)...
+
+================================================================================
+Flash Attention - WMMA Tensor Core (head_dim=64)
+================================================================================
+  Tile size: 36x72 (same as Small Tile)
+  Threads: 256 (8 warps)
+  Shared memory: 52.0 KB
+  Tensor Cores: ENABLED via WMMA API
+    → Q@K^T: wmma::mma_sync (16x16x16 tiles, FP16→FP32)
+    → P@V:   CUDA cores (FP32 input limitation)
+================================================================================
+
+Verifying correctness...
+Comparing Large Tile vs Small Tile:
+
+Comparing CUTLASS vs Small Tile:
+
+Comparing Baseline vs Small Tile:
+
+Comparing Large Tile vs Baseline:
+
+================================================================================
+Performance Results:
+================================================================================
+Baseline (Naive):                       27.376 ms  (1.00x vs baseline)
+Flash Attn (Small Tile):                 1.898 ms  (14.42x vs baseline)
+Flash Attn (CUTLASS Tensor Core):        1.385 ms  (19.76x vs baseline, 1.37x vs Small)
+Flash Attn (Large Tile):                 4.685 ms  (5.84x vs baseline)
+
+================================================================================
+Accuracy Results (symmetric relative error):
+================================================================================
+Large Tile vs Small Tile:  0.002741
+CUTLASS vs Small Tile:     0.002741
+Baseline vs Small Tile:    0.002741
+Large Tile vs Baseline:    0.002654
+
+✅ TEST PASSED (All implementations agree within 2.0%)
+
+================================================================================
+Throughput:
+================================================================================
+Total FLOPs:                   0.27 GFLOPs (268.44 million ops)
+Baseline (Naive):              0.01 TFLOPs/s
+Flash Attn (Small Tile):       0.14 TFLOPs/s (14.42x vs baseline)
+Flash Attn (CUTLASS TC):       0.19 TFLOPs/s (19.76x vs baseline, 1.37x vs Small)
+Flash Attn (Large Tile):       0.06 TFLOPs/s (5.84x vs baseline)
+
+Memory Bandwidth:
+Flash Attn (CUTLASS TC):       0.38 GB/s
+Flash Attn (Large Tile):       0.11 GB/s
+A100 HBM peak:                 ~1555 GB/s
+
+Note: Attention is memory-bound. CUTLASS tensor cores help but limited by bandwidth.
+      To see higher TFLOPs, use larger batch sizes or longer sequences.
+
+================================================================================
+All tests completed!
+
+==========================================
+Done!
+==========================================
+
+To rebuild:
+  build_and_run.sh
+
+To use CMake:
+  build_and_run.sh cmake
+
+To clean:
+  make clean
+  rm -rf build/

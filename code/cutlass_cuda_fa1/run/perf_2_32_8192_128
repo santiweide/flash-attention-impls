@@ -1,0 +1,58 @@
+==========================================
+Minimal Flash Attention - Quick Start
+==========================================
+
+[0;32m✓[0m CUDA found: 12.8
+[0;32m✓[0m GPU detected: NVIDIA A100-SXM4-40GB
+  Using CUDA architecture: -arch=sm_80
+[0;32m✓[0m Cutlass found at ../csrc/cutlass
+
+==========================================
+Building...
+==========================================
+Using Makefile build system...
+rm -f test_flash_attn *.o
+Compiling test_flash_attn...
+CUDA Architecture: -arch=sm_80
+Cutlass Include: ../csrc/cutlass/include
+nvcc -arch=sm_80 -std=c++17 -O3 --expt-relaxed-constexpr --expt-extended-lambda -I../csrc/cutlass/include -I. --use_fast_math -o test_flash_attn test_flash_attn.cu flash_attn_unified.cu flash_attn_cutlass.cu
+Build complete: ./test_flash_attn
+[0;32m✓[0m Build successful!
+
+==========================================
+Running tests...
+==========================================
+
+Flash Attention Minimal Implementation Test
+================================================================================
+GPU: NVIDIA A100-SXM4-40GB
+Compute Capability: 8.0
+================================================================================
+
+================================================================================
+Flash Attention Performance Test: Tile Size & CUTLASS Comparison
+================================================================================
+
+All Flash Attention variants use the same algorithm (online softmax + tiling)
+Differences are in tile size and compute primitives:
+
+  Small Tile:    45×90 tiles, 128 threads, 51.7 KB shared mem
+    → Conservative config, standard CUDA cores
+
+  CUTLASS TC:    45×90 tiles, 128 threads, 51.7 KB shared mem + Tensor Cores
+    → Same config as Small Tile, but uses A100 tensor cores for GEMMs
+
+  Large Tile:    120×120 tiles, 256 threads, 150.9 KB shared mem
+    → Aggressive config, standard CUDA cores
+
+  Baseline:      O(batch × heads × seq_len²) memory ← QUADRATIC!
+
+
+================================================================================
+Config: batch=2, heads=32, seqlen=8192, headdim=128
+================================================================================
+Memory per tensor: 128.00 MB (Q/K/V/O)
+Baseline scores buffer: 16384.00 MB (batch×heads×seq²×4bytes)
+Total memory: 16896.00 MB (+ 1 MB for CUTLASS output)
+Initializing inputs...
+Running Baseline (Naive, no shared mem, no online softmax)...
