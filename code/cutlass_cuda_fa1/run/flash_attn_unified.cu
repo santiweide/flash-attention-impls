@@ -357,7 +357,7 @@ struct RefTileConfig {
     
     static constexpr size_t get_smem_size() {
         return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
-               (kTileM * kTileN) * sizeof(float) +
+               (kTileM * kTileN * 2) * sizeof(float) +  // Need space for BOTH S and P!
                (kTileM * 2) * sizeof(float) +
                (kTileM * kHeadDim) * sizeof(float);
     }
