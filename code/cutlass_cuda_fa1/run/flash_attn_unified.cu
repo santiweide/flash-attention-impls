@@ -446,7 +446,9 @@ __global__ void attention_reference_kernel_unified(
         );
         
         for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
-            shared_mem.S[idx] *= softmax_scale;
+            int i = idx / k_size;
+            int j = idx % k_size;
+            shared_mem.S[i * kTileN + j] *= softmax_scale;
         }
         __syncthreads();
         
