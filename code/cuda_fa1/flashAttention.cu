@@ -50,6 +50,14 @@ __global__ void flash_attention_forward(
     float* Vj = Kj + Bc * d;
 
 
+    // 预加载当前 Q tile 到共享内存 Qi
+    for (int t = threadIdx.x; t < br_size * d; t += blockDim.x) {
+        int r = t / d;
+        int c = t % d;
+        Qi[r*d + c] = Q_bh[(qi_start + r)*d + c];
+    }
+    __syncthreads();
+
     for (int j = 0; j < Tc; ++j) {
         int kj_start = j * Bc;
         int bc_size  = (Bc < N - kj_start) ? Bc : (N - kj_start);
@@ -68,7 +76,7 @@ __global__ void flash_attention_forward(
             
 
             float q_row[128];
-            for (int t = 0; t < d; ++t) q_row[t] = Q_bh[gi*d + t];
+            for (int t = 0; t < d; ++t) q_row[t] = Qi[r*d + t];
 
 
             float m_row = m_bh[gi];
