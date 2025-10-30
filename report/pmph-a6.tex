@@ -234,22 +234,19 @@ We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we
 
 \begin{table}[htbp]
 \centering
-\caption{Flash Attention Performance Comparison (Runtime in ms and Speedup vs. Naive)}
+\caption{Flash Attention Latency Comparison (Runtime in ms and Speedup vs. Naive)}
 \label{tab:full_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=4.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2]@{}}
 \toprule
-& & \multicolumn{2}{c}{\textbf{Small Tile}} & \multicolumn{2}{c}{\textbf{CUTLASS TC}} & \multicolumn{2}{c}{\textbf{Large Tile}} \\
+& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
 \textbf{Config (B, H, N, D)} & \mcc{\textbf{Naive (ms)}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} \\
 \midrule
 (1, 1, 512, 64)    & 13.87  & 0.95  & 14.62x & \B{0.71} & 19.63x & 2.35  & 5.89x \\
 (1, 1, 1024, 64)   & 27.38  & 1.90  & 14.42x & \B{1.39} & 19.76x & 4.69  & 5.84x \\
 (1, 1, 2048, 64)   & 53.80  & 3.72  & 14.47x & \B{2.74} & 19.63x & 9.35  & 5.75x \\
-(1, 1, 4096, 32)   & 47.57  & \B{6.16} & 7.72x  & 6.28  & 7.57x  & 17.29 & 2.75x \\
 (1, 1, 4096, 64)   & 128.08 & 7.36  & 17.40x & \B{6.27} & 20.43x & 18.68 & 6.86x \\
-(1, 1, 8192, 32)   & 95.36  & 13.38 & 7.13x  & \B{13.02} & 7.32x  & 34.44 & 2.77x \\
-(1, 1, 8192, 64)   & 233.23 & 18.78 & 12.42x & \B{13.50} & 17.28x & 37.16 & 6.28x \\
 (1, 32, 8192, 32)  & 899.36 & 264.30 & 3.40x  & \B{245.50} & 3.66x  & 722.78 & 1.24x \\
 (1, 32, 8192, 64)  & 2151.82 & 597.63 & 3.60x  & \B{309.99} & 6.94x  & 891.22 & 2.41x \\
 (1, 32, 8192, 128) & 4141.44 & 1023.15 & 4.05x  & \B{606.79} & 6.83x  & 1421.33 & 2.91x \\
