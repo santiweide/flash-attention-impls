@@ -191,9 +191,7 @@ Let $T_r$ and $T_c$ be the number of blocks along the sequence length $N$ (i.e.,
 For FA1, since one block must sequentially iterate over both the $T_r$ row-blocks and $T_c$ column-blocks, the critical path (depth) is proportional to the total number of tiles it must compute:
               \[ D_{FA1} = O(T_r \times T_c) = O(N^2) \]
 
-For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are "embarrassingly parallel" and are processed by different thread blocks simultaneously.
-
-\textbf{Depth:} The critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
+For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are "embarrassingly parallel" and are processed by different thread blocks simultaneously. Thus the critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
               \[ D_{FA2} = O(T_c) = O(N) \]
 
 
