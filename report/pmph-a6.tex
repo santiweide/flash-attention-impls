@@ -237,17 +237,43 @@ We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we
 \section{CUDA + Cutlass by Wanjing Hu}
 
 \subsection{Profiling}
+According to the work complexity analysis, the profiling is based on different sequence length and 
+
+
 
 \begin{table}[htbp]
 \centering
-\caption{Flash Attention Latency Comparison (Runtime in ms and Speedup vs. Naive)}
+\caption{Flash Attention Throughput Comparison (TFLOPs/s and Speedup vs. Naive)}
+\label{tab:throughput_comparison}
+\sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
+\begin{tabular}{@{}l S[table-format=1.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2]@{}}
+\toprule
+& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Large Tile}} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
+\textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naived}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
+\midrule
+(1, 1, 512, 64)    & 0.00  & 0.07  & x & \textbf{0.10} & 19.63x & 0.03  & x  \\
+(1, 1, 1024, 64)   & 0.01  & 0.14  & 14x & \textbf{0.19} & 19.76x & 0.06  & 6.00x  \\
+(1, 1, 2048, 64)   & 0.02  & 0.29  & 14.5x & \textbf{0.39} & 19.63x & 0.11  & 5.50x  \\
+(1, 1, 4096, 64)   & 0.03  & 0.58  & 19.33x & \textbf{0.68} & 20.43x & 0.23  & 7.67x  \\
+(1, 32, 8192, 32)  & 0.31   & 1.04   & 3.35x   & \textbf{1.12}  & 3.66x   & 0.38   & 1.23x   \\
+(1, 32, 8192, 64)  & 0.26  & 0.92  & 3.54x  & \textbf{1.77} & 6.94x  & 0.62  & 2.38x  \\
+(1, 32, 8192, 128) & 0.27 & 1.07 & 3.96x & \textbf{1.81} & 6.83x & 0.77 & 2.85x \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{table}[htbp]
+\centering
+\caption{FA1xCutlass Latency (Runtime in ms and compare vs. Naive)}
 \label{tab:full_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=4.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2]@{}}
 \toprule
 & & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
-\textbf{Config (B, H, N, D)} & \mcc{\textbf{Naive (ms)}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} \\
+\textbf{Config (B, H, N, D)} & \mcc{\textbf{Naive}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} \\
 \midrule
 (1, 1, 512, 64)    & 13.87  & 0.95  & 14.62x & \B{0.71} & 19.63x & 2.35  & 5.89x \\
 (1, 1, 1024, 64)   & 27.38  & 1.90  & 14.42x & \B{1.39} & 19.76x & 4.69  & 5.84x \\
