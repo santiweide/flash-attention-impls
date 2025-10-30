@@ -226,6 +226,12 @@ We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we
 \end{algorithm}
 \end{comment}
 
+%%%%%%% Implementation part %%%%%%%%%%%
+% Answer the following 3 questions in each one's own session
+% 1) validation: how did you implement the validation (rationale), on what datasets have you tried, what are the corner cases, etc.
+% 2) memory access: what are the shared memory and register resources that are used per block. How many accesses to global memory are performed.
+% 3) evaluation: performance should be evaluated for various datasets; is the performance sensitive to dataset characteristics?  (at least to size it should). Evaluate the impact of various parameters, such as Q (the number of elements processed sequentially per thread), B the block size, etc. Evaluate the impact of optimizations and compare with state of the art approaches, and if possible with ideal performace (ideal peak bandwidth performance). 
+
 \section{CUDA by Zhigao Yan}
 
 \section{CUDA + Cutlass by Wanjing Hu}
