@@ -94,13 +94,13 @@
 
 Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention}. In this report, we implement Flash Attention 1(FA1) forward calculation with different Domain Specific Languages(DSLs).
 
-For \textbf{evaluation metrics}, we focus on Latency speed up across different DSLs, compute efficiency, memory efficiency and throughput.
+For \textbf{evaluation metrics}, we focus on Latency speed up across different DSLs, compute efficiency, and memory efficiency.
 
 Latency speedup is assessed using kernel runtime of the execution time $(T)$ of the self-attention forward. Here we choose Baseline as TODO: 
 
 $$\text{Speedup} = \frac{T_{\text{Base}}}{T_{\text{FlashAttention}}}.$$
 
-For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPs): 
+For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPs//s): 
 
 $$\text{Achieved TFLOPs} = \frac{\text{Total Floating-Point operations in FA1}}{T_{\text{Execution Time}}}$$.
 
@@ -108,29 +108,7 @@ We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we
 
 For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
 
-$$\text{Achieved Bandwidth} = \frac{\text{Total runtime memory access in FA1}}{T_{\text{Execution Time}}}$$.
-
-For throughput we use maximum input batch size with fixed other parameters. This is a more request-oriented index and more end-to-end in Transformer-like model serving.
-
-
- \begin{comment}
-\begin{algorithm}[htbp]
-  \caption{Standard Attention}
-  \label{alg:standard_attention}
-  \begin{algorithmic}[1]
-    \STATE Load $Q$ and $K$ by blocks from HBM.
-    \STATE Compute $S = (1/\sqrt{d})QK^T$ (GEMM-I).
-    \STATE Write $S$ to HBM.
-    \STATE Read $S$ from HBM.
-    \STATE Compute $S = S - \text{rowmax}(S)$.
-    \STATE Compute $P = \text{softmax}(S)$.
-    \STATE Write $P$ to HBM.
-    \STATE Load $P$ and $V$ by blocks from HBM.
-    \STATE Compute $O = PV$ (GEMM-II).
-    \STATE Write $O$ to HBM.
-  \end{algorithmic}
-\end{algorithm}
-\end{comment}
+$$\text{Achieved Bandwidth} = \frac{\text{Total runtime memory access in FA}}{T_{\text{Execution Time}}}$$.
 
 \section{DSL XX by Your Name TODO}
 \section{DSL XX by Your Name TODO}
