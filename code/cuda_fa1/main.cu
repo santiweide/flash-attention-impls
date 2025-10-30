@@ -1,5 +1,6 @@
 #include "flashAttention.h"
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <sys/time.h>
 #include <cstdio>
 #include <cmath>
@@ -23,7 +24,7 @@
         } \
     } while(0)
 
-// 初始化随机数据 (from test_flash_attn.cu)
+// 初始化随机数据 (from test_flash_attn.cu) - 支持float和half
 void init_random(float* data, size_t size, float mean = 0.0f, float stddev = 0.02f) {
     std::vector<float> host_data(size);
     std::mt19937 gen(42);  // 固定seed以便复现
@@ -35,6 +36,27 @@ void init_random(float* data, size_t size, float mean = 0.0f, float stddev = 0.0
     
     CHECK_CUDA(cudaMemcpy(data, host_data.data(), 
                           size * sizeof(float), 
+                          cudaMemcpyHostToDevice));
+}
+
+// 初始化随机数据 - half_t版本
+void init_random_half(__half* data, size_t size, float mean = 0.0f, float stddev = 0.02f) {
+    std::vector<float> host_data(size);
+    std::mt19937 gen(42);  // 固定seed以便复现
+    std::normal_distribution<float> dist(mean, stddev);
+    
+    for (size_t i = 0; i < size; i++) {
+        host_data[i] = dist(gen);
+    }
+    
+    // 转换为half_t
+    std::vector<__half> host_data_half(size);
+    for (size_t i = 0; i < size; i++) {
+        host_data_half[i] = __float2half(host_data[i]);
+    }
+    
+    CHECK_CUDA(cudaMemcpy(data, host_data_half.data(), 
+                          size * sizeof(__half), 
                           cudaMemcpyHostToDevice));
 }
 
@@ -219,26 +241,51 @@ void attention_baseline(
     CHECK_CUDA(cudaFree(d_scores_buffer));
 }
 
-// Verification function
+// Verification function - 支持half_t
 bool verify_flash_attention(
-    const float* Q, const float* K, const float* V,
+    const __half* Q, const __half* K, const __half* V,
     int B, int H, int N, int d, int M,
     float tolerance) {
     
     printf("Verifying Flash Attention accuracy against Standard Attention...\n");
     
+    // 首先将half_t转换为float用于baseline计算
+    size_t size_QKV_half = (size_t)B * H * N * d * sizeof(__half);
+    size_t size_QKV_float = (size_t)B * H * N * d * sizeof(float);
+    
+    float *Q_float, *K_float, *V_float;
+    cudaMalloc(&Q_float, size_QKV_float);
+    cudaMalloc(&K_float, size_QKV_float);
+    cudaMalloc(&V_float, size_QKV_float);
+    
+    // 转换half_t到float（简化版本，在实际应用中可以使用kernel）
+    std::vector<__half> host_Q(B * H * N * d), host_K(B * H * N * d), host_V(B * H * N * d);
+    cudaMemcpy(host_Q.data(), Q, size_QKV_half, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_K.data(), K, size_QKV_half, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_V.data(), V, size_QKV_half, cudaMemcpyDeviceToHost);
+    
+    std::vector<float> host_Q_f(B * H * N * d), host_K_f(B * H * N * d), host_V_f(B * H * N * d);
+    for (size_t i = 0; i < B * H * N * d; i++) {
+        host_Q_f[i] = __half2float(host_Q[i]);
+        host_K_f[i] = __half2float(host_K[i]);
+        host_V_f[i] = __half2float(host_V[i]);
+    }
+    cudaMemcpy(Q_float, host_Q_f.data(), size_QKV_float, cudaMemcpyHostToDevice);
+    cudaMemcpy(K_float, host_K_f.data(), size_QKV_float, cudaMemcpyHostToDevice);
+    cudaMemcpy(V_float, host_V_f.data(), size_QKV_float, cudaMemcpyHostToDevice);
+    
     // Allocate memory for standard attention result
-    size_t size_QKV = (size_t)B * H * N * d * sizeof(float);
     float *O_standard;
-    cudaMalloc(&O_standard, size_QKV);
+    cudaMalloc(&O_standard, size_QKV_float);
     
     // Compute standard attention on GPU
-    attention_baseline(Q, K, V, O_standard, B, H, N, d, 0);
+    attention_baseline(Q_float, K_float, V_float, O_standard, B, H, N, d, 0);
     
-    // Allocate memory for flash attention result
+    // Allocate memory for flash attention result (half_t)
     size_t size_LM = (size_t)B * H * N * sizeof(float);
-    float *O_flash, *l, *m;
-    cudaMalloc(&O_flash, size_QKV);
+    __half *O_flash;
+    float *l, *m;
+    cudaMalloc(&O_flash, size_QKV_half);
     cudaMalloc(&l, size_LM);
     cudaMalloc(&m, size_LM);
     
@@ -249,32 +296,65 @@ bool verify_flash_attention(
     
     dim3 grid(Tr, B*H);
     dim3 block(Br);
-    size_t shmem = (size_t)(Br*d + Bc*d + Bc*d) * sizeof(float);
+    // shared memory: Qi (half_t) + Kj (half_t) + Vj (half_t) + O_accum (float)
+    size_t shmem = (size_t)(Br*d + Bc*d + Bc*d) * sizeof(__half) + 
+                   (size_t)(Br*d) * sizeof(float);
     
     flash_attention_forward<<<grid, block, shmem>>>(Q, K, V, O_flash, l, m, B, H, N, d, M);
     cudaDeviceSynchronize();
     
     // Copy results to host for comparison
-    float *O_standard_host, *O_flash_host;
-    cudaMallocHost(&O_standard_host, size_QKV);
-    cudaMallocHost(&O_flash_host, size_QKV);
-    cudaMemcpy(O_standard_host, O_standard, size_QKV, cudaMemcpyDeviceToHost);
-    cudaMemcpy(O_flash_host, O_flash, size_QKV, cudaMemcpyDeviceToHost);
+    std::vector<float> host_O_standard(B * H * N * d);
+    std::vector<__half> host_O_flash(B * H * N * d);
+    cudaMemcpy(host_O_standard.data(), O_standard, size_QKV_float, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_O_flash.data(), O_flash, size_QKV_half, cudaMemcpyDeviceToHost);
     
-    // Compare results using relative error (same as test_flash_attn.cu)
-    float max_relative_error = compute_max_relative_error(O_standard, O_flash, B * H * N * d);
+    // 转换half_t到float进行比较
+    std::vector<float> host_O_flash_f(B * H * N * d);
+    for (size_t i = 0; i < B * H * N * d; i++) {
+        host_O_flash_f[i] = __half2float(host_O_flash[i]);
+    }
     
-    const float error_threshold = 0.02f;  // 2% 误差阈值 (same as test_flash_attn.cu)
-    bool is_correct = max_relative_error < error_threshold;
+    // Compare results using relative error
+    float max_error = 0.0f;
+    int error_count = 0;
+    const float error_threshold = 0.01f;
+    const float epsilon = 1e-5f;
+    
+    for (size_t i = 0; i < B * H * N * d; i++) {
+        float val_a = host_O_flash_f[i];
+        float val_b = host_O_standard[i];
+        float abs_diff = std::abs(val_a - val_b);
+        float denominator = std::abs(val_a) + std::abs(val_b) + epsilon;
+        float rel_error = abs_diff / denominator;
+        
+        if (rel_error > error_threshold) {
+            error_count++;
+            if (error_count <= 10) {
+                printf("Error at %zu: flash=%.6f, ref=%.6f, abs_diff=%.6f, rel_err=%.6f\n",
+                       i, val_a, val_b, abs_diff, rel_error);
+            }
+        }
+        max_error = std::max(max_error, rel_error);
+    }
+    
+    if (error_count > 10) {
+        printf("... and %d more errors\n", error_count - 10);
+    }
+    
+    const float max_relative_error = max_error;
+    const float error_threshold_final = 0.02f;
+    bool is_correct = max_relative_error < error_threshold_final;
     
     printf("Max relative error: %.6f\n", max_relative_error);
-    printf("Error threshold: %.6f\n", error_threshold);
+    printf("Error threshold: %.6f\n", error_threshold_final);
     printf("Verification result: %s\n", is_correct ? "PASSED" : "FAILED");
     
     // Cleanup
     cudaFree(O_standard);
-    cudaFreeHost(O_standard_host);
-    cudaFreeHost(O_flash_host);
+    cudaFree(Q_float);
+    cudaFree(K_float);
+    cudaFree(V_float);
     cudaFree(O_flash);
     cudaFree(l);
     cudaFree(m);
@@ -292,6 +372,7 @@ int main(int argc, char** argv) {
 
     printf("Flash Attention Performance Test\n");
     printf("B=%d, H=%d, N=%d, d=%d, M=%d, runs=%d\n", B, H, N, d, M, runs);
+    printf("Using FP16 (half_t) for Q, K, V, O\n");
 
     int Bc = (int)ceilf((float)M / (4.0f * (float)d));
     int Br = (Bc < d) ? Bc : d;
@@ -299,24 +380,29 @@ int main(int argc, char** argv) {
 
     dim3 grid(Tr, B*H);
     dim3 block(Br);
-    size_t shmem = (size_t)(Br*d + Bc*d + Bc*d) * sizeof(float);
+    // shared memory: Qi (half_t) + Kj (half_t) + Vj (half_t) + O_accum (float)
+    size_t shmem = (size_t)(Br*d + Bc*d + Bc*d) * sizeof(__half) + 
+                   (size_t)(Br*d) * sizeof(float);
 
-    // Allocate memory
-    size_t size_QKV = (size_t)B * H * N * d * sizeof(float);
+    // Allocate memory - 使用half_t
+    size_t size_QKV_half = (size_t)B * H * N * d * sizeof(__half);
+    size_t size_QKV_float = (size_t)B * H * N * d * sizeof(float);
     size_t size_LM  = (size_t)B * H * N * sizeof(float);
-    float *Q, *K, *V, *O_flash, *O_standard, *l, *m;
-    cudaMalloc(&Q, size_QKV);
-    cudaMalloc(&K, size_QKV);
-    cudaMalloc(&V, size_QKV);
-    cudaMalloc(&O_flash, size_QKV);
-    cudaMalloc(&O_standard, size_QKV);
+    
+    __half *Q, *K, *V, *O_flash;
+    float *O_standard, *l, *m;
+    cudaMalloc(&Q, size_QKV_half);
+    cudaMalloc(&K, size_QKV_half);
+    cudaMalloc(&V, size_QKV_half);
+    cudaMalloc(&O_flash, size_QKV_half);
+    cudaMalloc(&O_standard, size_QKV_float);  // baseline仍然使用float
     cudaMalloc(&l, size_LM);
     cudaMalloc(&m, size_LM);
 
-    // Initialize with random data (same as test_flash_attn.cu)
-    init_random(Q, B * H * N * d);
-    init_random(K, B * H * N * d);
-    init_random(V, B * H * N * d);
+    // Initialize with random data - 使用half_t版本
+    init_random_half(Q, B * H * N * d);
+    init_random_half(K, B * H * N * d);
+    init_random_half(V, B * H * N * d);
 
     // Verify correctness first
     bool verification_passed = verify_flash_attention(Q, K, V, B, H, N, d, M);
@@ -324,10 +410,32 @@ int main(int argc, char** argv) {
         printf("Warning: Flash Attention verification failed, but continuing with performance test\n");
     }
 
-    // Performance test - Standard Attention
+    // Performance test - Standard Attention (需要先转换为float)
     printf("\nRunning Standard Attention performance test...\n");
+    // 转换half_t到float用于baseline
+    float *Q_float, *K_float, *V_float;
+    cudaMalloc(&Q_float, size_QKV_float);
+    cudaMalloc(&K_float, size_QKV_float);
+    cudaMalloc(&V_float, size_QKV_float);
+    
+    // 简化的转换（在实际应用中应该使用kernel）
+    std::vector<__half> host_Q(B * H * N * d), host_K(B * H * N * d), host_V(B * H * N * d);
+    cudaMemcpy(host_Q.data(), Q, size_QKV_half, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_K.data(), K, size_QKV_half, cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_V.data(), V, size_QKV_half, cudaMemcpyDeviceToHost);
+    
+    std::vector<float> host_Q_f(B * H * N * d), host_K_f(B * H * N * d), host_V_f(B * H * N * d);
+    for (size_t i = 0; i < B * H * N * d; i++) {
+        host_Q_f[i] = __half2float(host_Q[i]);
+        host_K_f[i] = __half2float(host_K[i]);
+        host_V_f[i] = __half2float(host_V[i]);
+    }
+    cudaMemcpy(Q_float, host_Q_f.data(), size_QKV_float, cudaMemcpyHostToDevice);
+    cudaMemcpy(K_float, host_K_f.data(), size_QKV_float, cudaMemcpyHostToDevice);
+    cudaMemcpy(V_float, host_V_f.data(), size_QKV_float, cudaMemcpyHostToDevice);
+    
     float time_standard = benchmark([&]() {
-        attention_baseline(Q, K, V, O_standard, B, H, N, d, 0);
+        attention_baseline(Q_float, K_float, V_float, O_standard, B, H, N, d, 0);
     }, 5, runs);
 
     // Performance test - Flash Attention
@@ -338,9 +446,9 @@ int main(int argc, char** argv) {
 
     // Calculate performance metrics
     double bytes_per_call =
-        3.0 * size_QKV +   
-        1.0 * size_QKV +  
-        2.0 * size_LM;     
+        3.0 * size_QKV_half +   // Q, K, V (half_t)
+        1.0 * size_QKV_half +   // O (half_t)
+        2.0 * size_LM;           // l, m (float)
 
     double GBps_standard = (bytes_per_call / (time_standard * 1e-3)) / 1e9;
     double GBps_flash = (bytes_per_call / (time_flash * 1e-3)) / 1e9;
@@ -369,6 +477,7 @@ int main(int argc, char** argv) {
     // Cleanup
     cudaFree(Q); cudaFree(K); cudaFree(V);
     cudaFree(O_flash); cudaFree(O_standard); cudaFree(l); cudaFree(m);
+    cudaFree(Q_float); cudaFree(K_float); cudaFree(V_float);
     
     return 0;
 }
