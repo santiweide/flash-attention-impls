@@ -374,9 +374,3 @@ if __name__ == "__main__":
     # Max batch size search (optional)
     max_b = try_max_batch(base_B=1, H=H, N=N, D=D, dtype=DTYPE, causal=CAUSAL)
     print(f"[MaxBatch] max_batch_size at (H={H}, N={N}, D={D}, dtype={DTYPE}): {max_b}")
-
-    # print("\n[Nsight Compute] 已添加 NVTX 标记：FA2_FWD / FA2_BWD。")
-    # print("  使用示例：\n"
-    #       "    ncu --set full --target-processes all "
-    #       "-k _fwd_kernel,_bwd_kernel python FA2_triton_bench.py\n"
-    #       "  在报告中查看 DRAM Bytes（dram__bytes.* 指标）以评估 Bandwidth。")
