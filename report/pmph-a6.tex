@@ -176,10 +176,7 @@ Size: $(b, h, N, N) \times (b, h, N, d) \rightarrow (b, h, N, d)$
 
 FLOPs: $2 \cdot b \cdot h \cdot N \cdot N \cdot d = 2 \cdot b \cdot (h \cdot d) \cdot N^2$
 
-
-So, \textbf{total FLOPs:}
-
-$$ FLOPs_{\text{fwd\_attn}} = (2 \cdot b \cdot d \cdot N^2) + (2 \cdot b \cdot d \cdot N^2) = 4 \cdot b \cdot d \cdot N^2 $$
+$$ Total\, FLOPs = (2 \cdot b \cdot d \cdot N^2) + (2 \cdot b \cdot d \cdot N^2) = 4 \cdot b \cdot d \cdot N^2 $$
 
 
 \textbf{Depth Complexity: }
