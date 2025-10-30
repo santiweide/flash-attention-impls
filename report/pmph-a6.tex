@@ -21,6 +21,22 @@
 \usepackage{graphicx}
 
 \usepackage{natbib}
+
+
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{etoolbox}
+\usepackage[table]{xcolor}
+\usepackage[margin=1in]{geometry}
+
+% Define commands for highlighting the minimum value in a row
+\newcolumntype{R}{S[table-format=4.3]}
+\newrobustcmd{\B}[1]{%
+  \ifdimless{#1pt}{9999pt}{\bfseries\color{blue!75!black}}{}%
+  #1
+}
+\newcommand{\mcc}[1]{\multicolumn{1}{c}{#1}}
+
 % for citation commands in the .tex, authors can use:
 % \citep, \citet, and \citeyearpar for compatibility with natbib, or
 % \cite, \newcite, and \shortcite for compatibility with older ACL .sty files
@@ -28,6 +44,8 @@
 \newcommand\shortcite{\citeyearpar}% to get "(Year)" with natbib
 \newcommand\newcite{\citet} % to get "Author (Year)" with natbib
 \newcommand{\citeposs}[1]{\citeauthor{#1}'s (\citeyear{#1})} % to get "Author's (Year)"
+
+
 
 \bibliographystyle{acl_natbib}
 
@@ -92,31 +110,169 @@
 
 \section{Problem Statement}
 
-Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention}. In this report, we implement Flash Attention 1(FA1) forward calculation with different Domain Specific Languages(DSLs).
+Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention}. In this report, we implement Flash Attention(FA) forward pass with different Domain Specific Languages(DSLs): CUDA, CUDA+Cutlass, PyTorch and PyTorch + Triton.
 
+<<<<<<< HEAD
 For \textbf{evaluation metrics}, we focus on Latency speed up across different DSLs, compute efficiency, and memory efficiency.
+=======
+\subsection{What is Attention and what does Flash Attention do}
+The calculation process of Attention is as follows:
+>>>>>>> 7fad839 ([report] Add work-depth analysis)
 
-Latency speedup is assessed using kernel runtime of the execution time $(T)$ of the self-attention forward. Here we choose Baseline as TODO: 
+\[
+S = QK^{T} \quad P = \text{Softmax}(S) \quad O = PV
+\]
 
-$$\text{Speedup} = \frac{T_{\text{Base}}}{T_{\text{FlashAttention}}}.$$
+Among them, the Q, K, and V matrices are generated from the input sequence, while S and P are intermediate matrices, and O is the resulting matrix after the Attention computation.
+
+FlashAttention leverages shared memory to reduce accesses to high-bandwidth memory (HBM). It applies tiling to the $Q$, $K$, and $V$ matrices and modifies the softmax computation to operate efficiently on local tile-level results. In FlashAttention v1, the $Q$ matrix is loaded as a whole while $K$ and $V$ are split  during matrix multiplication (split-$K/V$). See Algorithm~\ref{alg:flashattention1}. In FlashAttention v2, $Q$ is instead split across threads or warps (split-$Q$), while $K$ and $V$ remain fixed. See Algorithm~\ref{alg:flashattention2}.
+
+\begin{algorithm}[htbp]
+\caption{FlashAttention-1 Block Logic (Warp-Level Split-K)}
+\label{alg:flashattention1}
+\begin{algorithmic}[1]
+    \FOR{each $K_j, V_j$ block}
+        \STATE \textbf{in parallel for each warp $w$:}
+        \STATE \hspace{0.5cm} $K_{j,w}, V_{j,w} \gets$ slices of $K_j, V_j$
+        \STATE \hspace{0.5cm} $S_{ij,w} \gets Q_i K_{j,w}^T$
+        \STATE \hspace{0.5cm} $(P_{ij,w}, L_{i,w}, m_{i,w}) \gets \text{update\_stats}(S_{ij,w}, L_{i,w}, m_{i,w})$
+        \STATE \hspace{0.5cm} $O_{\text{partial},w} \gets P_{ij,w} V_{j,w}$
+        \STATE \hspace{0.5cm} Write $O_{\text{partial},w}$ to $sO_{\text{partial}}$
+        \STATE Synchronize all warps
+        \STATE $O_{\text{block}} \gets \text{reduce\_sum}(sO_{\text{partial}})$
+        \STATE $O_i \gets \text{update\_output}(O_i, O_{\text{block}})$
+    \ENDFOR
+    \STATE $O_i \gets \text{finalize\_scaling}(O_i, L_i)$
+\end{algorithmic}
+\end{algorithm}
+
+
+\begin{algorithm}[htbp]
+\caption{FlashAttention-2 Block Logic (Warp-Level Split-Q)}
+\label{alg:flashattention2}
+\begin{algorithmic}[1]
+    \FOR{each $K_j, V_j$ block}
+        \STATE \textbf{in parallel for each warp $w$:}
+        \STATE \hspace{0.5cm} $Q_{i,w} \gets$ slice of $Q_i$
+        \STATE \hspace{0.5cm} $S_{ij,w} \gets Q_{i,w} K_j^T$
+        \STATE \hspace{0.5cm} $(P_{ij,w}, L_{i,w}, m_{i,w}) \gets \text{update\_stats}(S_{ij,w}, L_{i,w}, m_{i,w})$
+        \STATE \hspace{0.5cm} $O_{i,w} \gets \text{update\_output}(O_{i,w}, P_{ij,w} V_j)$
+    \ENDFOR
+    \STATE $O_i \gets \text{finalize\_scaling}(O_i, L_i)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Work-Depth Complexity}
+Let $N$ be the sequence length, $b$ be the batch size, $h$ be the head number and $d$ be the head dimension.
+
+\textbf{Work Complexity: } The work complexity is unified with Attention. 
+
+
+\textbf{Score ($S = QK^T$):} This computes the $N \times N$ score matrix.
+
+Size: $(b, h, N, d) \times (b, h, d, N) \rightarrow (b, h, N, N)$
+
+FLOPs: $2 \cdot b \cdot h \cdot N \cdot d \cdot N = 2 \cdot b \cdot (h \cdot d) \cdot N^2$
+
+\textbf{Output ($O = PV$):} This computes the $N \times d$ output matrix.
+
+Size: $(b, h, N, N) \times (b, h, N, d) \rightarrow (b, h, N, d)$
+
+FLOPs: $2 \cdot b \cdot h \cdot N \cdot N \cdot d = 2 \cdot b \cdot (h \cdot d) \cdot N^2$
+
+
+So, \textbf{total FLOPs:}
+
+$$ FLOPs_{\text{fwd\_attn}} = (2 \cdot b \cdot d \cdot N^2) + (2 \cdot b \cdot d \cdot N^2) = 4 \cdot b \cdot d \cdot N^2 $$
+
+
+\textbf{Depth Complexity: }
+Different tiling strategy brings different depth complexity.
+
+Let $T_r$ and $T_c$ be the number of blocks along the sequence length $N$ (i.e., $T_r \approx O(N)$ and $T_c \approx O(N)$).
+
+
+For FA1, since one block must sequentially iterate over both the $T_r$ row-blocks and $T_c$ column-blocks, the critical path (depth) is proportional to the total number of tiles it must compute:
+              \[ D_{FA1} = O(T_r \times T_c) = O(N^2) \]
+
+For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are "embarrassingly parallel" and are processed by different thread blocks simultaneously.
+
+\textbf{Depth:} The critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
+              \[ D_{FA2} = O(T_c) = O(N) \]
+
+
+
+\subsection{Evaluation Metrics}
+We focus on latency speedup, compute efficiency, and memory efficiency.\footnote{We intended to measure the achieved memory bandwidth, but were unable to install \textit{Nsight Compute} successfully.} Latency speedup is assessed using kernel runtime of the execution time $(T)$ of the self-attention forward. Here our baseline is a naive Attention implementation with no shared memory or warp-level optimizations ($\text{Speedup} = \frac{T_{\text{Base}}}{T_{\text{FlashAttention}}}$).
 
 For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPs//s): 
 
-$$\text{Achieved TFLOPs} = \frac{\text{Total Floating-Point operations in FA1}}{T_{\text{Execution Time}}}$$.
+$$\text{Achieved TFLOPs} = \frac{\text{Total Floating-Point operations in FA}}{T_{\text{Execution Time}}}$$.
 
 We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we are using the GPU compute resource efficiently.
 
-For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
 
-$$\text{Achieved Bandwidth} = \frac{\text{Total runtime memory access in FA}}{T_{\text{Execution Time}}}$$.
+%For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
 
-\section{DSL XX by Your Name TODO}
-\section{DSL XX by Your Name TODO}
-\section{DSL XX by Your Name TODO}
-\section{DSL XX by Your Name TODO}
+%$$\text{Achieved Bandwidth} = \frac{\text{Total runtime memory access in FA}}{T_{\text{Execution Time}}}$$.
+
+ \begin{comment}
+\begin{algorithm}[htbp]
+  \caption{Standard Attention}
+  \label{alg:standard_attention}
+  \begin{algorithmic}[1]
+    \STATE Load $Q$ and $K$ by blocks from HBM.
+    \STATE Compute $S = (1/\sqrt{d})QK^T$ (GEMM-I).
+    \STATE Write $S$ to HBM.
+    \STATE Read $S$ from HBM.
+    \STATE Compute $S = S - \text{rowmax}(S)$.
+    \STATE Compute $P = \text{softmax}(S)$.
+    \STATE Write $P$ to HBM.
+    \STATE Load $P$ and $V$ by blocks from HBM.
+    \STATE Compute $O = PV$ (GEMM-II).
+    \STATE Write $O$ to HBM.
+  \end{algorithmic}
+\end{algorithm}
+\end{comment}
+
+\section{CUDA by Zhigao Yan}
+
+\section{CUDA + Cutlass by Wanjing Hu}
+
+\subsection{Profiling}
+
+\begin{table}[htbp]
+\centering
+\caption{Flash Attention Performance Comparison (Runtime in ms and Speedup vs. Naive)}
+\label{tab:full_comparison}
+\sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
+\begin{tabular}{@{}l S[table-format=4.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2]@{}}
+\toprule
+& & \multicolumn{2}{c}{\textbf{Small Tile}} & \multicolumn{2}{c}{\textbf{CUTLASS TC}} & \multicolumn{2}{c}{\textbf{Large Tile}} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
+\textbf{Config (B, H, N, D)} & \mcc{\textbf{Naive (ms)}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} \\
+\midrule
+(1, 1, 512, 64)    & 13.87  & 0.95  & 14.62x & \B{0.71} & 19.63x & 2.35  & 5.89x \\
+(1, 1, 1024, 64)   & 27.38  & 1.90  & 14.42x & \B{1.39} & 19.76x & 4.69  & 5.84x \\
+(1, 1, 2048, 64)   & 53.80  & 3.72  & 14.47x & \B{2.74} & 19.63x & 9.35  & 5.75x \\
+(1, 1, 4096, 32)   & 47.57  & \B{6.16} & 7.72x  & 6.28  & 7.57x  & 17.29 & 2.75x \\
+(1, 1, 4096, 64)   & 128.08 & 7.36  & 17.40x & \B{6.27} & 20.43x & 18.68 & 6.86x \\
+(1, 1, 8192, 32)   & 95.36  & 13.38 & 7.13x  & \B{13.02} & 7.32x  & 34.44 & 2.77x \\
+(1, 1, 8192, 64)   & 233.23 & 18.78 & 12.42x & \B{13.50} & 17.28x & 37.16 & 6.28x \\
+(1, 32, 8192, 32)  & 899.36 & 264.30 & 3.40x  & \B{245.50} & 3.66x  & 722.78 & 1.24x \\
+(1, 32, 8192, 64)  & 2151.82 & 597.63 & 3.60x  & \B{309.99} & 6.94x  & 891.22 & 2.41x \\
+(1, 32, 8192, 128) & 4141.44 & 1023.15 & 4.05x  & \B{606.79} & 6.83x  & 1421.33 & 2.91x \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\section{PyTorch by Yuxuan Chen}
+
+\section{PyTorch + Triton by Hongyang Cui}
 
 
 \bibliography{custom}
-
 
 \end{document}
