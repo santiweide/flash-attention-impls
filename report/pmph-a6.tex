@@ -110,7 +110,7 @@
 
 \section{Problem Statement}
 
-Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention}. In this report, we implement Flash Attention(FA) forward pass with different Domain Specific Languages(DSLs): CUDA, CUDA+Cutlass, PyTorch and PyTorch + Triton.
+Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention} \cite{dao2023flashattention}. In this report, we implement Flash Attention(FA) forward pass with different Domain Specific Languages(DSLs): CUDA, CUDA+Cutlass, PyTorch and PyTorch + Triton.
 
 \subsection{What is Attention and what does Flash Attention do}
 The calculation process of Attention is as follows:
