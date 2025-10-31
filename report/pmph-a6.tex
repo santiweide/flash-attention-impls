@@ -159,6 +159,9 @@ FlashAttention leverages shared memory to reduce accesses to high-bandwidth memo
 \end{algorithm}
 
 \subsection{Work-Depth Complexity}
+
+Here we count only matrix multiplication for TFLOPS calculation, since $Softmax$ involves much fewer FLOPS. For a matrix $A$ of size $m \times n$ and a matrix $B$ of size $n \times p$,  the multiplication $A \times B$ requires $m \times n \times p$ multiplications and $m \times n \times p$ additions, totaling $2mnp$ FLOPs.
+
 Let $N$ be the sequence length, $b$ be the batch size, $h$ be the head number and $d$ be the head dimension.
 
 \textbf{Work Complexity: } The work complexity is unified with Attention\footnote{Note that we ignore the $Q=xW_Q$, $K=xW_K$, $V=xW_V$, $O=xW_O$ since we did not implement that in code. But this is counted in original flash attention paper.}.
@@ -188,7 +191,7 @@ Let $T_r$ and $T_c$ be the number of blocks along the sequence length $N$ (i.e.,
 For FA1, since one block must sequentially iterate over both the $T_r$ row-blocks and $T_c$ column-blocks, the critical path (depth) is proportional to the total number of tiles it must compute:
               \[ D_{FA1} = O(T_r \times T_c) = O(N^2) \]
 
-For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are "embarrassingly parallel" and are processed by different thread blocks simultaneously. Thus the critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
+For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are processed by different thread blocks simultaneously. Thus the critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
               \[ D_{FA2} = O(T_c) = O(N) \]
 
 
@@ -241,7 +244,9 @@ We compare the achieved TFLOPS with the theoretical hardware TFLOPS to see if we
 \textbf{Correctness} The output of the new kernel is compared with CUDA naive implementation with the same data input, with precision of diff less than 2\%. Since we are using float point 16 as the data calculate precision, there will be some accumulation error.
 
 
-\subsection{SMEM Allocation}
+\subsection{Memory Access}
+
+I use \textbf{shared memory} for the tile of $Q$, $K$ and $V$.
 \begin{lstlisting}
 // lines 93-98
 static constexpr size_t get_smem_size() {
@@ -252,7 +257,6 @@ static constexpr size_t get_smem_size() {
 }
 \end{lstlisting}
 
-\subsection{Itemized Calculation (HEAD\_DIM=32)}
 \begin{table}[h!]
 \centering
 \begin{tabular}{lcccc}
