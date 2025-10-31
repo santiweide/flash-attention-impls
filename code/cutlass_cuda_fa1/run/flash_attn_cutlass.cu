@@ -476,11 +476,13 @@ __global__ void flash_attn_cutlass_kernel(
         }
         __syncthreads();
         
-        // Online softmax
+        // Online softmax - prepare reduction buffer
+        float* reduce_buf = reinterpret_cast<float*>(smem + stats_offset + kTileM * 2 * sizeof(float));
+        
         for (int i = 0; i < q_size; i++) {
             parallel_softmax_update(
                 i, k_size, shared_mem.S + i * kTileN, shared_mem.P + i * kTileN,
-                m_shared + i, l_shared + i, smem + stats_offset + kTileM * 2, O_accum, blockDim.x, HEAD_DIM
+                m_shared + i, l_shared + i, reduce_buf, O_accum, blockDim.x, HEAD_DIM
             );
         }
         __syncthreads();
