@@ -37,22 +37,21 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
  * Input: local_max (value from each thread)
  * Output: max value in all threads (broadcasted)
  */
-__device__ __forceinline__ float block_reduce_max(float val) {
-    extern __shared__ float block_reduce_smem[];
+__device__ __forceinline__ float block_reduce_max(float val, float* smem) {
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
     
     // Warp reduction
     float warp_max = warp_reduce_max(val);
     
     // Store warp results
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
     if (lane_id == 0) {
-        block_reduce_smem[warp_id] = warp_max;
+        smem[warp_id] = warp_max;
     }
     __syncthreads();
     
     // Final warp reduction of warp maxes
-    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? block_reduce_smem[lane_id] : -INFINITY;
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[lane_id] : -INFINITY;
     result = warp_reduce_max(result);
     
     // Broadcast to all threads
@@ -73,22 +72,21 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 /**
  * Block-level parallel sum reduction
  */
-__device__ __forceinline__ float block_reduce_sum(float val) {
-    extern __shared__ float block_reduce_smem[];
+__device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
     
     // Warp reduction
     float warp_sum = warp_reduce_sum(val);
     
-    // Store warp results
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    // Store warp results (offset to avoid overwriting max results)
     if (lane_id == 0) {
-        block_reduce_smem[warp_id] = warp_sum;
+        smem[8 + warp_id] = warp_sum;
     }
     __syncthreads();
     
     // Final warp reduction
-    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? block_reduce_smem[lane_id] : 0.0f;
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[8 + lane_id] : 0.0f;
     result = warp_reduce_sum(result);
     
     // Broadcast to all threads
@@ -118,7 +116,7 @@ __device__ __forceinline__ void parallel_softmax_update(
     for (int idx = tid; idx < k_size; idx += num_threads) {
         local_max = fmaxf(local_max, scores[idx]);
     }
-    float m_new_block = block_reduce_max(local_max);
+    float m_new_block = block_reduce_max(local_max, m_shared);
     
     // Update m
     float m_old = m_shared[row_idx];
@@ -133,7 +131,7 @@ __device__ __forceinline__ void parallel_softmax_update(
         probs[idx] = p;
         local_sum += p;
     }
-    float l_new_block = block_reduce_sum(local_sum);
+    float l_new_block = block_reduce_sum(local_sum, l_shared);
     
     // Update l with correction
     float l_old = l_shared[row_idx];

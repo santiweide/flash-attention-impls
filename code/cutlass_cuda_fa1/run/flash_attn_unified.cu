@@ -123,23 +123,22 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 
 /**
  * Block-level parallel max reduction with broadcast
+ * Note: Assumes block size is 256 (8 warps)
  */
-__device__ __forceinline__ float block_reduce_max(float val) {
-    // Use first 32 elements of shared memory for warp maxes
-    float* smem = (float*)__shared_memory_ptr();
+__device__ __forceinline__ float block_reduce_max(float val, float* smem) {
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
     
     // Warp reduction
     float warp_max = warp_reduce_max(val);
     
-    // Store warp results
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    // Store warp results in shared memory
     if (lane_id == 0) {
         smem[warp_id] = warp_max;
     }
     __syncthreads();
     
-    // Final warp reduction
+    // Final warp reduction of warp maxes
     float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[lane_id] : -INFINITY;
     result = warp_reduce_max(result);
     
@@ -161,22 +160,21 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 /**
  * Block-level parallel sum reduction with broadcast
  */
-__device__ __forceinline__ float block_reduce_sum(float val) {
-    float* smem = (float*)__shared_memory_ptr();
+__device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
     
     // Warp reduction
     float warp_sum = warp_reduce_sum(val);
     
-    // Store warp results (offset to avoid overwriting max results)
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    // Store warp results (use offset to avoid conflicts)
     if (lane_id == 0) {
-        smem[32 + warp_id] = warp_sum;
+        smem[8 + warp_id] = warp_sum;
     }
     __syncthreads();
     
     // Final warp reduction
-    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[32 + lane_id] : 0.0f;
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[8 + lane_id] : 0.0f;
     result = warp_reduce_sum(result);
     
     // Broadcast to all threads
@@ -309,7 +307,7 @@ __global__ void flash_attn_large_tile_kernel(
             for (int idx = tid; idx < k_size; idx += blockDim.x) {
                 local_max = fmaxf(local_max, shared_mem.S[i * kTileN + idx]);
             }
-            float m_new_block = block_reduce_max(local_max);
+            float m_new_block = block_reduce_max(local_max, (float*)smem);
             
             // Update m (broadcasted to all threads)
             float m_old = m_shared[i];
@@ -324,7 +322,7 @@ __global__ void flash_attn_large_tile_kernel(
                 shared_mem.S[i * kTileN + idx] = p;  // Reuse S for P
                 local_sum += p;
             }
-            float l_new_block = block_reduce_sum(local_sum);
+            float l_new_block = block_reduce_sum(local_sum, (float*)smem);
             
             // Update l with correction (all threads participate)
             float l_old = l_shared[i];

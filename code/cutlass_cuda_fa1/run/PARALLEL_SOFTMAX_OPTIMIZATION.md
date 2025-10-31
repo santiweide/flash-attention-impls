@@ -1,5 +1,37 @@
 # Parallel Softmax Optimization: From Theory to Practice
 
+## Compilation & Build Notes
+
+### Compilation Fix: __shared_memory_ptr Error
+
+**Original Issue:**
+```cpp
+float* smem = (float*)__shared_memory_ptr();  // ❌ NOT A VALID CUDA FUNCTION
+```
+
+**Solution:**
+Pass shared memory as parameter to reduction functions:
+```cpp
+__device__ __forceinline__ float block_reduce_max(float val, float* smem) {
+    // smem is passed from kernel
+    // Use it for storing warp results
+    if (lane_id == 0) {
+        smem[warp_id] = warp_max;  // ✅ Store in passed SMEM
+    }
+}
+
+// Called from kernel:
+float result = block_reduce_max(local_max, (float*)smem);  // ✅ Pass SMEM pointer
+```
+
+**Why This Works:**
+- Shared memory is declared in kernel as `extern __shared__ char smem[]`
+- We cast it to `float*` for storing warp reduction results
+- First 16 floats (64 bytes) reserved for reduction metadata
+- No additional shared memory allocation needed
+
+---
+
 ## Executive Summary
 
 This document details the critical optimization that transforms Flash Attention from theoretical O(N log N) depth to practical O(N log N) depth by implementing parallel softmax computation using GPU tree reductions.
