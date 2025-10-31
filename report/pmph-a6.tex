@@ -160,7 +160,7 @@ FlashAttention leverages shared memory to reduce accesses to high-bandwidth memo
 
 \subsection{Work-Depth Complexity}
 
-Here we count only matrix multiplication for TFLOPS calculation, since $Softmax$ involves much fewer FLOPS. For a matrix $A$ of size $m \times n$ and a matrix $B$ of size $n \times p$,  the multiplication $A \times B$ requires $m \times n \times p$ multiplications and $m \times n \times p$ additions, totaling $2mnp$ FLOPs.
+Here we count only matrix multiplication for FLOPs calculation, since $Softmax$ involves much fewer FLOPs. For a matrix $A$ of size $m \times n$ and a matrix $B$ of size $n \times p$,  the multiplication $A \times B$ requires $m \times n \times p$ multiplications and $m \times n \times p$ additions, totaling $2mnp$ FLOPs.
 
 Let $N$ be the sequence length, $b$ be the batch size, $h$ be the head number and $d$ be the head dimension.
 
@@ -199,11 +199,11 @@ For FA2, it improves parallelism by \textit{adding} the sequence length dimensio
 \subsection{Evaluation Metrics}
 We focus on latency speedup, compute efficiency, and memory efficiency.\footnote{We intended to measure the achieved memory bandwidth, but were unable to install \textit{Nsight Compute} successfully.} Latency speedup is assessed using kernel runtime of the execution time $(T)$ of the self-attention forward. Here our baseline is a naive Attention implementation with no shared memory or warp-level optimizations ($\text{Speedup} = \frac{T_{\text{Base}}}{T_{\text{FlashAttention}}}$).
 
-For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPS): 
+For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPs/s): 
 
-$$\text{Achieved TFLOPS} = \frac{\text{Total Floating-Point operations in FA}}{T_{\text{Execution Time}}}$$.
+$$\text{Achieved TFLOPs/s} = \frac{\text{Total Floating-Point operations in FA}}{T_{\text{Execution Time}}}$$.
 
-We compare the achieved TFLOPS with the theoretical hardware TFLOPS to see if we are using the GPU compute resource efficiently.
+We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to see if we are using the GPU compute resource efficiently. The achieved TFLOPs/s of FA1 in paper is 25-40\% of the theoretical matmul TFLOPs/s with FP16/BF16 on A100. And for FA2 is 50\%-73\% of that\cite{dao2023flashattention}. Specifically, when head dimension is 128, FA2 can achieve 227 TFLOPs/s in forward pass.
 
 
 %For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
@@ -286,14 +286,14 @@ According to the work complexity analysis, the profiling is based on different s
 
 \begin{table}[htbp]
 \centering
-\caption{Flash Attention Throughput Comparison (TFLOPS and Speedup vs. Naive)}
+\caption{Flash Attention Throughput Comparison (TFLOPs/s and Speedup vs. Naive)}
 \label{tab:throughput_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=1.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2]@{}}
 \toprule
 & & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Large Tile}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
-\textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naived}} & \multicolumn{1}{c}{\textbf{TFLOPS}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPS}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPS}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
+\textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naived}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
 \midrule
 (1, 1, 512, 64)    & 0.00  & 0.07  & x & \textbf{0.10} & 19.63x & 0.03  & x  \\
 (1, 1, 1024, 64)   & 0.01  & 0.14  & 14x & \textbf{0.19} & 19.76x & 0.06  & 6.00x  \\
