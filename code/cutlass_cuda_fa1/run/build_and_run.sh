@@ -1,6 +1,8 @@
 #!/bin/bash
 
-    set -e  # exit on error
+module load cuda
+
+set -e  # exit on error
 
 echo "=========================================="
 echo "Minimal Flash Attention - Quick Start"
