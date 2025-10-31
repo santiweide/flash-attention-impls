@@ -33,122 +33,79 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 /**
- * Block-level parallel max reduction
- * Input: local_max (value from each thread)
- * Output: max value in all threads (broadcasted)
- * reduce_buf: temporary buffer for storing warp results (needs 16 floats)
+ * Parallel block reduction for maximum (tree-based warp shuffles)
+ * All threads cooperate to reduce 256 values to 1
+ * Result is broadcast to all threads via shared memory
  */
 __device__ __forceinline__ float block_reduce_max(float val, float* reduce_buf) {
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
     
-    // Warp reduction
-    float warp_max = warp_reduce_max(val);
+    // Step 1: Warp-level max reduction using __shfl_down_sync
+    float result = val;
+    for (int offset = 16; offset > 0; offset /= 2) {
+        result = fmaxf(result, __shfl_down_sync(0xFFFFFFFFU, result, offset));
+    }
     
-    // Store warp results
-    if (lane_id == 0) {
-        reduce_buf[warp_id] = warp_max;
+    // Step 2: Store warp results in shared memory
+    if (lane == 0) {
+        reduce_buf[warp] = result;
     }
     __syncthreads();
     
-    // Final warp reduction of warp maxes
-    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? reduce_buf[lane_id] : -INFINITY;
-    result = warp_reduce_max(result);
-    
-    // Broadcast to all threads
-    return __shfl_sync(0xffffffff, result, 0);
-}
-
-/**
- * Warp-level parallel sum reduction
- */
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+    // Step 3: Warp 0 reduces all warp results
+    if (warp == 0) {
+        result = (lane < 8) ? reduce_buf[lane] : -INFINITY;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            result = fmaxf(result, __shfl_down_sync(0xFFFFFFFFU, result, offset));
+        }
     }
-    return val;
+    
+    // Step 4: Broadcast result back to all threads
+    result = __shfl_sync(0xFFFFFFFFU, result, 0);
+    __syncthreads();
+    
+    return result;
 }
 
 /**
- * Block-level parallel sum reduction
+ * Parallel block reduction for sum (tree-based warp shuffles)
  */
 __device__ __forceinline__ float block_reduce_sum(float val, float* reduce_buf) {
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
     
-    // Warp reduction
-    float warp_sum = warp_reduce_sum(val);
+    // Step 1: Warp-level sum reduction using __shfl_down_sync
+    float result = val;
+    for (int offset = 16; offset > 0; offset /= 2) {
+        result += __shfl_down_sync(0xFFFFFFFFU, result, offset);
+    }
     
-    // Store warp results (offset to avoid overwriting max results)
-    if (lane_id == 0) {
-        reduce_buf[8 + warp_id] = warp_sum;
+    // Step 2: Store warp results in shared memory
+    if (lane == 0) {
+        reduce_buf[warp] = result;
     }
     __syncthreads();
     
-    // Final warp reduction
-    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? reduce_buf[8 + lane_id] : 0.0f;
-    result = warp_reduce_sum(result);
+    // Step 3: Warp 0 reduces all warp results
+    if (warp == 0) {
+        result = (lane < 8) ? reduce_buf[lane] : 0.0f;
+        for (int offset = 4; offset > 0; offset /= 2) {
+            result += __shfl_down_sync(0xFFFFFFFFU, result, offset);
+        }
+    }
     
-    // Broadcast to all threads
-    return __shfl_sync(0xffffffff, result, 0);
+    // Step 4: Broadcast result back to all threads
+    result = __shfl_sync(0xFFFFFFFFU, result, 0);
+    __syncthreads();
+    
+    return result;
 }
 
-/**
- * Parallel online softmax for one row (all threads cooperate)
- * 
- * NOTE: m_shared, l_shared are already offset to the current row!
- * They should be accessed at index 0, not row_idx
- */
-__device__ __forceinline__ void parallel_softmax_update(
-    int q_size,             // total Q size for this block
-    int q_idx,              // which Q row within the block
-    int k_size,
-    float* scores,          // [k_size] - S scores for this row
-    float* probs,           // [k_size] - output probabilities for this row
-    float* m_ptr,           // pointer to m value for this row
-    float* l_ptr,           // pointer to l value for this row
-    float* reduce_buf,      // temporary reduction buffer (16 floats)
-    float* O_accum,         // [q_size × HEAD_DIM] output accumulator
-    int num_threads,
-    int HEAD_DIM
-) {
-    const int tid = threadIdx.x;
-    
-    // Step 1: Find max over all scores (parallel reduction)
-    float local_max = -INFINITY;
-    for (int idx = tid; idx < k_size; idx += num_threads) {
-        local_max = fmaxf(local_max, scores[idx]);
-    }
-    float m_new_block = block_reduce_max(local_max, reduce_buf);
-    
-    // Update m - these are already offset pointers!
-    float m_old = *m_ptr;
-    float m_new = fmaxf(m_old, m_new_block);
-    *m_ptr = m_new;
-    __syncthreads();
-    
-    // Step 2: Compute exp and sum (parallel reduction)
-    float local_sum = 0.0f;
-    for (int idx = tid; idx < k_size; idx += num_threads) {
-        float p = expf(scores[idx] - m_new);
-        probs[idx] = p;
-        local_sum += p;
-    }
-    float l_new_block = block_reduce_sum(local_sum, reduce_buf);
-    
-    // Update l with correction
-    float l_old = *l_ptr;
-    float correction = expf(m_old - m_new);
-    float l_new = correction * l_old + l_new_block;
-    *l_ptr = l_new;
-    
-    // Step 3: Apply correction to O_accum (parallel across threads)
-    // O_accum is [q_size × HEAD_DIM], access row q_idx
-    for (int d = tid; d < HEAD_DIM; d += num_threads) {
-        O_accum[q_idx * HEAD_DIM + d] *= correction;
-    }
-}
+// NOTE: parallel_softmax_update removed - now using sequential softmax
+// to ensure numerical consistency with reference implementation
 
 // ==================== CUTLASS GEMM Configuration ====================
 
@@ -481,14 +438,34 @@ __global__ void flash_attn_cutlass_kernel(
         }
         __syncthreads();
         
-        // Online softmax - use shared_mem.P as reduction buffer (it will be overwritten during softmax anyway)
+        // Online softmax - SEQUENTIAL (matching Small Tile reference)
         for (int i = 0; i < q_size; i++) {
-            float* reduce_buf = reinterpret_cast<float*>(shared_mem.P);  // Reuse P as temp buffer
-            
-            parallel_softmax_update(
-                q_size, i, k_size, shared_mem.S + i * kTileN, shared_mem.P + i * kTileN,
-                m_shared + i, l_shared + i, reduce_buf, O_accum, blockDim.x, HEAD_DIM
-            );
+            if (tid == 0) {
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, shared_mem.S[i * kTileN + j]);
+                }
+                
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    float p = expf(shared_mem.S[i * kTileN + j] - m_new);
+                    shared_mem.S[i * kTileN + j] = p;
+                    l_new += p;
+                }
+                
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    O_accum[i * HEAD_DIM + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
+            }
         }
         __syncthreads();
         

@@ -298,47 +298,36 @@ __global__ void flash_attn_large_tile_kernel(
         }
         __syncthreads();
         
-        // Online softmax - PARALLEL VERSION
+        // Online softmax - SEQUENTIAL (reference implementation)
         for (int i = 0; i < q_size; i++) {
-            const int tid = threadIdx.x;
-            
-            // Use space after l_shared for reduction buffer (kTileM + 16 floats needed)
-            float* reduce_buf = l_shared + kTileM;
-            
-            // Step 1: Find max over all scores (all threads cooperate)
-            float local_max = -INFINITY;
-            for (int idx = tid; idx < k_size; idx += blockDim.x) {
-                local_max = fmaxf(local_max, shared_mem.S[i * kTileN + idx]);
+            if (tid == 0) {
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, shared_mem.S[i * kTileN + j]);
+                }
+                
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    float p = expf(shared_mem.S[i * kTileN + j] - m_new);
+                    shared_mem.S[i * kTileN + j] = p;
+                    l_new += p;
+                }
+                
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    O_accum[i * HEAD_DIM + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
             }
-            float m_new_block = block_reduce_max(local_max, reduce_buf);
-            
-            // Update m (broadcasted to all threads)
-            float m_old = m_shared[i];
-            float m_new = fmaxf(m_old, m_new_block);
-            m_shared[i] = m_new;
-            __syncthreads();
-            
-            // Step 2: Compute exp and sum (all threads cooperate)
-            float local_sum = 0.0f;
-            for (int idx = tid; idx < k_size; idx += blockDim.x) {
-                float p = expf(shared_mem.S[i * kTileN + idx] - m_new);
-                shared_mem.S[i * kTileN + idx] = p;  // Reuse S for P
-                local_sum += p;
-            }
-            float l_new_block = block_reduce_sum(local_sum, reduce_buf);
-            
-            // Update l with correction (all threads participate)
-            float l_old = l_shared[i];
-            float correction = expf(m_old - m_new);
-            float l_new = correction * l_old + l_new_block;
-            l_shared[i] = l_new;
-            
-            // Step 3: Apply correction to O_accum (all threads cooperate)
-            for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
-                O_accum[i * HEAD_DIM + d] *= correction;
-            }
-            __syncthreads();
         }
+        __syncthreads();
         
         // O += P @ V
         for (int i = 0; i < q_size; i++) {
@@ -531,7 +520,7 @@ __global__ void flash_attn_small_tile_kernel(
         }
         __syncthreads();
         
-        // Online softmax
+        // Online softmax - SEQUENTIAL (reference implementation)
         for (int i = 0; i < q_size; i++) {
             if (tid == 0) {
                 float m_old = m_shared[i];
@@ -562,6 +551,7 @@ __global__ void flash_attn_small_tile_kernel(
         }
         __syncthreads();
         
+
         for (int i = 0; i < q_size; i++) {
             for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
                 float sum = 0.0f;
