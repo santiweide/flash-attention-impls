@@ -417,6 +417,94 @@ for (each output position) {
 
 ---
 
+## Appendix A: Debugging & Fixes
+
+### Critical Bug Fix: Shared Memory Corruption
+
+#### Problem Identified
+
+During initial testing, CUTLASS output showed values near zero while reference values were normal:
+```
+Error at 0: flash=-0.000000, ref=0.000156, abs_diff=0.000156
+Error at 1: flash=-0.000000, ref=-0.000017, abs_diff=0.000017
+... (all values near zero)
+```
+
+#### Root Cause Analysis
+
+The original `parallel_softmax_update` implementation reused `m_shared` and `l_shared` arrays as the reduction buffer:
+
+```cuda
+// ❌ WRONG: Reuses m_shared as reduction buffer
+float m_new_block = block_reduce_max(local_max, m_shared);
+
+// This overwrites m_shared[0..7] with warp reduction results!
+// Then later:
+float m_old = m_shared[row_idx];  // ❌ Potentially corrupted!
+```
+
+**Why This Broke:**
+1. `block_reduce_max` stores warp leader results in `smem[0..7]`
+2. These indices correspond to `m_shared[0..7]` for the first 8 rows
+3. When accessing `m_shared[row_idx]`, we might get garbage instead of actual m values
+4. This caused softmax correction factor to be wrong
+5. Output was corrupted, appearing as zeros
+
+#### Solution Implemented
+
+Created a separate reduction buffer within the existing shared memory layout:
+
+```cuda
+// ✅ CORRECT: Use separate buffer after l_shared
+float* reduce_buf = l_shared + kTileM;  // After l_shared array
+
+// Now reduction doesn't corrupt m_shared or l_shared
+float m_new_block = block_reduce_max(local_max, reduce_buf);
+
+// Safe to read original values
+float m_old = m_shared[row_idx];  // ✅ Correct
+```
+
+#### Memory Layout
+
+```
+Shared Memory Layout:
+┌─────────────────────────────────────────┐
+│ Q tile: [kTileM × HEAD_DIM]             │ (FP16)
+│ K tile: [kTileN × HEAD_DIM]             │ (FP16)
+│ V tile: [kTileN × HEAD_DIM]             │ (FP16)
+│ S tile: [kTileM × kTileN]               │ (FP32)
+│ P tile: [kTileM × kTileN]               │ (FP32)
+├─────────────────────────────────────────┤ stats_offset
+│ m_shared: [kTileM]                      │ (FP32) - line max values
+│ l_shared: [kTileM]                      │ (FP32) - line sum values
+│ reduce_buf: [16] ← ADDED                │ (FP32) - reduction temporary
+├─────────────────────────────────────────┤
+│ O_accum: [kTileM × HEAD_DIM]            │ (FP32)
+└─────────────────────────────────────────┘
+```
+
+### Files Modified for Fix
+
+1. **flash_attn_cutlass.cu:**
+   - Updated `block_reduce_max()` to accept `reduce_buf` parameter
+   - Updated `block_reduce_sum()` to accept `reduce_buf` parameter
+   - Updated `parallel_softmax_update()` to accept `reduce_buf` parameter
+   - Pass `smem + stats_offset + kTileM * 2` as reduction buffer
+
+2. **flash_attn_unified.cu:**
+   - Updated reduction functions similarly
+   - Softmax loop now uses `reduce_buf = l_shared + kTileM`
+
+### Verification
+
+After fix, numerical errors should be within tolerance:
+```
+Expected: abs_diff < 1e-4 for FP16 precision
+```
+
+---
+
 ## 8. Future Optimizations
 
 ### 8.1 Potential Next Steps

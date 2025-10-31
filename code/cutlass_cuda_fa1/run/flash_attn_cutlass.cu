@@ -36,8 +36,9 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
  * Block-level parallel max reduction
  * Input: local_max (value from each thread)
  * Output: max value in all threads (broadcasted)
+ * reduce_buf: temporary buffer for storing warp results (needs 16 floats)
  */
-__device__ __forceinline__ float block_reduce_max(float val, float* smem) {
+__device__ __forceinline__ float block_reduce_max(float val, float* reduce_buf) {
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     
@@ -46,12 +47,12 @@ __device__ __forceinline__ float block_reduce_max(float val, float* smem) {
     
     // Store warp results
     if (lane_id == 0) {
-        smem[warp_id] = warp_max;
+        reduce_buf[warp_id] = warp_max;
     }
     __syncthreads();
     
     // Final warp reduction of warp maxes
-    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[lane_id] : -INFINITY;
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? reduce_buf[lane_id] : -INFINITY;
     result = warp_reduce_max(result);
     
     // Broadcast to all threads
@@ -72,7 +73,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 /**
  * Block-level parallel sum reduction
  */
-__device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
+__device__ __forceinline__ float block_reduce_sum(float val, float* reduce_buf) {
     int warp_id = threadIdx.x / 32;
     int lane_id = threadIdx.x % 32;
     
@@ -81,12 +82,12 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
     
     // Store warp results (offset to avoid overwriting max results)
     if (lane_id == 0) {
-        smem[8 + warp_id] = warp_sum;
+        reduce_buf[8 + warp_id] = warp_sum;
     }
     __syncthreads();
     
     // Final warp reduction
-    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[8 + lane_id] : 0.0f;
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? reduce_buf[8 + lane_id] : 0.0f;
     result = warp_reduce_sum(result);
     
     // Broadcast to all threads
@@ -95,16 +96,15 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
 
 /**
  * Parallel online softmax for one row (all threads cooperate)
- * Input: scores[k_size] - the attention scores for one query position
- * Output: m, l, P updated in shared memory
  */
 __device__ __forceinline__ void parallel_softmax_update(
     int row_idx,
     int k_size,
-    float* scores,          // [k_size] - S scores or P values
+    float* scores,          // [k_size] - S scores
     float* probs,           // [k_size] - output probabilities
-    float* m_shared,        // per-row max
-    float* l_shared,        // per-row sum
+    float* m_shared,        // per-row max values
+    float* l_shared,        // per-row sum values
+    float* reduce_buf,      // temporary reduction buffer (16 floats)
     float* O_accum,         // [TILE_M × HEAD_DIM] output accumulator
     int num_threads,
     int HEAD_DIM
@@ -116,7 +116,7 @@ __device__ __forceinline__ void parallel_softmax_update(
     for (int idx = tid; idx < k_size; idx += num_threads) {
         local_max = fmaxf(local_max, scores[idx]);
     }
-    float m_new_block = block_reduce_max(local_max, m_shared);
+    float m_new_block = block_reduce_max(local_max, reduce_buf);
     
     // Update m
     float m_old = m_shared[row_idx];
@@ -131,7 +131,7 @@ __device__ __forceinline__ void parallel_softmax_update(
         probs[idx] = p;
         local_sum += p;
     }
-    float l_new_block = block_reduce_sum(local_sum, l_shared);
+    float l_new_block = block_reduce_sum(local_sum, reduce_buf);
     
     // Update l with correction
     float l_old = l_shared[row_idx];
@@ -480,7 +480,7 @@ __global__ void flash_attn_cutlass_kernel(
         for (int i = 0; i < q_size; i++) {
             parallel_softmax_update(
                 i, k_size, shared_mem.S + i * kTileN, shared_mem.P + i * kTileN,
-                m_shared + i, l_shared + i, O_accum, blockDim.x, HEAD_DIM
+                m_shared + i, l_shared + i, smem + stats_offset + kTileM * 2, O_accum, blockDim.x, HEAD_DIM
             );
         }
         __syncthreads();
