@@ -1,7 +1,6 @@
 #!/bin/bash
 
 module load cuda
-
 set -e  # exit on error
 
 echo "=========================================="
@@ -118,4 +117,3 @@ echo ""
 echo "To clean:"
 echo "  make clean"
 echo "  rm -rf build/"
-
