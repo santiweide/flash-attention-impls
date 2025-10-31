@@ -161,22 +161,22 @@ FlashAttention leverages shared memory to reduce accesses to high-bandwidth memo
 \subsection{Work-Depth Complexity}
 Let $N$ be the sequence length, $b$ be the batch size, $h$ be the head number and $d$ be the head dimension.
 
-\textbf{Work Complexity: } The work complexity is unified with Attention. 
+\textbf{Work Complexity: } The work complexity is unified with Attention\footnote{Note that we ignore the $Q=xW_Q$, $K=xW_K$, $V=xW_V$, $O=xW_O$ since we did not implement that in code. But this is counted in original flash attention paper.}.
 
 
 \textbf{Score ($S = QK^T$):} This computes the $N \times N$ score matrix.
 
 Size: $(b, h, N, d) \times (b, h, d, N) \rightarrow (b, h, N, N)$
 
-FLOPs: $2 \cdot b \cdot h \cdot N \cdot d \cdot N = 2 \cdot b \cdot (h \cdot d) \cdot N^2$
+FLOPS: $2 \cdot b \cdot h \cdot N \cdot d \cdot N = 2 \cdot b \cdot (h \cdot d) \cdot N^2$
 
 \textbf{Output ($O = PV$):} This computes the $N \times d$ output matrix.
 
 Size: $(b, h, N, N) \times (b, h, N, d) \rightarrow (b, h, N, d)$
 
-FLOPs: $2 \cdot b \cdot h \cdot N \cdot N \cdot d = 2 \cdot b \cdot (h \cdot d) \cdot N^2$
+FLOPS: $2 \cdot b \cdot h \cdot N \cdot N \cdot d = 2 \cdot b \cdot (h \cdot d) \cdot N^2$
 
-$$ Total\, FLOPs = (2 \cdot b \cdot d \cdot N^2) + (2 \cdot b \cdot d \cdot N^2) = 4 \cdot b \cdot d \cdot N^2 $$
+$$ Total\, FLOPS = (2 \cdot b \cdot d \cdot N^2) + (2 \cdot b \cdot d \cdot N^2) = 4 \cdot b \cdot d \cdot N^2 $$
 
 
 \textbf{Depth Complexity: }
@@ -196,11 +196,11 @@ For FA2, it improves parallelism by \textit{adding} the sequence length dimensio
 \subsection{Evaluation Metrics}
 We focus on latency speedup, compute efficiency, and memory efficiency.\footnote{We intended to measure the achieved memory bandwidth, but were unable to install \textit{Nsight Compute} successfully.} Latency speedup is assessed using kernel runtime of the execution time $(T)$ of the self-attention forward. Here our baseline is a naive Attention implementation with no shared memory or warp-level optimizations ($\text{Speedup} = \frac{T_{\text{Base}}}{T_{\text{FlashAttention}}}$).
 
-For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPs//s): 
+For compute efficiency we use achieved Tera Floating-Point Operations Per Second(TFLOPS): 
 
-$$\text{Achieved TFLOPs} = \frac{\text{Total Floating-Point operations in FA}}{T_{\text{Execution Time}}}$$.
+$$\text{Achieved TFLOPS} = \frac{\text{Total Floating-Point operations in FA}}{T_{\text{Execution Time}}}$$.
 
-We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we are using the GPU compute resource efficiently.
+We compare the achieved TFLOPS with the theoretical hardware TFLOPS to see if we are using the GPU compute resource efficiently.
 
 
 %For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
@@ -282,14 +282,14 @@ According to the work complexity analysis, the profiling is based on different s
 
 \begin{table}[htbp]
 \centering
-\caption{Flash Attention Throughput Comparison (TFLOPs/s and Speedup vs. Naive)}
+\caption{Flash Attention Throughput Comparison (TFLOPS and Speedup vs. Naive)}
 \label{tab:throughput_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=1.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2]@{}}
 \toprule
 & & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Large Tile}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
-\textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naived}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
+\textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naived}} & \multicolumn{1}{c}{\textbf{TFLOPS}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPS}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPS}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
 \midrule
 (1, 1, 512, 64)    & 0.00  & 0.07  & x & \textbf{0.10} & 19.63x & 0.03  & x  \\
 (1, 1, 1024, 64)   & 0.01  & 0.14  & 14x & \textbf{0.19} & 19.76x & 0.06  & 6.00x  \\
