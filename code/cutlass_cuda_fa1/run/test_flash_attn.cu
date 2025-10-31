@@ -57,6 +57,19 @@ void flash_attention_cutlass_dispatch(
     cudaStream_t stream
 );
 
+// Declare CUTLASS Tensor Core with Parallel Softmax interface
+void flash_attention_cutlass_parallel_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
+
 // Declare Baseline implementation (forward declaration, implemented later)
 void attention_baseline(
     const cutlass::half_t* Q,
@@ -210,6 +223,10 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaMalloc(&d_O_baseline, bytes));
     CHECK_CUDA(cudaMalloc(&d_O_cutlass, bytes));
     
+    // allocate output for parallel CUTLASS
+    cutlass::half_t *d_O_cutlass_parallel;
+    CHECK_CUDA(cudaMalloc(&d_O_cutlass_parallel, bytes));
+    
     // initialize inputs
     printf("Initializing inputs...\n");
     init_random(d_Q, qkv_size);
@@ -256,6 +273,16 @@ void run_test(const TestConfig& config) {
         );
     });
     
+    // run CUTLASS Tensor Core with Parallel Softmax version
+    printf("Running Flash Attention (CUTLASS + Parallel Softmax)...\n");
+    float time_cutlass_parallel = benchmark([&]() {
+        flash_attention_cutlass_parallel_dispatch(
+            d_Q, d_K, d_V, d_O_cutlass_parallel,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
+    });
+    
     // verify correctness
     printf("\nVerifying correctness...\n");
     printf("Comparing Large Tile vs Small Tile:\n");
@@ -263,6 +290,12 @@ void run_test(const TestConfig& config) {
     
     printf("\nComparing CUTLASS vs Small Tile:\n");
     float error_cutlass_vs_ref = compute_max_relative_error(d_O_cutlass, d_O_ref, qkv_size);
+    
+    printf("\nComparing CUTLASS (Parallel Softmax) vs Small Tile:\n");
+    float error_cutlass_parallel_vs_ref = compute_max_relative_error(d_O_cutlass_parallel, d_O_ref, qkv_size);
+    
+    printf("\nComparing CUTLASS (Parallel) vs CUTLASS (Sequential):\n");
+    float error_cutlass_parallel_vs_sequential = compute_max_relative_error(d_O_cutlass_parallel, d_O_cutlass, qkv_size);
     
     printf("\nComparing Baseline vs Small Tile:\n");
     float error_baseline_vs_ref = compute_max_relative_error(d_O_baseline, d_O_ref, qkv_size);
@@ -281,6 +314,8 @@ void run_test(const TestConfig& config) {
            "Flash Attn (Small Tile):", time_ref, time_baseline / time_ref);
     printf("%-35s %10.3f ms  (%.2fx vs baseline, %.2fx vs Small)\n", 
            "Flash Attn (CUTLASS Tensor Core):", time_cutlass, time_baseline / time_cutlass, time_ref / time_cutlass);
+    printf("%-35s %10.3f ms  (%.2fx vs baseline, %.2fx vs Small)\n", 
+           "Flash Attn (CUTLASS + Parallel):", time_cutlass_parallel, time_baseline / time_cutlass_parallel, time_ref / time_cutlass_parallel);
     printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
            "Flash Attn (Large Tile):", time_flash, time_baseline / time_flash);
     
@@ -290,6 +325,8 @@ void run_test(const TestConfig& config) {
     printf("================================================================================\n");
     printf("Large Tile vs Small Tile:  %.6f\n", error_flash_vs_ref);
     printf("CUTLASS vs Small Tile:     %.6f\n", error_cutlass_vs_ref);
+    printf("CUTLASS (Parallel Softmax) vs Small Tile:     %.6f\n", error_cutlass_parallel_vs_ref);
+    printf("CUTLASS (Parallel) vs CUTLASS (Sequential):     %.6f\n", error_cutlass_parallel_vs_sequential);
     printf("Baseline vs Small Tile:    %.6f\n", error_baseline_vs_ref);
     printf("Large Tile vs Baseline:    %.6f\n", error_flash_vs_baseline);
     
@@ -344,6 +381,7 @@ void run_test(const TestConfig& config) {
     CHECK_CUDA(cudaFree(d_O_ref));
     CHECK_CUDA(cudaFree(d_O_baseline));
     CHECK_CUDA(cudaFree(d_O_cutlass));
+    CHECK_CUDA(cudaFree(d_O_cutlass_parallel));
 }
 
 // ==================== Reference Implementation (Tiled version, head_dim=32 optimized) ====================

@@ -104,8 +104,61 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* reduce_buf) 
     return result;
 }
 
-// NOTE: parallel_softmax_update removed - now using sequential softmax
-// to ensure numerical consistency with reference implementation
+/**
+ * Parallel online softmax for one row (all threads cooperate)
+ * 
+ * Uses tree reduction for max and sum operations
+ * All threads participate to maximize parallelism
+ */
+__device__ __forceinline__ void parallel_softmax_update(
+    int q_size,             // total Q size for this block
+    int q_idx,              // which Q row within the block
+    int k_size,
+    float* scores,          // [k_size] - S scores for this row
+    float* probs,           // [k_size] - output probabilities for this row
+    float* m_ptr,           // pointer to m value for this row
+    float* l_ptr,           // pointer to l value for this row
+    float* reduce_buf,      // temporary reduction buffer (16 floats)
+    float* O_accum,         // [q_size × HEAD_DIM] output accumulator
+    int num_threads,
+    int HEAD_DIM
+) {
+    const int tid = threadIdx.x;
+    
+    // Step 1: Find max over all scores (parallel reduction)
+    float local_max = -INFINITY;
+    for (int idx = tid; idx < k_size; idx += num_threads) {
+        local_max = fmaxf(local_max, scores[idx]);
+    }
+    float m_new_block = block_reduce_max(local_max, reduce_buf);
+    
+    // Update m - these are already offset pointers!
+    float m_old = *m_ptr;
+    float m_new = fmaxf(m_old, m_new_block);
+    *m_ptr = m_new;
+    __syncthreads();
+    
+    // Step 2: Compute exp and sum (parallel reduction)
+    float local_sum = 0.0f;
+    for (int idx = tid; idx < k_size; idx += num_threads) {
+        float p = expf(scores[idx] - m_new);
+        probs[idx] = p;
+        local_sum += p;
+    }
+    float l_new_block = block_reduce_sum(local_sum, reduce_buf);
+    
+    // Update l with correction
+    float l_old = *l_ptr;
+    float correction = expf(m_old - m_new);
+    float l_new = correction * l_old + l_new_block;
+    *l_ptr = l_new;
+    
+    // Step 3: Apply correction to O_accum (parallel across threads)
+    // O_accum is [q_size × HEAD_DIM], access row q_idx
+    for (int d = tid; d < HEAD_DIM; d += num_threads) {
+        O_accum[q_idx * HEAD_DIM + d] *= correction;
+    }
+}
 
 // ==================== CUTLASS GEMM Configuration ====================
 
@@ -351,7 +404,7 @@ __device__ __forceinline__ void cutlass_gemm_pv(
 // ==================== Flash Attention Kernel with CUTLASS ====================
 
 template<int HEAD_DIM>
-__global__ void flash_attn_cutlass_kernel(
+__global__ void flash_attn_cutlass_parallel_kernel(
     const cutlass::half_t* __restrict__ Q,
     const cutlass::half_t* __restrict__ K,
     const cutlass::half_t* __restrict__ V,
@@ -438,34 +491,14 @@ __global__ void flash_attn_cutlass_kernel(
         }
         __syncthreads();
         
-        // Online softmax - SEQUENTIAL (matching Small Tile reference)
+        // Online softmax - PARALLEL VERSION using tree reductions
         for (int i = 0; i < q_size; i++) {
-            if (tid == 0) {
-                float m_old = m_shared[i];
-                float l_old = l_shared[i];
-                
-                float m_new = m_old;
-                for (int j = 0; j < k_size; j++) {
-                    m_new = fmaxf(m_new, shared_mem.S[i * kTileN + j]);
-                }
-                
-                float l_new = 0.0f;
-                for (int j = 0; j < k_size; j++) {
-                    float p = expf(shared_mem.S[i * kTileN + j] - m_new);
-                    shared_mem.P[i * kTileN + j] = p;
-                    l_new += p;
-                }
-                
-                float correction = expf(m_old - m_new);
-                l_new = correction * l_old + l_new;
-                
-                for (int d = 0; d < HEAD_DIM; d++) {
-                    O_accum[i * HEAD_DIM + d] *= correction;
-                }
-                
-                m_shared[i] = m_new;
-                l_shared[i] = l_new;
-            }
+            float* reduce_buf = reinterpret_cast<float*>(shared_mem.P);  // Reuse P as temp buffer
+            
+            parallel_softmax_update(
+                q_size, i, k_size, shared_mem.S + i * kTileN, shared_mem.P + i * kTileN,
+                m_shared + i, l_shared + i, reduce_buf, O_accum, blockDim.x, HEAD_DIM
+            );
         }
         __syncthreads();
         
@@ -488,7 +521,7 @@ __global__ void flash_attn_cutlass_kernel(
 // ==================== Host Interface ====================
 
 template<int HEAD_DIM>
-void flash_attn_cutlass_forward(
+void flash_attn_cutlass_parallel_forward(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -510,7 +543,7 @@ void flash_attn_cutlass_forward(
     
     if (smem_size > 48 * 1024) {
         cudaFuncSetAttribute(
-            flash_attn_cutlass_kernel<HEAD_DIM>,
+            flash_attn_cutlass_parallel_kernel<HEAD_DIM>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size
         );
@@ -521,7 +554,7 @@ void flash_attn_cutlass_forward(
     if (first_call) {
         printf("\n");
         printf("================================================================================\n");
-        printf("Flash Attention - WMMA Tensor Core (head_dim=%d)\n", HEAD_DIM);
+        printf("Flash Attention - WMMA + PARALLEL Softmax (head_dim=%d)\n", HEAD_DIM);
         printf("================================================================================\n");
         printf("  Tile size: %dx%d (same as Small Tile)\n", Config::kTileM, Config::kTileN);
         printf("  Threads: %d (%d warps)\n", Config::kThreads, Config::kThreads / 32);
@@ -529,11 +562,15 @@ void flash_attn_cutlass_forward(
         printf("  Tensor Cores: ENABLED via WMMA API\n");
         printf("    → Q@K^T: wmma::mma_sync (16x16x16 tiles, FP16→FP32)\n");
         printf("    → P@V:   CUDA cores (FP32 input limitation)\n");
+        printf("  Softmax: PARALLEL tree reductions (all 256 threads participate)\n");
+        printf("    → Max reduction: O(log N) depth\n");
+        printf("    → Sum reduction: O(log N) depth\n");
+        printf("    → Correction: Parallel across threads\n");
         printf("================================================================================\n");
         first_call = false;
     }
     
-    flash_attn_cutlass_kernel<HEAD_DIM><<<grid, block, smem_size, stream>>>(
+    flash_attn_cutlass_parallel_kernel<HEAD_DIM><<<grid, block, smem_size, stream>>>(
         Q, K, V, O,
         softmax_scale,
         batch_size, num_heads, seq_len
@@ -541,14 +578,14 @@ void flash_attn_cutlass_forward(
     
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "CUTLASS Flash attention kernel launch failed: %s\n", 
+        fprintf(stderr, "CUTLASS Parallel Flash attention kernel launch failed: %s\n", 
                 cudaGetErrorString(err));
     }
 }
 
 // ==================== Public Dispatch Function ====================
 
-void flash_attention_cutlass_dispatch(
+void flash_attention_cutlass_parallel_dispatch(
     const cutlass::half_t* Q,
     const cutlass::half_t* K,
     const cutlass::half_t* V,
@@ -561,13 +598,13 @@ void flash_attention_cutlass_dispatch(
 ) {
     switch (head_dim) {
         case 32:
-            flash_attn_cutlass_forward<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            flash_attn_cutlass_parallel_forward<32>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
             break;
         case 64:
-            flash_attn_cutlass_forward<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            flash_attn_cutlass_parallel_forward<64>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
             break;
         case 128:
-            flash_attn_cutlass_forward<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
+            flash_attn_cutlass_parallel_forward<128>(Q, K, V, O, batch_size, num_heads, seq_len, stream);
             break;
         default:
             fprintf(stderr, "Unsupported head_dim=%d for CUTLASS (supported: 32, 64, 128)\n", head_dim);
