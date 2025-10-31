@@ -96,16 +96,20 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* reduce_buf) 
 
 /**
  * Parallel online softmax for one row (all threads cooperate)
+ * 
+ * NOTE: m_shared, l_shared are already offset to the current row!
+ * They should be accessed at index 0, not row_idx
  */
 __device__ __forceinline__ void parallel_softmax_update(
-    int row_idx,
+    int q_size,             // total Q size for this block
+    int q_idx,              // which Q row within the block
     int k_size,
-    float* scores,          // [k_size] - S scores
-    float* probs,           // [k_size] - output probabilities
-    float* m_shared,        // per-row max values
-    float* l_shared,        // per-row sum values
+    float* scores,          // [k_size] - S scores for this row
+    float* probs,           // [k_size] - output probabilities for this row
+    float* m_ptr,           // pointer to m value for this row
+    float* l_ptr,           // pointer to l value for this row
     float* reduce_buf,      // temporary reduction buffer (16 floats)
-    float* O_accum,         // [TILE_M × HEAD_DIM] output accumulator
+    float* O_accum,         // [q_size × HEAD_DIM] output accumulator
     int num_threads,
     int HEAD_DIM
 ) {
@@ -118,10 +122,10 @@ __device__ __forceinline__ void parallel_softmax_update(
     }
     float m_new_block = block_reduce_max(local_max, reduce_buf);
     
-    // Update m
-    float m_old = m_shared[row_idx];
+    // Update m - these are already offset pointers!
+    float m_old = *m_ptr;
     float m_new = fmaxf(m_old, m_new_block);
-    m_shared[row_idx] = m_new;
+    *m_ptr = m_new;
     __syncthreads();
     
     // Step 2: Compute exp and sum (parallel reduction)
@@ -134,14 +138,15 @@ __device__ __forceinline__ void parallel_softmax_update(
     float l_new_block = block_reduce_sum(local_sum, reduce_buf);
     
     // Update l with correction
-    float l_old = l_shared[row_idx];
+    float l_old = *l_ptr;
     float correction = expf(m_old - m_new);
     float l_new = correction * l_old + l_new_block;
-    l_shared[row_idx] = l_new;
+    *l_ptr = l_new;
     
     // Step 3: Apply correction to O_accum (parallel across threads)
+    // O_accum is [q_size × HEAD_DIM], access row q_idx
     for (int d = tid; d < HEAD_DIM; d += num_threads) {
-        O_accum[row_idx * HEAD_DIM + d] *= correction;
+        O_accum[q_idx * HEAD_DIM + d] *= correction;
     }
 }
 
@@ -481,7 +486,7 @@ __global__ void flash_attn_cutlass_kernel(
             float* reduce_buf = reinterpret_cast<float*>(shared_mem.P);  // Reuse P as temp buffer
             
             parallel_softmax_update(
-                i, k_size, shared_mem.S + i * kTileN, shared_mem.P + i * kTileN,
+                q_size, i, k_size, shared_mem.S + i * kTileN, shared_mem.P + i * kTileN,
                 m_shared + i, l_shared + i, reduce_buf, O_accum, blockDim.x, HEAD_DIM
             );
         }
