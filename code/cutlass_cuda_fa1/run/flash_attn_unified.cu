@@ -108,6 +108,81 @@ struct SharedMemory {
     }
 };
 
+// ==================== Parallel Softmax Utilities ====================
+
+/**
+ * Warp-level parallel max reduction
+ */
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+/**
+ * Block-level parallel max reduction with broadcast
+ */
+__device__ __forceinline__ float block_reduce_max(float val) {
+    // Use first 32 elements of shared memory for warp maxes
+    float* smem = (float*)__shared_memory_ptr();
+    
+    // Warp reduction
+    float warp_max = warp_reduce_max(val);
+    
+    // Store warp results
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) {
+        smem[warp_id] = warp_max;
+    }
+    __syncthreads();
+    
+    // Final warp reduction
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[lane_id] : -INFINITY;
+    result = warp_reduce_max(result);
+    
+    // Broadcast to all threads
+    return __shfl_sync(0xffffffff, result, 0);
+}
+
+/**
+ * Warp-level parallel sum reduction
+ */
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+/**
+ * Block-level parallel sum reduction with broadcast
+ */
+__device__ __forceinline__ float block_reduce_sum(float val) {
+    float* smem = (float*)__shared_memory_ptr();
+    
+    // Warp reduction
+    float warp_sum = warp_reduce_sum(val);
+    
+    // Store warp results (offset to avoid overwriting max results)
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) {
+        smem[32 + warp_id] = warp_sum;
+    }
+    __syncthreads();
+    
+    // Final warp reduction
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[32 + lane_id] : 0.0f;
+    result = warp_reduce_sum(result);
+    
+    // Broadcast to all threads
+    return __shfl_sync(0xffffffff, result, 0);
+}
+
 // ==================== GEMM (Template) ====================
 
 template<typename T, int M, int N, int K>
@@ -225,47 +300,51 @@ __global__ void flash_attn_large_tile_kernel(
         }
         __syncthreads();
         
-        // Online softmax
+        // Online softmax - PARALLEL VERSION
         for (int i = 0; i < q_size; i++) {
-            if (tid == 0) {
-                float* scores = shared_mem.S + i * kTileN;
-                float* P = shared_mem.P + i * kTileN;
-                
-                float m_old = m_shared[i];
-                float l_old = l_shared[i];
-                
-                float m_new = m_old;
-                for (int j = 0; j < k_size; j++) {
-                    m_new = fmaxf(m_new, scores[j]);
-                }
-                
-                float l_new = 0.0f;
-                for (int j = 0; j < k_size; j++) {
-                    P[j] = expf(scores[j] - m_new);
-                    l_new += P[j];
-                }
-                
-                float correction = expf(m_old - m_new);
-                l_new = correction * l_old + l_new;
-                
-                for (int d = 0; d < HEAD_DIM; d++) {
-                    O_accum[i * HEAD_DIM + d] *= correction;
-                }
-                
-                m_shared[i] = m_new;
-                l_shared[i] = l_new;
+            const int tid = threadIdx.x;
+            
+            // Step 1: Find max over all scores (all threads cooperate)
+            float local_max = -INFINITY;
+            for (int idx = tid; idx < k_size; idx += blockDim.x) {
+                local_max = fmaxf(local_max, shared_mem.S[i * kTileN + idx]);
             }
+            float m_new_block = block_reduce_max(local_max);
+            
+            // Update m (broadcasted to all threads)
+            float m_old = m_shared[i];
+            float m_new = fmaxf(m_old, m_new_block);
+            m_shared[i] = m_new;
+            __syncthreads();
+            
+            // Step 2: Compute exp and sum (all threads cooperate)
+            float local_sum = 0.0f;
+            for (int idx = tid; idx < k_size; idx += blockDim.x) {
+                float p = expf(shared_mem.S[i * kTileN + idx] - m_new);
+                shared_mem.S[i * kTileN + idx] = p;  // Reuse S for P
+                local_sum += p;
+            }
+            float l_new_block = block_reduce_sum(local_sum);
+            
+            // Update l with correction (all threads participate)
+            float l_old = l_shared[i];
+            float correction = expf(m_old - m_new);
+            float l_new = correction * l_old + l_new_block;
+            l_shared[i] = l_new;
+            
+            // Step 3: Apply correction to O_accum (all threads cooperate)
+            for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+                O_accum[i * HEAD_DIM + d] *= correction;
+            }
+            __syncthreads();
         }
-        __syncthreads();
         
         // O += P @ V
         for (int i = 0; i < q_size; i++) {
             for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
                 float sum = 0.0f;
-                const float* P_row = shared_mem.P + i * kTileN;
-                #pragma unroll 8
                 for (int j = 0; j < k_size; j++) {
-                    sum += P_row[j] * float(shared_mem.V[j * HEAD_DIM + d]);
+                    sum += shared_mem.S[i * kTileN + j] * float(shared_mem.V[j * HEAD_DIM + d]);  // Use S instead of P
                 }
                 O_accum[i * HEAD_DIM + d] += sum;
             }

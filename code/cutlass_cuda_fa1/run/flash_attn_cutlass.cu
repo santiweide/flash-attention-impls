@@ -18,6 +18,135 @@
 
 using namespace nvcuda;
 
+// ==================== Parallel Softmax Utilities ====================
+
+/**
+ * Warp-level parallel max reduction
+ * Returns max value in thread 0 of the warp
+ */
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+/**
+ * Block-level parallel max reduction
+ * Input: local_max (value from each thread)
+ * Output: max value in all threads (broadcasted)
+ */
+__device__ __forceinline__ float block_reduce_max(float val) {
+    extern __shared__ float block_reduce_smem[];
+    
+    // Warp reduction
+    float warp_max = warp_reduce_max(val);
+    
+    // Store warp results
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) {
+        block_reduce_smem[warp_id] = warp_max;
+    }
+    __syncthreads();
+    
+    // Final warp reduction of warp maxes
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? block_reduce_smem[lane_id] : -INFINITY;
+    result = warp_reduce_max(result);
+    
+    // Broadcast to all threads
+    return __shfl_sync(0xffffffff, result, 0);
+}
+
+/**
+ * Warp-level parallel sum reduction
+ */
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+/**
+ * Block-level parallel sum reduction
+ */
+__device__ __forceinline__ float block_reduce_sum(float val) {
+    extern __shared__ float block_reduce_smem[];
+    
+    // Warp reduction
+    float warp_sum = warp_reduce_sum(val);
+    
+    // Store warp results
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) {
+        block_reduce_smem[warp_id] = warp_sum;
+    }
+    __syncthreads();
+    
+    // Final warp reduction
+    float result = (threadIdx.x < (blockDim.x + 31) / 32) ? block_reduce_smem[lane_id] : 0.0f;
+    result = warp_reduce_sum(result);
+    
+    // Broadcast to all threads
+    return __shfl_sync(0xffffffff, result, 0);
+}
+
+/**
+ * Parallel online softmax for one row (all threads cooperate)
+ * Input: scores[k_size] - the attention scores for one query position
+ * Output: m, l, P updated in shared memory
+ */
+__device__ __forceinline__ void parallel_softmax_update(
+    int row_idx,
+    int k_size,
+    float* scores,          // [k_size] - S scores or P values
+    float* probs,           // [k_size] - output probabilities
+    float* m_shared,        // per-row max
+    float* l_shared,        // per-row sum
+    float* O_accum,         // [TILE_M × HEAD_DIM] output accumulator
+    int num_threads,
+    int HEAD_DIM
+) {
+    const int tid = threadIdx.x;
+    
+    // Step 1: Find max over all scores (parallel reduction)
+    float local_max = -INFINITY;
+    for (int idx = tid; idx < k_size; idx += num_threads) {
+        local_max = fmaxf(local_max, scores[idx]);
+    }
+    float m_new_block = block_reduce_max(local_max);
+    
+    // Update m
+    float m_old = m_shared[row_idx];
+    float m_new = fmaxf(m_old, m_new_block);
+    m_shared[row_idx] = m_new;
+    __syncthreads();
+    
+    // Step 2: Compute exp and sum (parallel reduction)
+    float local_sum = 0.0f;
+    for (int idx = tid; idx < k_size; idx += num_threads) {
+        float p = expf(scores[idx] - m_new);
+        probs[idx] = p;
+        local_sum += p;
+    }
+    float l_new_block = block_reduce_sum(local_sum);
+    
+    // Update l with correction
+    float l_old = l_shared[row_idx];
+    float correction = expf(m_old - m_new);
+    float l_new = correction * l_old + l_new_block;
+    l_shared[row_idx] = l_new;
+    
+    // Step 3: Apply correction to O_accum (parallel across threads)
+    for (int d = tid; d < HEAD_DIM; d += num_threads) {
+        O_accum[row_idx * HEAD_DIM + d] *= correction;
+    }
+}
+
 // ==================== CUTLASS GEMM Configuration ====================
 
 // Configuration for small GEMM operations used in attention
@@ -351,35 +480,10 @@ __global__ void flash_attn_cutlass_kernel(
         
         // Online softmax
         for (int i = 0; i < q_size; i++) {
-            if (tid == 0) {
-                float m_old = m_shared[i];
-                float l_old = l_shared[i];
-                
-                // Find new max
-                float m_new = m_old;
-                for (int j = 0; j < k_size; j++) {
-                    m_new = fmaxf(m_new, shared_mem.S[i * kTileN + j]);
-                }
-                
-                // Compute exp and new sum
-                float l_new = 0.0f;
-                for (int j = 0; j < k_size; j++) {
-                    float p = expf(shared_mem.S[i * kTileN + j] - m_new);
-                    shared_mem.P[i * kTileN + j] = p;
-                    l_new += p;
-                }
-                
-                // Apply correction
-                float correction = expf(m_old - m_new);
-                l_new = correction * l_old + l_new;
-                
-                for (int d = 0; d < HEAD_DIM; d++) {
-                    O_accum[i * HEAD_DIM + d] *= correction;
-                }
-                
-                m_shared[i] = m_new;
-                l_shared[i] = l_new;
-            }
+            parallel_softmax_update(
+                i, k_size, shared_mem.S + i * kTileN, shared_mem.P + i * kTileN,
+                m_shared + i, l_shared + i, O_accum, blockDim.x, HEAD_DIM
+            );
         }
         __syncthreads();
         
