@@ -61,7 +61,7 @@
 
 
 \lstset{frame=tb,
-    language=Python,
+    language=c++,
     backgroundcolor=\color{backcolour},   
     commentstyle=\color{codegreen},
     keywordstyle=\color{magenta},
@@ -236,10 +236,49 @@ We compare the achieved TFLOPs with the theoretical hardware TFLOPs to see if we
 
 \section{CUDA + Cutlass by Wanjing Hu}
 
-\subsection{Profiling}
+\subsection{Validation of implementation}
+
+\textbf{Correctness} The output of the new kernel is compared with CUDA naive implementation with the same data input, with precision of diff less than 2\%. Since we are using float point 16 as the data calculate precision, there will be some accumulation error.
+
+
+\subsection{SMEM Allocation}
+\begin{lstlisting}
+// lines 93-98
+static constexpr size_t get_smem_size() {
+    return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
+           (kTileM * kTileN * 2) * sizeof(float) +  // S and P
+           (kTileM * 2) * sizeof(float) +          // m, l
+           (kTileM * kHeadDim) * sizeof(float);   // O_accum
+}
+\end{lstlisting}
+
+\subsection{Itemized Calculation (HEAD\_DIM=32)}
+\begin{table}[h!]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Data Structure} & \textbf{Dimensions} & \textbf{Elements} & \textbf{Bytes} & \textbf{Calculation} \\
+\midrule
+\textbf{Q} & [45, 32] & 1,440 & 2,880 B & $45 \times 32 \times 2$ \\
+\textbf{K} & [90, 32] & 2,880 & 5,760 B & $90 \times 32 \times 2$ \\
+\textbf{V} & [90, 32] & 2,880 & 5,760 B & $90 \times 32 \times 2$ \\
+\textbf{S} & [45, 90] & 4,050 & 16,200 B & $45 \times 90 \times 4$ \\
+\textbf{P} & [45, 90] & 4,050 & 16,200 B & $45 \times 90 \times 4$ \\
+\textbf{m} & [45] & 45 & 180 B & $45 \times 4$ \\
+\textbf{l} & [45] & 45 & 180 B & $45 \times 4$ \\
+\textbf{O\_accum} & [45, 32] & 1,440 & 5,760 B & $45 \times 32 \times 4$ \\
+\midrule
+\textbf{TOTAL} & - & - & \textbf{52,920 B} & $\approx$ \textbf{51.7 KB} \\
+\bottomrule
+\end{tabular}
+\caption{SMEM breakdown for HEAD\_DIM=32.}
+\end{table}
+
+\subsection{Memory Access Analysis}
+
+
+\subsection{Evaluation}
 According to the work complexity analysis, the profiling is based on different sequence length and 
-
-
 
 \begin{table}[htbp]
 \centering
@@ -285,8 +324,6 @@ According to the work complexity analysis, the profiling is based on different s
 \bottomrule
 \end{tabular}
 \end{table}
-
-
 
 \section{PyTorch by Yuxuan Chen}
 
