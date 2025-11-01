@@ -2,7 +2,7 @@
  * Flash Attention with CUTLASS GEMM (Tensor Core Version)
  * 
  * Uses CUTLASS tensor cores for Q@K^T and P@V matrix multiplications
- * while keeping the same tile configuration as Small Tile for fair comparison
+ * with PARALLEL SOFTMAX using Warp Shuffle operations
  ******************************************************************************/
 
  #include <cuda_runtime.h>
@@ -259,10 +259,92 @@
      __syncthreads();
  }
  
- // ==================== Flash Attention Kernel with CUTLASS ====================
- 
- template<int HEAD_DIM>
- __global__ void flash_attn_cutlass_kernel(
+ // ==================== Parallel Softmax with Warp Shuffle ====================
+
+// Parallel softmax computation using warp shuffle operations
+// All threads in each warp cooperate to compute softmax for query positions
+// assigned to that warp
+template<int TILE_M, int TILE_N, int DIM_K>
+__device__ __forceinline__ void parallel_softmax_warp(
+    float* S,               // [TILE_M, TILE_N] - attention scores
+    float* P,               // [TILE_M, TILE_N] - attention probabilities
+    float* m_shared,        // [TILE_M] - max values
+    float* l_shared,        // [TILE_M] - normalizing factors
+    float* O_accum,         // [TILE_M, DIM_K] - output accumulator
+    int q_size,             // Number of valid query positions
+    int k_size,             // Number of valid key positions
+    int num_threads
+) {
+    const int tid = threadIdx.x;
+    const int laneId = tid % 32;
+    const int warpId = tid / 32;
+    const int numWarps = (num_threads + 31) / 32;
+    
+    // Each warp processes one or more query positions
+    // With 256 threads (8 warps) and up to 45 queries, some warps handle multiple queries
+    for (int i = warpId; i < q_size; i += numWarps) {
+        float m_old = m_shared[i];
+        float l_old = l_shared[i];
+        
+        // ========== Step 1: Find max in parallel ==========
+        // Each lane finds the max of its assigned columns
+        float m_new = -INFINITY;
+        for (int j = laneId; j < k_size; j += 32) {
+            m_new = fmaxf(m_new, S[i * TILE_N + j]);
+        }
+        
+        // Reduce within warp using butterfly shuffle pattern
+        // This is a standard warp reduce for max
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            m_new = fmaxf(m_new, __shfl_down_sync(0xffffffff, m_new, offset));
+        }
+        
+        // Broadcast result from lane 0 to all lanes in the warp
+        m_new = __shfl_sync(0xffffffff, m_new, 0);
+        
+        // ========== Step 2: Compute softmax exponentials and sum ==========
+        // Each lane computes exponentials for its assigned columns and accumulates sum
+        float l_new = 0.0f;
+        for (int j = laneId; j < k_size; j += 32) {
+            float p = expf(S[i * TILE_N + j] - m_new);
+            P[i * TILE_N + j] = p;
+            l_new += p;
+        }
+        
+        // Reduce sum within warp using butterfly shuffle pattern
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            l_new += __shfl_down_sync(0xffffffff, l_new, offset);
+        }
+        
+        // Broadcast result from lane 0 to all lanes in the warp
+        l_new = __shfl_sync(0xffffffff, l_new, 0);
+        
+        // ========== Step 3: Apply online softmax correction ==========
+        // Correction factor for updating the output accumulator
+        float correction = expf(m_old - m_new);
+        l_new = correction * l_old + l_new;
+        
+        // Update statistics (only lane 0 writes to avoid conflicts)
+        if (laneId == 0) {
+            m_shared[i] = m_new;
+            l_shared[i] = l_new;
+        }
+        
+        // Update O_accum in parallel: scale by correction factor
+        // Each lane handles part of the dimension
+        for (int d = laneId; d < DIM_K; d += 32) {
+            O_accum[i * DIM_K + d] *= correction;
+        }
+    }
+    __syncthreads();
+}
+
+// ==================== Flash Attention Kernel with CUTLASS ====================
+
+template<int HEAD_DIM>
+__global__ void flash_attn_cutlass_kernel(
      const cutlass::half_t* __restrict__ Q,
      const cutlass::half_t* __restrict__ K,
      const cutlass::half_t* __restrict__ V,
@@ -350,38 +432,9 @@
          __syncthreads();
          
          // Online softmax
-         for (int i = 0; i < q_size; i++) {
-             if (tid == 0) {
-                 float m_old = m_shared[i];
-                 float l_old = l_shared[i];
-                 
-                 // Find new max
-                 float m_new = m_old;
-                 for (int j = 0; j < k_size; j++) {
-                     m_new = fmaxf(m_new, shared_mem.S[i * kTileN + j]);
-                 }
-                 
-                 // Compute exp and new sum
-                 float l_new = 0.0f;
-                 for (int j = 0; j < k_size; j++) {
-                     float p = expf(shared_mem.S[i * kTileN + j] - m_new);
-                     shared_mem.P[i * kTileN + j] = p;
-                     l_new += p;
-                 }
-                 
-                 // Apply correction
-                 float correction = expf(m_old - m_new);
-                 l_new = correction * l_old + l_new;
-                 
-                 for (int d = 0; d < HEAD_DIM; d++) {
-                     O_accum[i * HEAD_DIM + d] *= correction;
-                 }
-                 
-                 m_shared[i] = m_new;
-                 l_shared[i] = l_new;
-             }
-         }
-         __syncthreads();
+         parallel_softmax_warp<kTileM, kTileN, HEAD_DIM>(
+             shared_mem.S, shared_mem.P, m_shared, l_shared, O_accum, q_size, k_size, blockDim.x
+         );
          
          // O += P @ V using CUTLASS
          cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
@@ -435,7 +488,7 @@
      if (first_call) {
          printf("\n");
          printf("================================================================================\n");
-         printf("Flash Attention - WMMA Tensor Core (head_dim=%d)\n", HEAD_DIM);
+         printf("Flash Attention - WMMA Tensor Core + Parallel Softmax (head_dim=%d)\n", HEAD_DIM);
          printf("================================================================================\n");
          printf("  Tile size: %dx%d (same as Small Tile)\n", Config::kTileM, Config::kTileN);
          printf("  Threads: %d (%d warps)\n", Config::kThreads, Config::kThreads / 32);
@@ -443,6 +496,7 @@
          printf("  Tensor Cores: ENABLED via WMMA API\n");
          printf("    → Q@K^T: wmma::mma_sync (16x16x16 tiles, FP16→FP32)\n");
          printf("    → P@V:   CUDA cores (FP32 input limitation)\n");
+         printf("  Softmax: PARALLEL via warp shuffle (cooperative warp reduction)\n");
          printf("================================================================================\n");
          first_call = false;
      }
