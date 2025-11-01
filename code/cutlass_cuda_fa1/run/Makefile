@@ -22,11 +22,13 @@ NVCC_FLAGS := $(CUDA_ARCH) $(CXX_FLAGS) \
               -I. \
               --use_fast_math
 
+# ==================== Standard Targets ====================
+
 # target
 TARGET := test_flash_attn
 SOURCES := test_flash_attn.cu flash_attn_unified.cu flash_attn_cutlass.cu
 
-.PHONY: all clean run info
+.PHONY: all clean run info help
 
 all: $(TARGET)
 
@@ -67,4 +69,60 @@ info:
 	@echo "  make CUDA_ARCH=-arch=sm_89  # for RTX 4090"
 
 help: info
+
+# ==================== Performance Benchmark Targets ====================
+
+# Performance test for flash_attn_cutlass only
+PERF_TARGET := perf_flash_attn_cutlass
+PERF_SOURCES := perf_flash_attn_cutlass.cu flash_attn_cutlass.cu
+
+.PHONY: perf perf_run perf_clean perf_info
+
+# Build performance benchmark
+perf: $(PERF_TARGET)
+
+$(PERF_TARGET): $(PERF_SOURCES)
+	@echo "Compiling $(PERF_TARGET) (Performance Benchmark Only)..."
+	@echo "CUDA Architecture: $(CUDA_ARCH)"
+	@echo "Cutlass Include: $(CUTLASS_INCLUDE)"
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^
+	@echo "Build complete: ./$(PERF_TARGET)"
+
+# Run performance benchmark
+perf_run: $(PERF_TARGET)
+	@echo "Running $(PERF_TARGET) - Performance Benchmark..."
+	@echo "Measuring latency and TFLOPs/s across different configurations..."
+	@echo ""
+	./$(PERF_TARGET)
+
+# Clean performance benchmark
+perf_clean:
+	rm -f $(PERF_TARGET) $(PERF_TARGET).o
+
+# Show performance benchmark info
+perf_info:
+	@echo "=== Performance Benchmark Information ==="
+	@echo "Target: $(PERF_TARGET)"
+	@echo "Sources: $(PERF_SOURCES)"
+	@echo "CUDA Architecture: $(CUDA_ARCH)"
+	@echo ""
+	@echo "Features:"
+	@echo "  • Tests flash_attn_cutlass only (parallel softmax enabled)"
+	@echo "  • Measures latency (ms) and TFLOPs/s"
+	@echo "  • Computes memory bandwidth (GB/s)"
+	@echo "  • No correctness verification - performance only"
+	@echo ""
+	@echo "Test Configurations (18 total):"
+	@echo "  • Sequence lengths: 512, 1024, 2048, 4096, 8192"
+	@echo "  • Head dimensions: 32, 64, 128"
+	@echo "  • Batch sizes: 1 (default), 2, 4, 8 (for seq_len=8192)"
+	@echo "  • Number of heads: 12"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make perf       - Build performance benchmark"
+	@echo "  make perf_run   - Build and run benchmark"
+	@echo "  make perf_clean - Clean build files"
+	@echo "  make perf_info  - Show this information"
+
+.PHONY: perf_info
 
