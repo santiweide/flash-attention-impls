@@ -164,7 +164,7 @@ Here we count only matrix multiplication for FLOPs calculation, since $Softmax$ 
 
 Let $N$ be the sequence length, $b$ be the batch size, $h$ be the head number and $d$ be the head dimension.
 
-\textbf{Work Complexity: } The work complexity is unified with Attention\footnote{Note that we ignore the $Q=xW_Q$, $K=xW_K$, $V=xW_V$, $O=xW_O$ since we did not implement that in code. But this is counted in original flash attention paper.}.
+\textbf{Work Complexity: } The work complexity is unified with Attention\footnote{Note that we ignore the $Q=xW_Q$, $K=xW_K$, $V=xW_V$, $O=xW_O$ since we did not implement that in code. This is aligned with in original flash attention 2 paper on page 10.}.
 
 
 \textbf{Score ($S = QK^T$):} This computes the $N \times N$ score matrix.
@@ -182,18 +182,7 @@ FLOPS: $2 \cdot b \cdot h \cdot N \cdot N \cdot d = 2 \cdot b \cdot (h \cdot d) 
 $$ Total\, FLOPS = (2 \cdot b \cdot d \cdot N^2) + (2 \cdot b \cdot d \cdot N^2) = 4 \cdot b \cdot d \cdot N^2 $$
 
 
-\textbf{Depth Complexity: }
-Different tiling strategy brings different depth complexity.
-
-Let $T_r$ and $T_c$ be the number of blocks along the sequence length $N$ (i.e., $T_r \approx O(N)$ and $T_c \approx O(N)$).
-
-
-For FA1, since one block must sequentially iterate over both the $T_r$ row-blocks and $T_c$ column-blocks, the critical path (depth) is proportional to the total number of tiles it must compute:
-              \[ D_{FA1} = O(T_r \times T_c) = O(N^2) \]
-
-For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are processed by different thread blocks simultaneously. Thus the critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
-              \[ D_{FA2} = O(T_c) = O(N) \]
-
+\textbf{Depth Complexity: } Different tiling strategy brings different depth complexity. See each one's session for more details.
 
 
 \subsection{Evaluation Metrics}
@@ -244,15 +233,28 @@ We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to se
 \textbf{Correctness} The output of the new kernel is compared with CUDA naive implementation with the same data input, with precision of diff less than 2\%. Since we are using float point 16 as the data calculate precision, there will be some accumulation error.
 
 
+\subsection{Depth Complexity}
+
+Let $T_r$ and $T_c$ be the number of blocks along the sequence length $N$ (i.e., $T_r \approx O(N)$ and $T_c \approx O(N)$).
+
+
+For FA1, since one block must sequentially iterate over both the $T_r$ row-blocks and $T_c$ column-blocks, the critical path (depth) is proportional to the total number of tiles it must compute:
+              \[ D_{FA1} = O(T_r \times T_c) = O(N^2) \]
+
+For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are processed by different thread blocks simultaneously. Thus the critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
+              \[ D_{FA2} = O(T_c) = O(N) \]
+
+
+
 \subsection{Memory Access}
 
-I use \textbf{shared memory} for the tile of $Q$, $K$ and $V$.
+I use \textbf{shared memory} for the tile of $Q$, $K$ and $V$, and the intermediate result of $S$, $P$, and $O$. Also for storing the max and sum of each row in $S$, where $S=QK^T$.
 \begin{lstlisting}
 // lines 93-98
 static constexpr size_t get_smem_size() {
     return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
            (kTileM * kTileN * 2) * sizeof(float) +  // S and P
-           (kTileM * 2) * sizeof(float) +          // m, l
+           (kTileM * 2) * sizeof(float) +          // m, max of the row; l, for sum of the row of S_ij
            (kTileM * kHeadDim) * sizeof(float);   // O_accum
 }
 \end{lstlisting}
