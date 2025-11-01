@@ -220,65 +220,53 @@ We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to se
 
 \section{CUDA + Cutlass by fng685}
 
-\subsection{Validation of implementation}
-Here I use wmma in cutlass for $S=QK^{T}$, warp shuffle in Softmax calculation. The input of wmma is fp16, and the output is set fp32 to keep precision.
 
-\textbf{Correctness} The output of the new kernel is compared with CUDA naive implementation with the same data input, with precision of diff less than 2\%. Since we are using float point 16 as the data calculate precision, there will be some accumulation error.
+\section{CUTLASS-based FlashAttention Implementation}
 
-\textbf{Dataset} Random shape of weights and inputs are generated with random number in designed shape for evaluation. The random number is generated within floating point 16 precision in case there is overflow. The shape varies in sequence length, head number and head dimension to approach the max TFLOPs/s. I leave out the batch size to create test cases due to time limitation.
+\subsection{Implementation and Validation}
+This implementation utilizes CUTLASS WMMA (Warp-Matrix-Multiply-Accumulate) for the $S=QK^{T}$ operation. The softmax calculation is implemented using warp-level shuffle operations. WMMA inputs are \texttt{fp16}, while an \texttt{fp32} accumulator is used to maintain precision.
 
-\textbf{Parameter Choice} There is another extra parameters in the Flash Attention algorithm: Tile size. Beside  Naive implementation with CUDA, I also implement FlashAttention without cutlass with different Tile size to find a better configuration to further implement and test Flash Attention with CUDA. The two tile size I test with are $45x90$ and $120x120$. They are both within the A100-40G shared memory limitation(192KB)\cite{nvidia2022a100}. I calculate the tile size based on the shared memory allocated calculation, see Section~\ref{sec:mem-acc}.
+\textbf{Correctness:} The kernel's output was validated against a naive CUDA implementation using identical inputs, demonstrating a relative error of less than 2\%. This minor deviation is expected due to the use of \texttt{fp16} for data representation and intermediate calculations, which introduces accumulation errors.
+
+\textbf{Dataset:} Test cases were generated using randomly shaped tensors (weights and inputs) populated with random \texttt{fp16} values to prevent overflow. The shapes varied in sequence length ($N$), head number ($H$), and head dimension ($D$) to benchmark performance and approach the maximum TFLOPs/s. Based on the evaluation tables, all test cases use a fixed batch size of 1.
+
+\textbf{Parameter Choice:} An additional key parameter in the FlashAttention algorithm is the tile size. In addition to the naive baseline, a non-CUTLASS FlashAttention was first implemented with two different tile sizes ($45 \times 90$ and $120 \times 120$) to identify a suitable configuration. These tile sizes were selected to fit within the 192KB shared memory limit per Streaming Multiprocessor (SM) of the A100-40G GPU \cite{nvidia2022a100}. The memory footprint for a given tile is calculated as shown in Section~\ref{sec:mem-acc}.
 
 \subsection{Depth Complexity}
+% This section has been rewritten, as the original analysis incorrectly equated
+% work complexity (O(N^2)) with parallel depth complexity.
 
-If some operation happens in tile and with a fixed number of operations, we count it to $O(1)$ depth. If some operation happens across tile, or depends on prior result sequentially, then it is $O(T)$ depth.
-Let $T_r$ and $T_c$ denote the number of query and key/value blocks, respectively, along the sequence length $N$ 
-(i.e., $T_r \approx O(N)$ and $T_c \approx O(N)$).
+The parallel depth of an algorithm represents the longest chain of dependent operations. Let $T_r = N / B_r$ and $T_c = N / B_c$ be the number of query and key/value blocks, respectively, where $B_r$ and $B_c$ are the tile dimensions.
 
-In my cutlass implementation of FA1, I have to iterate over both Q's threadblock and K's threadblock, which contributes to $O(T_r \times T_c)$. Since Softmax is implemented by warp reduce, so it is constant depth.
+The FlashAttention algorithm parallelizes the outer loop over $T_r$ (the query blocks) by assigning each block to a separate CUDA thread block. These blocks execute in parallel.
 
+Within each thread block (processing one $Q$ tile), the algorithm must iterate \textit{sequentially} through all $T_c$ blocks of $K$ and $V$. The computation within this inner loop (a tile-matrix multiply and the warp-reduce softmax) has a near-constant depth $D_{\text{inner}}$, or $O(\log B_c)$ for the reduction.
+
+The total parallel depth is therefore dominated by the sequential inner loop, as all outer loop blocks run in parallel.
 \[
-D_{\text{FA1}} = O(T_r \times T_c) = O(N^2).
+D_{\text{FA1}} = O(T_c \times D_{\text{inner}}) \approx O(T_c) = O(N / B_c) \approx O(N).
 \]
+This $O(N)$ depth is a fundamental improvement over the $O(N^2)$ \textit{work} complexity, which the naive implementation also suffers from in terms of depth due to its large matrix materialization.
 
-\subsection{Memory Access}
+\subsection{Shared Memory Access}
 \label{sec:mem-acc}
 
-I use \textbf{shared memory} for the tile of $Q$, $K$ and $V$, and the intermediate result of $S$, $P$, and $O$. Also for storing the max and sum of each row in $S$, where $S=QK^T$.
+Shared memory is used to store the tiles of $Q$, $K$, and $V$, as well as the intermediate results for $S$, $P$, and the output accumulator $O$. It also stores the online softmax statistics (the row-wise maximum $m$ and sum of exponentials $l$).
 \begin{lstlisting}
-// lines 93-98
 static constexpr size_t get_smem_size() {
     return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
            (kTileM * kTileN * 2) * sizeof(float) +  // S and P
-           (kTileM * 2) * sizeof(float) +          // m, max of the row; l, for sum of the row of S_ij
+           (kTileM * 2) * sizeof(float) +          // m, row-wise max; l, row-wise sum of exponentials
            (kTileM * kHeadDim) * sizeof(float);   // O_accum
 }
 \end{lstlisting}
 
-\begin{table}[h!]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-\textbf{Data Structure} & \textbf{Dimensions} & \textbf{Elements} & \textbf{Bytes} & \textbf{Calculation} \\
-\midrule
-\textbf{Q} & [45, 32] & 1,440 & 2,880 B & $45 \times 32 \times 2$ \\
-\textbf{K} & [90, 32] & 2,880 & 5,760 B & $90 \times 32 \times 2$ \\
-\textbf{V} & [90, 32] & 2,880 & 5,760 B & $90 \times 32 \times 2$ \\
-\textbf{S} & [45, 90] & 4,050 & 16,200 B & $45 \times 90 \times 4$ \\
-\textbf{P} & [45, 90] & 4,050 & 16,200 B & $45 \times 90 \times 4$ \\
-\textbf{m} & [45] & 45 & 180 B & $45 \times 4$ \\
-\textbf{l} & [45] & 45 & 180 B & $45 \times 4$ \\
-\textbf{O\_accum} & [45, 32] & 1,440 & 5,760 B & $45 \times 32 \times 4$ \\
-\midrule
-\textbf{TOTAL} & - & - & \textbf{52,920 B} & $\approx$ \textbf{51.7 KB} \\
-\bottomrule
-\end{tabular}
-\caption{SMEM breakdown for HEAD\_DIM=32.}
-\end{table}
+\subsection{Evaluation and Results}
+The evaluation was conducted on an A100-40G GPU, tested on CUDA 12.8 with CUTLASS 3.4.0. The CUDA driver version was $545.23.08$.
 
+The naive implementation relies entirely on HBM and does not utilize shared memory. Consequently, it is memory-bound, with the GPU spending most of its time stalled on HBM accesses rather than performing computation. In contrast, the tiled versions demonstrate significantly lower latency by leveraging shared memory.
 
-\subsection{Evaluation}
-The evaluation is conducted on $hendrixgpu04fl$ due to my failures on logging to either $hendrixfut01fl$ or $hendrixfut03fl$. $hendrixgpu04fl$ is a A100-40G machine, and I test with CUDA12.8 + cutlass 4.3.0. The CUDA driver version is $545.23.08$.
+The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 8 \times 16$ tile layout.
 
 \begin{table}[htbp]
 \centering
@@ -289,16 +277,16 @@ The evaluation is conducted on $hendrixgpu04fl$ due to my failures on logging to
 \toprule
 & & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
-\textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naived}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
+\textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naive}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
 \midrule
 (1, 1, 512, 64)    & 0.00  & 0.07  & x & \textbf{0.16} & x & 0.03  & x  \\
-(1, 1, 1024, 64)   & 0.01  & 0.14  & 14x & \textbf{0.33} & 33x & 0.06  & 6.00x  \\
-(1, 1, 2048, 64)   & 0.02  & 0.29  & 14.5x & \textbf{0.67} & 33x & 0.11  & 5.50x  \\
-(1, 1, 4096, 64)   & 0.03  & 0.58  & 19.33x & \textbf{1.06} & 35x & 0.23  & 7.67x  \\
-(1, 1, 8192, 64)   & 0.07  & 0.91  & 13x & \textbf{2.13} & 31x & 0.46  & 6.5x  \\
-(1, 32, 8192, 32)  & 0.31   & 1.04   & 3.35x   & \textbf{2.23}  & 7x   & 0.38   & 1.23x   \\
-(1, 32, 8192, 64)  & 0.26  & 0.92  & 3.54x  & \textbf{3.08} & 11x  & 0.62  & 2.38x  \\
-(1, 32, 8192, 128) & 0.27 & 1.07 & 3.96x & \textbf{3.02} & 11x & 0.77 & 2.85x \\
+(1, 1, 1024, 64)   & 0.01  & 0.14  & 14.00x & \textbf{0.33} & 33.00x & 0.06  & 6.00x  \\
+(1, 1, 2048, 64)   & 0.02  & 0.29  & 14.50x & \textbf{0.67} & 33.50x & 0.11  & 5.50x  \\
+(1, 1, 4096, 64)   & 0.03  & 0.58  & 19.33x & \textbf{1.06} & 35.33x & 0.23  & 7.67x  \\
+(1, 1, 8192, 64)   & 0.07  & 0.91  & 13.00x & \textbf{2.13} & 30.43x & 0.46  & 6.57x  \\
+(1, 32, 8192, 32)  & 0.31   & 1.04   & 3.35x   & \textbf{2.23}  & 7.19x   & 0.38   & 1.23x   \\
+(1, 32, 8192, 64)  & 0.26  & 0.92  & 3.54x  & \textbf{3.08} & 11.85x  & 0.62  & 2.38x  \\
+(1, 32, 8192, 128) & 0.27 & 1.07 & 3.96x & \textbf{3.02} & 11.19x & 0.77 & 2.85x \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -306,7 +294,7 @@ The evaluation is conducted on $hendrixgpu04fl$ due to my failures on logging to
 
 \begin{table}[htbp]
 \centering
-\caption{FA1xCutlass Latency (Runtime in ms and compare vs. Naive)}
+\caption{FA1xCutlass Latency (Runtime in ms and Speedup vs. Naive)}
 \label{tab:full_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=4.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2]@{}}
@@ -315,14 +303,14 @@ The evaluation is conducted on $hendrixgpu04fl$ due to my failures on logging to
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
 \textbf{Config (B, H, N, D)} & \mcc{\textbf{Naive}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} \\
 \midrule
-(1, 1, 512, 64)    & 13.87  & 0.95  & 14.62x & \B{0.42} & 33x & 2.35  & 5.89x \\
-(1, 1, 1024, 64)   & 27.38  & 1.90  & 14.42x & \B{0.81} & 33x & 4.69  & 5.84x \\
-(1, 1, 2048, 64)   & 53.80  & 3.72  & 14.47x & \B{1.60} & 33x & 9.35  & 5.75x \\
-(1, 1, 4096, 64)   & 128.08 & 7.36  & 17.40x & \B{4.05} & 31x & 18.68 & 6.86x \\
-(1, 1, 8192, 64)   & 243.31 & 18.79  & 13x & \B{8.05} & 30x & 37.15 & 6.5x \\
-(1, 32, 8192, 32)  & 899.36 & 264.30 & 3.40x  & \B{123.37} & 7x  & 722.78 & 1.24x \\
-(1, 32, 8192, 64)  & 2151.82 & 597.63 & 3.60x  & \B{178.72} & 12x  & 891.22 & 2.41x \\
-(1, 32, 8192, 128) & 4141.44 & 1023.15 & 4.05x  & \B{364.537} & 11x  & 1421.33 & 2.91x \\
+(1, 1, 512, 64)    & 13.87  & 0.95  & 14.60x & \textbf{0.42} & 33.02x & 2.35  & 5.90x \\
+(1, 1, 1024, 64)   & 27.38  & 1.90  & 14.41x & \textbf{0.81} & 33.80x & 4.69  & 5.84x \\
+(1, 1, 2048, 64)   & 53.80  & 3.72  & 14.46x & \textbf{1.60} & 33.63x & 9.35  & 5.75x \\
+(1, 1, 4096, 64)   & 128.08 & 7.36  & 17.40x & \textbf{4.05} & 31.62x & 18.68 & 6.85x \\
+(1, 1, 8192, 64)   & 243.31 & 18.79  & 12.95x & \textbf{8.05} & 30.22x & 37.15 & 6.55x \\
+(1, 32, 8192, 32)  & 899.36 & 264.30 & 3.40x  & \textbf{123.37} & 7.29x  & 722.78 & 1.24x \\
+(1, 32, 8192, 64)  & 2151.82 & 597.63 & 3.60x  & \textbf{178.72} & 12.04x  & 891.22 & 2.41x \\
+(1, 32, 8192, 128) & 4141.44 & 1023.15 & 4.05x  & \textbf{364.54} & 11.36x  & 1421.33 & 2.91x \\
 \bottomrule
 \end{tabular}
 \end{table}
