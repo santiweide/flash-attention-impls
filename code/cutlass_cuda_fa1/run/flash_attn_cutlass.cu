@@ -146,7 +146,7 @@
      constexpr int WMMA_K = 16;
      
      const int warpId = threadIdx.x / 32;
-     const int laneId = threadIdx.x % 32;
+    //  const int laneId = threadIdx.x % 32;
      const int numWarps = blockDim.x / 32;
      
      // Use WMMA for tensor core acceleration
