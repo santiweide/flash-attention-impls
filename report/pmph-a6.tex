@@ -12,6 +12,7 @@
 \usepackage[T1]{fontenc}
 
 \usepackage[utf8]{inputenc}
+\usepackage{hyperref}
 
 \usepackage{microtype}
 
@@ -183,7 +184,7 @@ For compute efficiency we use achieved Tera Floating-Point Operations Per Second
 
 $$\text{Achieved TFLOPs/s} = \frac{\text{Total Floating-Point operations in FA}}{T_{\text{Execution Time}}}$$.
 
-We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to see if we are using the GPU compute resource efficiently. The achieved TFLOPs/s of FA1 in paper is 25-40\% of the theoretical matmul TFLOPs/s with FP16/BF16 on A100. And for FA2 is 50\%-73\% of that\cite{dao2023flashattention}. Specifically, when head dimension is 128, FA2 can achieve 227 TFLOPs/s in forward pass.
+We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to see if we are using the GPU compute resource efficiently. The achieved TFLOPs/s of FA1 in paper is 25-40\% of the theoretical matmul TFLOPs/s with FP16/BF16 on A100. And for FA2 is 50\%-73\% of that\cite{dao2023flashattention}. Specifically, when head dimension is 128, FA2 can achieve 225 TFLOPs/s in forward pass.
 
 
 %For memory efficiency we access with achieved bandwidth. We use Nsight Compute to see the total runtime bandwidth.
@@ -217,27 +218,31 @@ We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to se
 
 \section{CUDA by Zhigao Yan}
 
-\section{CUDA + Cutlass by Wanjing Hu}
+\section{CUDA + Cutlass by fng685}
 
 \subsection{Validation of implementation}
+Here I use wmma in cutlass for $S=QK^{T}$, warp shuffle in Softmax calculation. The input of wmma is fp16, and the output is set fp32 to keep precision.
 
 \textbf{Correctness} The output of the new kernel is compared with CUDA naive implementation with the same data input, with precision of diff less than 2\%. Since we are using float point 16 as the data calculate precision, there will be some accumulation error.
 
+\textbf{Dataset} Random shape of weights and inputs are generated with random number in designed shape for evaluation. The random number is generated within floating point 16 precision in case there is overflow. The shape varies in sequence length, head number and head dimension to approach the max TFLOPs/s. I leave out the batch size to create test cases due to time limitation.
+
+\textbf{Parameter Choice} There is another extra parameters in the Flash Attention algorithm: Tile size. Beside  Naive implementation with CUDA, I also implement FlashAttention without cutlass with different Tile size to find a better configuration to further implement and test Flash Attention with CUDA. The two tile size I test with are $45x90$ and $120x120$. They are both within the A100-40G shared memory limitation(192KB)\cite{nvidia2022a100}. I calculate the tile size based on the shared memory allocated calculation, see Section~\ref{sec:mem-acc}.
 
 \subsection{Depth Complexity}
 
-Let $T_r$ and $T_c$ be the number of blocks along the sequence length $N$ (i.e., $T_r \approx O(N)$ and $T_c \approx O(N)$).
+If some operation happens in tile and with a fixed number of operations, we count it to $O(1)$ depth. If some operation happens across tile, or depends on prior result sequentially, then it is $O(T)$ depth.
+Let $T_r$ and $T_c$ denote the number of query and key/value blocks, respectively, along the sequence length $N$ 
+(i.e., $T_r \approx O(N)$ and $T_c \approx O(N)$).
 
+In my cutlass implementation of FA1, I have to iterate over both Q's threadblock and K's threadblock, which contributes to $O(T_r \times T_c)$. Since Softmax is implemented by warp reduce, so it is constant depth.
 
-For FA1, since one block must sequentially iterate over both the $T_r$ row-blocks and $T_c$ column-blocks, the critical path (depth) is proportional to the total number of tiles it must compute:
-              \[ D_{FA1} = O(T_r \times T_c) = O(N^2) \]
-
-For FA2, it improves parallelism by \textit{adding} the sequence length dimension (Q-blocks) to the grid-level parallelization. The $T_r$ row-blocks are processed by different thread blocks simultaneously. Thus the critical path is now only the sequential inner loop (which is the online softmax update) that each thread block must perform. This loop iterates over the $T_c$ column-blocks:
-              \[ D_{FA2} = O(T_c) = O(N) \]
-
-
+\[
+D_{\text{FA1}} = O(T_r \times T_c) = O(N^2).
+\]
 
 \subsection{Memory Access}
+\label{sec:mem-acc}
 
 I use \textbf{shared memory} for the tile of $Q$, $K$ and $V$, and the intermediate result of $S$, $P$, and $O$. Also for storing the max and sum of each row in $S$, where $S=QK^T$.
 \begin{lstlisting}
@@ -271,11 +276,9 @@ static constexpr size_t get_smem_size() {
 \caption{SMEM breakdown for HEAD\_DIM=32.}
 \end{table}
 
-\subsection{Memory Access Analysis}
-
 
 \subsection{Evaluation}
-According to the work complexity analysis, the profiling is based on different sequence length and 
+The evaluation is conducted on $hendrixgpu04fl$ due to my failures on logging to either $hendrixfut01fl$ or $hendrixfut03fl$. $hendrixgpu04fl$ is a A100-40G machine, and I test with CUDA12.8 + cutlass 4.3.0. The CUDA driver version is $545.23.08$.
 
 \begin{table}[htbp]
 \centering
@@ -284,17 +287,18 @@ According to the work complexity analysis, the profiling is based on different s
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=1.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2]@{}}
 \toprule
-& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Large Tile}} \\
+& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
 \textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naived}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
 \midrule
-(1, 1, 512, 64)    & 0.00  & 0.07  & x & \textbf{0.10} & 19.63x & 0.03  & x  \\
-(1, 1, 1024, 64)   & 0.01  & 0.14  & 14x & \textbf{0.19} & 19.76x & 0.06  & 6.00x  \\
-(1, 1, 2048, 64)   & 0.02  & 0.29  & 14.5x & \textbf{0.39} & 19.63x & 0.11  & 5.50x  \\
-(1, 1, 4096, 64)   & 0.03  & 0.58  & 19.33x & \textbf{0.68} & 20.43x & 0.23  & 7.67x  \\
-(1, 32, 8192, 32)  & 0.31   & 1.04   & 3.35x   & \textbf{1.12}  & 3.66x   & 0.38   & 1.23x   \\
-(1, 32, 8192, 64)  & 0.26  & 0.92  & 3.54x  & \textbf{1.77} & 6.94x  & 0.62  & 2.38x  \\
-(1, 32, 8192, 128) & 0.27 & 1.07 & 3.96x & \textbf{1.81} & 6.83x & 0.77 & 2.85x \\
+(1, 1, 512, 64)    & 0.00  & 0.07  & x & \textbf{0.16} & x & 0.03  & x  \\
+(1, 1, 1024, 64)   & 0.01  & 0.14  & 14x & \textbf{0.33} & 33x & 0.06  & 6.00x  \\
+(1, 1, 2048, 64)   & 0.02  & 0.29  & 14.5x & \textbf{0.67} & 33x & 0.11  & 5.50x  \\
+(1, 1, 4096, 64)   & 0.03  & 0.58  & 19.33x & \textbf{1.06} & 35x & 0.23  & 7.67x  \\
+(1, 1, 8192, 64)   & 0.07  & 0.91  & 13x & \textbf{2.13} & 31x & 0.46  & 6.5x  \\
+(1, 32, 8192, 32)  & 0.31   & 1.04   & 3.35x   & \textbf{2.23}  & 7x   & 0.38   & 1.23x   \\
+(1, 32, 8192, 64)  & 0.26  & 0.92  & 3.54x  & \textbf{3.08} & 11x  & 0.62  & 2.38x  \\
+(1, 32, 8192, 128) & 0.27 & 1.07 & 3.96x & \textbf{3.02} & 11x & 0.77 & 2.85x \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -311,13 +315,14 @@ According to the work complexity analysis, the profiling is based on different s
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
 \textbf{Config (B, H, N, D)} & \mcc{\textbf{Naive}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} \\
 \midrule
-(1, 1, 512, 64)    & 13.87  & 0.95  & 14.62x & \B{0.71} & 19.63x & 2.35  & 5.89x \\
-(1, 1, 1024, 64)   & 27.38  & 1.90  & 14.42x & \B{1.39} & 19.76x & 4.69  & 5.84x \\
-(1, 1, 2048, 64)   & 53.80  & 3.72  & 14.47x & \B{2.74} & 19.63x & 9.35  & 5.75x \\
-(1, 1, 4096, 64)   & 128.08 & 7.36  & 17.40x & \B{6.27} & 20.43x & 18.68 & 6.86x \\
-(1, 32, 8192, 32)  & 899.36 & 264.30 & 3.40x  & \B{245.50} & 3.66x  & 722.78 & 1.24x \\
-(1, 32, 8192, 64)  & 2151.82 & 597.63 & 3.60x  & \B{309.99} & 6.94x  & 891.22 & 2.41x \\
-(1, 32, 8192, 128) & 4141.44 & 1023.15 & 4.05x  & \B{606.79} & 6.83x  & 1421.33 & 2.91x \\
+(1, 1, 512, 64)    & 13.87  & 0.95  & 14.62x & \B{0.42} & 33x & 2.35  & 5.89x \\
+(1, 1, 1024, 64)   & 27.38  & 1.90  & 14.42x & \B{0.81} & 33x & 4.69  & 5.84x \\
+(1, 1, 2048, 64)   & 53.80  & 3.72  & 14.47x & \B{1.60} & 33x & 9.35  & 5.75x \\
+(1, 1, 4096, 64)   & 128.08 & 7.36  & 17.40x & \B{4.05} & 31x & 18.68 & 6.86x \\
+(1, 1, 8192, 64)   & 243.31 & 18.79  & 13x & \B{8.05} & 30x & 37.15 & 6.5x \\
+(1, 32, 8192, 32)  & 899.36 & 264.30 & 3.40x  & \B{123.37} & 7x  & 722.78 & 1.24x \\
+(1, 32, 8192, 64)  & 2151.82 & 597.63 & 3.60x  & \B{178.72} & 12x  & 891.22 & 2.41x \\
+(1, 32, 8192, 128) & 4141.44 & 1023.15 & 4.05x  & \B{364.537} & 11x  & 1421.33 & 2.91x \\
 \bottomrule
 \end{tabular}
 \end{table}
