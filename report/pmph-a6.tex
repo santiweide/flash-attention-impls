@@ -2,7 +2,6 @@
 
 \documentclass[11pt]{article}
 
-
 \usepackage{times}
 \usepackage{latexsym}
 \usepackage{amsmath}
@@ -21,7 +20,6 @@
 \usepackage{graphicx}
 
 \usepackage{natbib}
-
 
 \usepackage{booktabs}
 \usepackage{siunitx}
@@ -48,7 +46,6 @@
 
 
 \bibliographystyle{acl_natbib}
-
 
 \usepackage{listings}  
 \usepackage{xcolor} 
@@ -124,37 +121,31 @@ Among them, the Q, K, and V matrices are generated from the input sequence, whil
 FlashAttention leverages shared memory to reduce accesses to high-bandwidth memory (HBM). It applies tiling to the $Q$, $K$, and $V$ matrices and modifies the softmax computation to operate efficiently on local tile-level results. In FlashAttention v1, the $Q$ matrix is loaded as a whole while $K$ and $V$ are split  during matrix multiplication (split-$K/V$). See Algorithm~\ref{alg:flashattention1}. In FlashAttention v2, $Q$ is instead split across threads or warps (split-$Q$), while $K$ and $V$ remain fixed. See Algorithm~\ref{alg:flashattention2}.
 
 \begin{algorithm}[htbp]
-\caption{FlashAttention-1 Block Logic (Warp-Level Split-K)}
-\label{alg:flashattention1}
+\caption{FlashAttention-1 (Split-K, Parallel over Warps)}
 \begin{algorithmic}[1]
-    \FOR{each $K_j, V_j$ block}
-        \STATE \textbf{in parallel for each warp $w$:}
-        \STATE \hspace{0.5cm} $K_{j,w}, V_{j,w} \gets$ slices of $K_j, V_j$
-        \STATE \hspace{0.5cm} $S_{ij,w} \gets Q_i K_{j,w}^T$
-        \STATE \hspace{0.5cm} $(P_{ij,w}, L_{i,w}, m_{i,w}) \gets \text{update\_stats}(S_{ij,w}, L_{i,w}, m_{i,w})$
-        \STATE \hspace{0.5cm} $O_{\text{partial},w} \gets P_{ij,w} V_{j,w}$
-        \STATE \hspace{0.5cm} Write $O_{\text{partial},w}$ to $sO_{\text{partial}}$
-        \STATE Synchronize all warps
-        \STATE $O_{\text{block}} \gets \text{reduce\_sum}(sO_{\text{partial}})$
-        \STATE $O_i \gets \text{update\_output}(O_i, O_{\text{block}})$
-    \ENDFOR
-    \STATE $O_i \gets \text{finalize\_scaling}(O_i, L_i)$
+\FOR{each block of keys/values $K_j, V_j$}
+    \STATE \textbf{in parallel over warps $w$:} \COMMENT{Each warp processes a $Q_i$ tile}
+    \STATE \hspace{0.5cm} $S_{\text{local}} = Q_i K_j^{T}$ \COMMENT{partial attention scores}
+    \STATE \hspace{0.5cm} $P_{\text{local}} = \text{softmax\_tile}(S_{\text{local}})$ \COMMENT{local normalization (approx.)}
+    \STATE \hspace{0.5cm} $O_{\text{partial}} = P_{\text{local}} V_j$ \COMMENT{partial output}
+    \STATE \textbf{synchronize and sum across warps} \COMMENT{combine all $O_{\text{partial}}$}
+    \STATE \textbf{update running normalization stats} \COMMENT{for true softmax}
+\ENDFOR
 \end{algorithmic}
 \end{algorithm}
 
-
 \begin{algorithm}[htbp]
-\caption{FlashAttention-2 Block Logic (Warp-Level Split-Q)}
-\label{alg:flashattention2}
+\caption{FlashAttention-2 (Split-Q, Fully Parallel Warps)}
 \begin{algorithmic}[1]
-    \FOR{each $K_j, V_j$ block}
-        \STATE \textbf{in parallel for each warp $w$:}
-        \STATE \hspace{0.5cm} $Q_{i,w} \gets$ slice of $Q_i$
-        \STATE \hspace{0.5cm} $S_{ij,w} \gets Q_{i,w} K_j^T$
-        \STATE \hspace{0.5cm} $(P_{ij,w}, L_{i,w}, m_{i,w}) \gets \text{update\_stats}(S_{ij,w}, L_{i,w}, m_{i,w})$
-        \STATE \hspace{0.5cm} $O_{i,w} \gets \text{update\_output}(O_{i,w}, P_{ij,w} V_j)$
-    \ENDFOR
-    \STATE $O_i \gets \text{finalize\_scaling}(O_i, L_i)$
+\STATE \textbf{in parallel over warps $w$:} \COMMENT{Each warp handles its own $Q_i$ tile}
+\STATE \hspace{0.5cm} initialize $O_w = 0$, normalization stats
+\FOR{each $K_j, V_j$ block}
+    \STATE \hspace{0.5cm} $S_{\text{local}} = Q_w K_j^{T}$
+    \STATE \hspace{0.5cm} $P_{\text{local}} = \text{softmax\_tile}(S_{\text{local}})$
+    \STATE \hspace{0.5cm} $O_w \mathrel{+}= P_{\text{local}} V_j$ \COMMENT{accumulate output locally}
+\ENDFOR
+\STATE \hspace{0.5cm} finalize normalization
+\STATE \hspace{0.5cm} write $O_w$ to global output
 \end{algorithmic}
 \end{algorithm}
 
