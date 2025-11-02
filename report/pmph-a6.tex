@@ -123,6 +123,7 @@ FlashAttention leverages shared memory to reduce accesses to high-bandwidth memo
 
 \begin{algorithm}[htbp]
 \caption{FlashAttention-1 (Split-K, Parallel over Warps)}
+\label{alg:flashattention1}
 \begin{algorithmic}[1]
 \FOR{each block of keys/values $K_j, V_j$}
     \STATE \textbf{in parallel over warps $w$:} \COMMENT{Each warp processes a $Q_i$ tile}
@@ -137,6 +138,7 @@ FlashAttention leverages shared memory to reduce accesses to high-bandwidth memo
 
 \begin{algorithm}[htbp]
 \caption{FlashAttention-2 (Split-Q, Fully Parallel Warps)}
+\label{alg:flashattention2}
 \begin{algorithmic}[1]
 \STATE \textbf{in parallel over warps $w$:} \COMMENT{Each warp handles its own $Q_i$ tile}
 \STATE \hspace{0.5cm} initialize $O_w = 0$, normalization stats
@@ -254,8 +256,11 @@ I implemented a CUDA FlashAttention kernel that uses FP16 for inputs/outputs, pe
                 O_accum[r * d + col] += b * acc;
             }
 \end{lstlisting}
+
 \subsection{Validation}
 I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and performing all dot products, softmax, and accumulations in FP32-to provide a numerically stable reference for validating correctness and assessing performance differences. 
+
+
 \subsection{Evaluation}
 
 \begin{table}[h]
@@ -270,9 +275,9 @@ I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and p
   \textbf{Config (B, H, N, D)} & \mcc{\textbf{Baseline}} & \mcc{\textbf{FlashAttention}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Baseline}} & \mcc{\textbf{FlashAttention}} & \mcc{\textbf{Speedup}} \\
   \midrule
   (1, 1, 512, 64)      & 13.70  & 1.71 & 8.01x & 0.005 & 0.04 & 8x \\
-  (1, 1, 1024, 64)     & 27.74  & 3.42 & \8.11x & 0.01 & 0.079 & 7.9x \\
-  (1, 1, 2048, 64)     & 55.10  & 6.85 & \8.05x & 0.019 & 0.157 & 8.2x \\
-  (1, 1, 4096, 64)    & 121.77  & 13.68 & \8.90x & 0.035 & 0.314 & 8.97x \\
+  (1, 1, 1024, 64)     & 27.74  & 3.42 & 8.11x & 0.01 & 0.079 & 7.9x \\
+  (1, 1, 2048, 64)     & 55.10  & 6.85 & 8.05x & 0.019 & 0.157 & 8.2x \\
+  (1, 1, 4096, 64)    & 121.77  & 13.68 & 8.90x & 0.035 & 0.314 & 8.97x \\
   (1, 32, 8192, 32)   & 1165.02 & 266.11 & 4.38x & 0.236 & 1.033 & 4.38x \\
   (1, 32, 8192, 64)   & 2353.35 & 492.03 & 4.78x & 0.234 & 1.117 & 4.77x \\
   (1, 32, 8192, 128)  & 4507.89 & 1515.19 & 3.00x & 0.244 & 0.726 & 3.00x \\
@@ -280,19 +285,41 @@ I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and p
   \end{tabular}
 \end{table}
 
-\section{CUDA + Cutlass by fng685}
-
-
-\section{CUTLASS-based FlashAttention Implementation}
+\section{CUTLASS-based FlashAttention Implementation by fng685}
 
 \subsection{Implementation}
 
 This implementation leverages NVIDIA CUTLASS with WMMA (Warp-Matrix-Multiply-Accumulate) tensor core instructions for accelerated matrix operations in Flash Attention. 
 
 \paragraph{Tensor Core Acceleration}
-The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 16 \times 16$ to match the A100 instruction format. This provides significant speedup over scalar CUDA core operations.
+The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 8 \times 16$ to match the A100 instruction format. This provides significant speedup over scalar CUDA core operations.
 
 For the $O = P V$ (output projection) computation, CUDA cores are utilized instead of tensor cores. This design choice stems from the fact that attention probabilities $P$ are maintained in \texttt{fp32} precision for numerical stability during online softmax updates, while WMMA requires \texttt{fp16} inputs. Converting $P$ from \texttt{fp32} to \texttt{fp16} would incur additional overhead that outweighs the performance benefits, since the $P \times V$ computation is less compute-intensive than $Q \times K^{\top}$.
+
+\begin{lstlisting}
+ using GemmQK = cutlass::gemm::device::Gemm<
+     cutlass::half_t,                          // ElementA (Q)
+     cutlass::layout::RowMajor,                // LayoutA
+     cutlass::half_t,                          // ElementB (K)
+     cutlass::layout::RowMajor,                // LayoutB (K is transposed)
+     float,                                     // ElementC (S)
+     cutlass::layout::RowMajor,                // LayoutC
+     float,                                     // ElementAccumulator
+     cutlass::arch::OpClassTensorOp,           // Use Tensor Cores
+     cutlass::arch::Sm80,                      // A100 architecture
+     cutlass::gemm::GemmShape<16, 16, 16>,     // ThreadblockShape (small for flexibility)
+     cutlass::gemm::GemmShape<16, 16, 16>,     // WarpShape
+     cutlass::gemm::GemmShape<16, 8, 16>,      // InstructionShape (tensor core instruction)
+     cutlass::epilogue::thread::LinearCombination<
+         float,
+         1,
+         float,
+         float
+     >,
+     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+     2                                          // Stages
+ >;
+\end{lstlisting}
 
 \paragraph{Softmax Computation}
 The softmax operation is parallelized at the warp level using cooperative warp shuffle operations (\texttt{\_\_shfl\_down\_sync}, \texttt{\_\_shfl\_sync}). This implements an online softmax algorithm with Welford-style running statistics correction. Each warp processes one or more query positions cooperatively: threads within a warp collectively compute the maximum across the sequence dimension, apply exponential scaling, and reduce the normalization factor $l$. The online softmax update rule applies a correction factor $e^{m_{\text{old}} - m_{\text{new}}}$ to previously accumulated outputs, enabling sequential processing of key-value tiles without storing the full attention matrix.
@@ -300,9 +327,9 @@ The softmax operation is parallelized at the warp level using cooperative warp s
 \paragraph{Precision and Accumulation}
 All input tensors ($Q$, $K$, $V$) are maintained in \texttt{fp16} format. Intermediate computations employ \texttt{fp32} accumulators for attention scores ($S$), attention probabilities ($P$), and output accumulation ($O_{\text{accum}}$), ensuring numerical precision is preserved throughout the iterative online softmax process.
 
-\section{Validation}
+\subsection{Validation}
 
-\paragraph{Correctness:} The kernel's output was validated against a naive CUDA implementation using identical inputs, demonstrating a relative error of less than 2\%. This minor deviation is expected due to the use of \texttt{fp16} for data representation and intermediate calculations, which introduces accumulation errors.
+\paragraph{Correctness:} The kernel's output was validated against a naive CUDA implementation using identical inputs, demonstrating a relative error of less than 2\%. This minor deviation is expected due to the use of \texttt{fp16} for data representation and intermediate calculations, which introduces accumulation errors. Warmup is introduced for initializing cache memory and create CUDA context, so that these one-way cost will not influence the latency and throughput.
 
 \paragraph{Dataset:} Test cases were generated using randomly shaped tensors (weights and inputs) populated with random \texttt{fp16} values to prevent overflow. The shapes varied in sequence length ($N$), head number ($H$), and head dimension ($D$) to benchmark performance and approach the maximum TFLOPs/s. Based on the evaluation tables, all test cases use a fixed batch size of 1.
 
@@ -342,7 +369,7 @@ The evaluation was conducted on an A100-40G GPU, tested on CUDA 12.8 with CUTLAS
 
 The naive implementation relies entirely on HBM and does not utilize shared memory. Consequently, it is memory-bound, with the GPU spending most of its time stalled on HBM accesses rather than performing computation. In contrast, the tiled versions demonstrate significantly lower latency by leveraging shared memory.
 
-The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 8 \times 16$ tile layout.
+The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 16 \times 16$ tile layout for Threadblock shape and Warp shape, and $16 \times 8 \times 16$ for instruction shape.
 
 \begin{table}[htbp]
 \centering
