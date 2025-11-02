@@ -289,7 +289,7 @@ I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and p
 
 \subsection{Implementation}
 
-This implementation leverages NVIDIA CUTLASS with WMMA (Warp-Matrix-Multiply-Accumulate) tensor core instructions for accelerated matrix operations in Flash Attention. 
+This implementation leverages NVIDIA CUTLASS with WMMA (Warp-Matrix-Multiply-Accumulate) tensor core instructions for accelerated matrix operations in Flash Attention. For convenience we extract head dim as template variable to match different tiling size for shared memory allocation.
 
 \paragraph{Tensor Core Acceleration}
 The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 8 \times 16$ to match the A100 instruction format. This provides significant speedup over scalar CUDA core operations.
