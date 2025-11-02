@@ -285,14 +285,28 @@ I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and p
 
 \section{CUTLASS-based FlashAttention Implementation}
 
-\subsection{Implementation and Validation}
-This implementation utilizes CUTLASS WMMA (Warp-Matrix-Multiply-Accumulate) for the $S=QK^{T}$ operation. The softmax calculation is implemented using warp-level shuffle operations. WMMA inputs are \texttt{fp16}, while an \texttt{fp32} accumulator is used to maintain precision.
+\subsection{Implementation}
 
-\textbf{Correctness:} The kernel's output was validated against a naive CUDA implementation using identical inputs, demonstrating a relative error of less than 2\%. This minor deviation is expected due to the use of \texttt{fp16} for data representation and intermediate calculations, which introduces accumulation errors.
+This implementation leverages NVIDIA CUTLASS with WMMA (Warp-Matrix-Multiply-Accumulate) tensor core instructions for accelerated matrix operations in Flash Attention. 
 
-\textbf{Dataset:} Test cases were generated using randomly shaped tensors (weights and inputs) populated with random \texttt{fp16} values to prevent overflow. The shapes varied in sequence length ($N$), head number ($H$), and head dimension ($D$) to benchmark performance and approach the maximum TFLOPs/s. Based on the evaluation tables, all test cases use a fixed batch size of 1.
+\paragraph{Tensor Core Acceleration}
+The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 16 \times 16$ to match the A100 instruction format. This provides significant speedup over scalar CUDA core operations.
 
-\textbf{Parameter Choice:} An additional key parameter in the FlashAttention algorithm is the tile size. In addition to the naive baseline, a non-CUTLASS FlashAttention was first implemented with two different tile sizes ($45 \times 90$ and $120 \times 120$) to identify a suitable configuration. These tile sizes were selected to fit within the 192KB shared memory limit per Streaming Multiprocessor (SM) of the A100-40G GPU \cite{nvidia2022a100}. The memory footprint for a given tile is calculated as shown in Section~\ref{sec:mem-acc}.
+For the $O = P V$ (output projection) computation, CUDA cores are utilized instead of tensor cores. This design choice stems from the fact that attention probabilities $P$ are maintained in \texttt{fp32} precision for numerical stability during online softmax updates, while WMMA requires \texttt{fp16} inputs. Converting $P$ from \texttt{fp32} to \texttt{fp16} would incur additional overhead that outweighs the performance benefits, since the $P \times V$ computation is less compute-intensive than $Q \times K^{\top}$.
+
+\paragraph{Softmax Computation}
+The softmax operation is parallelized at the warp level using cooperative warp shuffle operations (\texttt{\_\_shfl\_down\_sync}, \texttt{\_\_shfl\_sync}). This implements an online softmax algorithm with Welford-style running statistics correction. Each warp processes one or more query positions cooperatively: threads within a warp collectively compute the maximum across the sequence dimension, apply exponential scaling, and reduce the normalization factor $l$. The online softmax update rule applies a correction factor $e^{m_{\text{old}} - m_{\text{new}}}$ to previously accumulated outputs, enabling sequential processing of key-value tiles without storing the full attention matrix.
+
+\paragraph{Precision and Accumulation}
+All input tensors ($Q$, $K$, $V$) are maintained in \texttt{fp16} format. Intermediate computations employ \texttt{fp32} accumulators for attention scores ($S$), attention probabilities ($P$), and output accumulation ($O_{\text{accum}}$), ensuring numerical precision is preserved throughout the iterative online softmax process.
+
+\section{Validation}
+
+\paragraph{Correctness:} The kernel's output was validated against a naive CUDA implementation using identical inputs, demonstrating a relative error of less than 2\%. This minor deviation is expected due to the use of \texttt{fp16} for data representation and intermediate calculations, which introduces accumulation errors.
+
+\paragraph{Dataset:} Test cases were generated using randomly shaped tensors (weights and inputs) populated with random \texttt{fp16} values to prevent overflow. The shapes varied in sequence length ($N$), head number ($H$), and head dimension ($D$) to benchmark performance and approach the maximum TFLOPs/s. Based on the evaluation tables, all test cases use a fixed batch size of 1.
+
+\paragraph{Parameter Choice:} An additional key parameter in the FlashAttention algorithm is the tile size. In addition to the naive baseline, a non-CUTLASS FlashAttention was first implemented with two different tile sizes ($45 \times 90$ and $120 \times 120$) to identify a suitable configuration. These tile sizes were selected to fit within the 192KB shared memory limit per Streaming Multiprocessor (SM) of the A100-40G GPU \cite{nvidia2022a100}. The memory footprint for a given tile is calculated as shown in Section~\ref{sec:mem-acc}.
 
 \subsection{Depth Complexity}
 % This section has been rewritten, as the original analysis incorrectly equated
