@@ -5,7 +5,7 @@
 NVCC := nvcc
 CUDA_ARCH := -arch=sm_80  # A100 architecture, modify as needed to sm_86 (RTX3090) or sm_89 (RTX4090)
 CXX_FLAGS := -std=c++17
-CUTLASS_DIR := ../csrc/cutlass
+CUTLASS_DIR := csrc/cutlass
 
 CUTLASS_INCLUDE := $(CUTLASS_DIR)/include
 ifeq (,$(wildcard $(CUTLASS_INCLUDE)))
