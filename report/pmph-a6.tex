@@ -410,9 +410,11 @@ The naive implementation relies entirely on HBM and does not utilize shared memo
 
 The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 16 \times 16$ tile layout for Threadblock shape and Warp shape, and $16 \times 16 \times 16$ for instruction shape.
 
+See throughput result in Table~\ref{tab:throughput_comparison} and latency result in Table~\ref{tab:full_comparison}. The speed up rate of Cutlass implementation against Naive implementation indicates Flash Attention is memory bounded\footnote{However, it is quite hard to give a quantitative analysis of speedup without the help of Nsight Compute.}. Another interesting discovery is that the large tile fully utilizing shared memory is not performing as well as small tile. For large tile, the single tile will do more FLOPS, but the concurrency across tiles will be limited. 
+
 \begin{table}[htbp]
 \centering
-\caption{Flash Attention Throughput Comparison (TFLOPs/s and Speedup vs. Naive)}
+\caption{FA1xCutlass Throughput (TFLOPs/s and Speedup vs. Naive)}
 \label{tab:throughput_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=1.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2]@{}}
