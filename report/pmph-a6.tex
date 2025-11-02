@@ -292,34 +292,73 @@ I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and p
 This implementation leverages NVIDIA CUTLASS with WMMA (Warp-Matrix-Multiply-Accumulate) tensor core instructions for accelerated matrix operations in Flash Attention. For convenience we extract head dim as template variable to match different tiling size for shared memory allocation.
 
 \paragraph{Tensor Core Acceleration}
-The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 8 \times 16$ to match the A100 instruction format. This provides significant speedup over scalar CUDA core operations.
+The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 16 \times 16$ to match the A100 instruction format. Since the lay out handles tiles with the fixed size, there will be some remaining elements to be calculate, and they are calculated with CUDA cores then. The result is accumulated into shared memory.
 
-For the $O = P V$ (output projection) computation, CUDA cores are utilized instead of tensor cores. This design choice stems from the fact that attention probabilities $P$ are maintained in \texttt{fp32} precision for numerical stability during online softmax updates, while WMMA requires \texttt{fp16} inputs. Converting $P$ from \texttt{fp32} to \texttt{fp16} would incur additional overhead that outweighs the performance benefits, since the $P \times V$ computation is less compute-intensive than $Q \times K^{\top}$.
 
-\begin{lstlisting}
- using GemmQK = cutlass::gemm::device::Gemm<
-     cutlass::half_t,                          // ElementA (Q)
-     cutlass::layout::RowMajor,                // LayoutA
-     cutlass::half_t,                          // ElementB (K)
-     cutlass::layout::RowMajor,                // LayoutB (K is transposed)
-     float,                                     // ElementC (S)
-     cutlass::layout::RowMajor,                // LayoutC
-     float,                                     // ElementAccumulator
-     cutlass::arch::OpClassTensorOp,           // Use Tensor Cores
-     cutlass::arch::Sm80,                      // A100 architecture
-     cutlass::gemm::GemmShape<16, 16, 16>,     // ThreadblockShape (small for flexibility)
-     cutlass::gemm::GemmShape<16, 16, 16>,     // WarpShape
-     cutlass::gemm::GemmShape<16, 8, 16>,      // InstructionShape (tensor core instruction)
-     cutlass::epilogue::thread::LinearCombination<
-         float,
-         1,
-         float,
-         float
-     >,
-     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-     2                                          // Stages
- >;
+\begin{lstlisting}     
+     if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+         //   Q is [M, K] row-major
+         //   K is [N, K] row-major, need to treat as K^T [K, N]
+         for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
+             for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
+                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;  // K^T is col-major!
+                 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+                 
+                 wmma::fill_fragment(c_frag, 0.0f);
+                 
+                 // Multiply-accumulate over K dimension
+                 for (int k = 0; k < (DIM_K / WMMA_K) * WMMA_K; k += WMMA_K) {
+                     // Load A (Q[m:m+16, k:k+16]) - row major
+                     wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
+                     
+                     // Load B (K^T[k:k+16, n:n+16]) = K[n:n+16, k:k+16] as col-major
+                     // K is stored row-major as [N, K], so K[n, k] is at K + n*DIM_K + k
+                     wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
+                     
+                     // C = A @ B^T + C
+                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                 }
+                 
+                 wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
+             }
+         }
+         
+         __syncthreads();
+     }
+     
+     // Handle remainder with standard CUDA cores
+     // This handles: partial tiles, edge cases, and any K dimension remainder
+     for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
+         int i = idx / k_size;
+         int j = idx % k_size;
+         
+         // Skip if already computed by WMMA
+         if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+             int m_base = (i / WMMA_M) * WMMA_M;
+             int n_base = (j / WMMA_N) * WMMA_N;
+             if (i >= m_base && i < m_base + WMMA_M && 
+                 j >= n_base && j < n_base + WMMA_N && 
+                 m_base < (q_size / WMMA_M) * WMMA_M && 
+                 n_base < (k_size / WMMA_N) * WMMA_N) {
+                 continue;  // Already computed by tensor cores
+             }
+         }
+         
+         float sum = 0.0f;
+         #pragma unroll
+         for (int k = 0; k < DIM_K; k++) {
+             sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
+         }
+         S[i * TILE_N + j] = sum;
+     }
+     __syncthreads();
+ }
 \end{lstlisting}
+
+
+For the $O = P V$ (output projection) computation, CUDA cores are utilized instead of tensor cores. This design choice stems from the fact that attention probabilities $P$ are maintained in \texttt{fp32} precision for numerical stability during online softmax updates, while WMMA requires \texttt{fp16} inputs. Converting $P$ from \texttt{fp32} to \texttt{fp16} would incur additional overhead that outweighs the performance benefits, since the $P \times V$ computation is less compute-intensive than $Q \times K^{\top}$ (P shaped $TILE\_M \times TILE\_N$, V shaped $TILE\_N \times HEAD\_DIM$, and Q shaped $TILE\_M \times HEAD\_DIM$, K shaped $TILE\_N \times HEAD\_DIM$).
+
 
 \paragraph{Softmax Computation}
 The softmax operation is parallelized at the warp level using cooperative warp shuffle operations (\texttt{\_\_shfl\_down\_sync}, \texttt{\_\_shfl\_sync}). This implements an online softmax algorithm with Welford-style running statistics correction. Each warp processes one or more query positions cooperatively: threads within a warp collectively compute the maximum across the sequence dimension, apply exponential scaling, and reduce the normalization factor $l$. The online softmax update rule applies a correction factor $e^{m_{\text{old}} - m_{\text{new}}}$ to previously accumulated outputs, enabling sequential processing of key-value tiles without storing the full attention matrix.
@@ -369,7 +408,7 @@ The evaluation was conducted on an A100-40G GPU, tested on CUDA 12.8 with CUTLAS
 
 The naive implementation relies entirely on HBM and does not utilize shared memory. Consequently, it is memory-bound, with the GPU spending most of its time stalled on HBM accesses rather than performing computation. In contrast, the tiled versions demonstrate significantly lower latency by leveraging shared memory.
 
-The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 16 \times 16$ tile layout for Threadblock shape and Warp shape, and $16 \times 8 \times 16$ for instruction shape.
+The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 16 \times 16$ tile layout for Threadblock shape and Warp shape, and $16 \times 16 \times 16$ for instruction shape.
 
 \begin{table}[htbp]
 \centering

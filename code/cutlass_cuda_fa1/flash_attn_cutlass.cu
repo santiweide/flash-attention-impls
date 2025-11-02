@@ -92,21 +92,12 @@
      constexpr int WMMA_K = 16;
      
      const int warpId = threadIdx.x / 32;
-    //  const int laneId = threadIdx.x % 32;
      const int numWarps = blockDim.x / 32;
-     
-     // Use WMMA for tensor core acceleration
-     // Each warp processes a 16x16 output tile using multiple 16x16x16 MMA operations
-     
-     // For simplicity and correctness, fall back to standard computation for edges
-     // A full WMMA implementation would handle partial tiles
      const int tid = threadIdx.x;
      const int num_threads = blockDim.x;
      
      // Use tensor cores for aligned portions, fallback for remainder
      if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
-         // Tensor core path for well-aligned data
-         // We compute Q @ K^T where:
          //   Q is [M, K] row-major
          //   K is [N, K] row-major, need to treat as K^T [K, N]
          for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
@@ -126,14 +117,12 @@
                      
                      // Load B (K^T[k:k+16, n:n+16]) = K[n:n+16, k:k+16] as col-major
                      // K is stored row-major as [N, K], so K[n, k] is at K + n*DIM_K + k
-                     // To interpret as col-major for K^T, stride is DIM_K
                      wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
                      
-                     // Perform tensor core multiply-accumulate: C = A @ B^T + C
+                     // C = A @ B^T + C
                      wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
                  }
                  
-                 // Store result
                  wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
              }
          }
@@ -191,7 +180,6 @@
      const int tid = threadIdx.x;
      const int num_threads = blockDim.x;
      
-     // Process using CUDA cores (P@V is less compute-intensive than Q@K^T anyway)
      for (int i = 0; i < q_size; i++) {
          for (int d = tid; d < DIM_K; d += num_threads) {
              float sum = 0.0f;
