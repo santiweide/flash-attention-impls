@@ -17,63 +17,9 @@
  #include <algorithm>
  
  using namespace nvcuda;
- 
- // ==================== CUTLASS GEMM Configuration ====================
- 
- // Configuration for small GEMM operations used in attention
- // Matches the Small Tile configuration: M=45, N=90, K=32
- 
- // GEMM for Q @ K^T: [M, K] @ [N, K]^T -> [M, N]
- // Using FP16 inputs, FP32 accumulation
- using GemmQK = cutlass::gemm::device::Gemm<
-     cutlass::half_t,                          // ElementA (Q)
-     cutlass::layout::RowMajor,                // LayoutA
-     cutlass::half_t,                          // ElementB (K)
-     cutlass::layout::RowMajor,                // LayoutB (K is transposed)
-     float,                                     // ElementC (S)
-     cutlass::layout::RowMajor,                // LayoutC
-     float,                                     // ElementAccumulator
-     cutlass::arch::OpClassTensorOp,           // Use Tensor Cores
-     cutlass::arch::Sm80,                      // A100 architecture
-     cutlass::gemm::GemmShape<16, 16, 16>,     // ThreadblockShape (small for flexibility)
-     cutlass::gemm::GemmShape<16, 16, 16>,     // WarpShape
-     cutlass::gemm::GemmShape<16, 8, 16>,      // InstructionShape (tensor core instruction)
-     cutlass::epilogue::thread::LinearCombination<
-         float,
-         1,
-         float,
-         float
-     >,
-     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-     2                                          // Stages
- >;
- 
- // GEMM for P @ V: [M, N] @ [N, K] -> [M, K]
- using GemmPV = cutlass::gemm::device::Gemm<
-     float,                                     // ElementA (P - attention probs)
-     cutlass::layout::RowMajor,                // LayoutA
-     cutlass::half_t,                          // ElementB (V)
-     cutlass::layout::RowMajor,                // LayoutB
-     float,                                     // ElementC (O)
-     cutlass::layout::RowMajor,                // LayoutC
-     float,                                     // ElementAccumulator
-     cutlass::arch::OpClassTensorOp,           // Use Tensor Cores
-     cutlass::arch::Sm80,
-     cutlass::gemm::GemmShape<16, 16, 16>,
-     cutlass::gemm::GemmShape<16, 16, 16>,
-     cutlass::gemm::GemmShape<16, 8, 16>,
-     cutlass::epilogue::thread::LinearCombination<
-         float,
-         1,
-         float,
-         float
-     >,
-     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-     2
- >;
+
  
  // ==================== Small Tile Configuration (Same as Small Tile) ====================
- 
  template<int HEAD_DIM>
  struct CutlassSmallTileConfig {
      // Same tile calculation as SmallTileConfig
