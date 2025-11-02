@@ -46,12 +46,11 @@ else
 fi
 
 # check Cutlass
-CUTLASS_DIR="../csrc/cutlass"
+CUTLASS_DIR="csrc/cutlass"
 if [ ! -d "$CUTLASS_DIR/include" ]; then
     echo -e "${YELLOW}⚠${NC} Cutlass not found at $CUTLASS_DIR"
     echo "  Attempting to initialize git submodule..."
     
-    cd ..
     if git submodule update --init csrc/cutlass; then
         echo -e "${GREEN}✓${NC} Cutlass initialized successfully"
         cd minimal_flashattn_cutlass
