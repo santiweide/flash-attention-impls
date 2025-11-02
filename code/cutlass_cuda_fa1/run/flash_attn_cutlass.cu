@@ -92,7 +92,8 @@
      
      static constexpr size_t get_smem_size() {
          return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
-                (kTileM * kTileN * 2) * sizeof(float) +  // S and P
+                (kTileM * kTileN * 2) * sizeof(float) +  // S and P (float)
+                (kTileM * kTileN) * sizeof(cutlass::half_t) +  // P_half for WMMA
                 (kTileM * 2) * sizeof(float) +            // m, l
                 (kTileM * kHeadDim) * sizeof(float);      // O_accum
      }
@@ -224,41 +225,6 @@
      __syncthreads();
  }
  
- // Wrapper for P @ V using WMMA Tensor Cores
- // P is float, V is half_t - need to convert P to half for WMMA
- template<int TILE_M, int TILE_N, int DIM_K>
- __device__ __forceinline__ void cutlass_gemm_pv(
-     const float* P,               // [TILE_M, TILE_N]
-     const cutlass::half_t* V,    // [TILE_N, DIM_K]
-     float* O,                     // [TILE_M, DIM_K]
-     int q_size,                   // Valid rows (≤ TILE_M)
-     int k_size                    // Valid cols (≤ TILE_N)
- ) {
-     // Note: P @ V is more complex because P is in float, not half
-     // For maximum performance, would need to keep P in half
-     // For now, use CUDA cores for simplicity and correctness
-     
-     // WMMA requires FP16 inputs, but P (attention probs) are in FP32
-     // Converting would add overhead, so use CUDA cores here
-     // Future optimization: store P as half_t if precision allows
-     
-     const int tid = threadIdx.x;
-     const int num_threads = blockDim.x;
-     
-     // Process using CUDA cores (P@V is less compute-intensive than Q@K^T anyway)
-     for (int i = 0; i < q_size; i++) {
-         for (int d = tid; d < DIM_K; d += num_threads) {
-             float sum = 0.0f;
-             #pragma unroll 8
-             for (int j = 0; j < k_size; j++) {
-                 sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
-             }
-             O[i * DIM_K + d] += sum;
-         }
-     }
-     __syncthreads();
- }
- 
  // ==================== Parallel Softmax with Warp Shuffle ====================
 
 // Parallel softmax computation using warp shuffle operations
@@ -267,7 +233,8 @@
 template<int TILE_M, int TILE_N, int DIM_K>
 __device__ __forceinline__ void parallel_softmax_warp(
     float* S,               // [TILE_M, TILE_N] - attention scores
-    float* P,               // [TILE_M, TILE_N] - attention probabilities
+    float* P,               // [TILE_M, TILE_N] - attention probabilities (float)
+    cutlass::half_t* P_half, // [TILE_M, TILE_N] - attention probabilities (half_t for WMMA)
     float* m_shared,        // [TILE_M] - max values
     float* l_shared,        // [TILE_M] - normalizing factors
     float* O_accum,         // [TILE_M, DIM_K] - output accumulator
@@ -309,6 +276,7 @@ __device__ __forceinline__ void parallel_softmax_warp(
         for (int j = laneId; j < k_size; j += 32) {
             float p = expf(S[i * TILE_N + j] - m_new);
             P[i * TILE_N + j] = p;
+            P_half[i * TILE_N + j] = cutlass::half_t(p);  // Store as half_t for WMMA
             l_new += p;
         }
         
@@ -341,7 +309,125 @@ __device__ __forceinline__ void parallel_softmax_warp(
     __syncthreads();
 }
 
-// ==================== Flash Attention Kernel with CUTLASS ====================
+// ==================== WMMA Tensor Core GEMM ====================
+
+// Wrapper for P @ V using WMMA Tensor Cores with half_t inputs
+// P and V are both half_t - much more efficient!
+template<int TILE_M, int TILE_N, int DIM_K>
+__device__ __forceinline__ void cutlass_gemm_pv_wmma(
+    const cutlass::half_t* P,        // [TILE_M, TILE_N] - attention probs (half_t)
+    const cutlass::half_t* V,        // [TILE_N, DIM_K]
+    float* O,                         // [TILE_M, DIM_K]
+    int q_size,                       // Valid rows (≤ TILE_M)
+    int k_size                        // Valid cols (≤ TILE_N)
+) {
+    // WMMA tile dimensions for A100
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
+    
+    const int warpId = threadIdx.x / 32;
+    const int numWarps = blockDim.x / 32;
+    
+    // Use WMMA for P @ V computation
+    // P: [M, N] row-major, V: [N, K] row-major → O: [M, K]
+    if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+        // Tensor core path for well-aligned data
+        for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
+            for (int k = 0; k < (DIM_K / WMMA_N) * WMMA_N; k += WMMA_N) {
+                // Declare fragments
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+                
+                // Initialize accumulator to zero (or accumulate if multiple k blocks)
+                wmma::fill_fragment(c_frag, 0.0f);
+                
+                // Multiply-accumulate over N dimension (key dimension)
+                for (int n = 0; n < (k_size / WMMA_K) * WMMA_K; n += WMMA_K) {
+                    // Load A (P[m:m+16, n:n+16]) - row major
+                    wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(P + m * TILE_N + n), TILE_N);
+                    
+                    // Load B (V[n:n+16, k:k+16]) - row major
+                    wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(V + n * DIM_K + k), DIM_K);
+                    
+                    // Perform tensor core multiply-accumulate: C = A @ B + C
+                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                }
+                
+                // Store result
+                wmma::store_matrix_sync(O + m * DIM_K + k, c_frag, DIM_K, wmma::mem_row_major);
+            }
+        }
+        
+        __syncthreads();
+    }
+    
+    // Handle remainder with standard CUDA cores
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+    for (int idx = tid; idx < q_size * DIM_K; idx += num_threads) {
+        int i = idx / DIM_K;
+        int d = idx % DIM_K;
+        
+        // Skip if already computed by WMMA
+        if (q_size >= WMMA_M && DIM_K >= WMMA_N) {
+            int m_base = (i / WMMA_M) * WMMA_M;
+            int k_base = (d / WMMA_N) * WMMA_N;
+            if (i >= m_base && i < m_base + WMMA_M && 
+                d >= k_base && d < k_base + WMMA_N && 
+                m_base < (q_size / WMMA_M) * WMMA_M && 
+                k_base < (DIM_K / WMMA_N) * WMMA_N) {
+                continue;  // Already computed by tensor cores
+            }
+        }
+        
+        // Compute remainder using CUDA cores
+        float sum = 0.0f;
+        #pragma unroll 8
+        for (int j = 0; j < k_size; j++) {
+            sum += float(P[i * TILE_N + j]) * float(V[j * DIM_K + d]);
+        }
+        O[i * DIM_K + d] += sum;
+    }
+    __syncthreads();
+}
+
+// Original CUDA cores version (kept for reference/fallback)
+template<int TILE_M, int TILE_N, int DIM_K>
+__device__ __forceinline__ void cutlass_gemm_pv(
+    const float* P,               // [TILE_M, TILE_N]
+    const cutlass::half_t* V,    // [TILE_N, DIM_K]
+    float* O,                     // [TILE_M, DIM_K]
+    int q_size,                   // Valid rows (≤ TILE_M)
+    int k_size                    // Valid cols (≤ TILE_N)
+) {
+    // Note: P @ V is more complex because P is in float, not half
+    // For maximum performance, would need to keep P in half
+    // For now, use CUDA cores for simplicity and correctness
+    
+    // WMMA requires FP16 inputs, but P (attention probs) are in FP32
+    // Converting would add overhead, so use CUDA cores here
+    // Future optimization: store P as half_t if precision allows
+    
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+    
+    // Process using CUDA cores (P@V is less compute-intensive than Q@K^T anyway)
+    for (int i = 0; i < q_size; i++) {
+        for (int d = tid; d < DIM_K; d += num_threads) {
+            float sum = 0.0f;
+            #pragma unroll 8
+            for (int j = 0; j < k_size; j++) {
+                sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
+            }
+            O[i * DIM_K + d] += sum;
+        }
+    }
+    __syncthreads();
+}
+ 
+ // ==================== Flash Attention Kernel with CUTLASS ====================
 
 template<int HEAD_DIM>
 __global__ void flash_attn_cutlass_kernel(
@@ -432,13 +518,15 @@ __global__ void flash_attn_cutlass_kernel(
          __syncthreads();
          
          // Online softmax
+         // Allocate space for P_half in shared memory
+         cutlass::half_t* P_half_shared = reinterpret_cast<cutlass::half_t*>(smem + stats_offset + (kTileM * kTileN * 2) * sizeof(float));
          parallel_softmax_warp<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.S, shared_mem.P, m_shared, l_shared, O_accum, q_size, k_size, blockDim.x
+             shared_mem.S, shared_mem.P, P_half_shared, m_shared, l_shared, O_accum, q_size, k_size, blockDim.x
          );
          
-         // O += P @ V using CUTLASS
-         cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.P, shared_mem.V, O_accum, q_size, k_size
+         // O += P @ V using CUTLASS (using WMMA)
+         cutlass_gemm_pv_wmma<kTileM, kTileN, HEAD_DIM>(
+             P_half_shared, shared_mem.V, O_accum, q_size, k_size
          );
      }
      
@@ -495,7 +583,7 @@ __global__ void flash_attn_cutlass_kernel(
          printf("  Shared memory: %.1f KB\n", smem_size / 1024.0);
          printf("  Tensor Cores: ENABLED via WMMA API\n");
          printf("    → Q@K^T: wmma::mma_sync (16x16x16 tiles, FP16→FP32)\n");
-         printf("    → P@V:   CUDA cores (FP32 input limitation)\n");
+         printf("    → P@V:   wmma::mma_sync (16x16x16 tiles, FP16→FP32)\n");
          printf("  Softmax: PARALLEL via warp shuffle (cooperative warp reduction)\n");
          printf("================================================================================\n");
          first_call = false;
