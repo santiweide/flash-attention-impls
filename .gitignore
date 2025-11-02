@@ -1,9 +1,9 @@
+*.DS_Store
 *.aux
 *.log
 *.synctex.gz
 *.out
 hwj*
-.DS_Store
 *.blg
 *.bbl
 *.pdf
