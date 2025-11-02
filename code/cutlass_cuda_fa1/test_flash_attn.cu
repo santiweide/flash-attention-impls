@@ -1,12 +1,5 @@
 /******************************************************************************
- * Flash Attention Test Program
- * 
- * Features:
- * 1. Generate random input
- * 2. Run Flash Attention
- * 3. Run reference implementation
- * 4. Compare results
- * 5. Measure performance
+ * Flash Attention Test Diff & Performance
  ******************************************************************************/
 
  #include <cuda_runtime.h>
@@ -18,7 +11,7 @@
  #include <cmath>
  #include <chrono>
  
- // 声明Large Tile接口
+ // Declare Large Tile interface
  void flash_attention_forward_dispatch(
      const cutlass::half_t* Q,
      const cutlass::half_t* K,
@@ -70,8 +63,6 @@
      cudaStream_t stream
  );
  
- // ==================== Helper Functions ====================
- 
  #define CHECK_CUDA(call) \
      do { \
          cudaError_t status = call; \
@@ -82,10 +73,9 @@
          } \
      } while(0)
  
- // Initialize random data
  void init_random(cutlass::half_t* data, size_t size, float mean = 0.0f, float stddev = 0.02f) {
      std::vector<float> host_data(size);
-     std::mt19937 gen(42);  // fixed seed for reproducibility
+     std::mt19937 gen(42);
      std::normal_distribution<float> dist(mean, stddev);
      
      for (size_t i = 0; i < size; i++) {
@@ -145,8 +135,7 @@
  // Benchmark function
  template<typename Func>
  float benchmark(Func func, int warmup = 5, int repeats = 20) {
-     // Warmup
-     for (int i = 0; i < warmup; i++) {
+     for (int i = 0; i < warmup; i++) { // warmup
          func();
      }
      CHECK_CUDA(cudaDeviceSynchronize());
@@ -163,7 +152,6 @@
      return duration.count() / repeats;
  }
  
- // ==================== Test Cases ====================
  
  struct TestConfig {
      int batch_size;
@@ -183,14 +171,11 @@
  
  void run_test(const TestConfig& config) {
      printf("\n");
-     printf("================================================================================\n");
      config.print();
-     printf("================================================================================\n");
      
      const size_t qkv_size = config.get_qkv_size();
      const size_t bytes = qkv_size * sizeof(cutlass::half_t);
      
-     // compute the size of the scores buffer for the baseline
      const size_t scores_buffer_size = (size_t)config.batch_size * config.num_heads * 
                                        config.seq_len * config.seq_len * sizeof(float);
      
@@ -200,7 +185,6 @@
      printf("Total memory: %.2f MB (+ 1 MB for CUTLASS output)\n", 
             (bytes * 4 + scores_buffer_size) / 1024.0 / 1024.0);
      
-     // allocate device memory (including CUTLASS output)
      cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline, *d_O_cutlass;
      CHECK_CUDA(cudaMalloc(&d_Q, bytes));
      CHECK_CUDA(cudaMalloc(&d_K, bytes));
@@ -210,14 +194,12 @@
      CHECK_CUDA(cudaMalloc(&d_O_baseline, bytes));
      CHECK_CUDA(cudaMalloc(&d_O_cutlass, bytes));
      
-     // initialize inputs
-     printf("Initializing inputs...\n");
+    //  printf("Initializing inputs...\n");
      init_random(d_Q, qkv_size);
      init_random(d_K, qkv_size);
      init_random(d_V, qkv_size);
      
-     // run Baseline (Naive)
-     printf("Running Baseline (Naive, no shared mem, no online softmax)...\n");
+    //  printf("Running Baseline (Naive, no shared mem, no online softmax)...\n");
      float time_baseline = benchmark([&]() {
          attention_baseline(
              d_Q, d_K, d_V, d_O_baseline,
@@ -226,8 +208,7 @@
          );
      });
      
-     // run Small Tile - conservative tile configuration to improve occupancy
-     printf("Running Flash Attention (Small Tile: conservative config)...\n");
+    //  printf("Running Flash Attention (Small Tile: conservative config)...\n");
      float time_ref = benchmark([&]() {
          attention_reference_dispatch(
              d_Q, d_K, d_V, d_O_ref,
@@ -236,8 +217,7 @@
          );
      });
      
-     // run Large Tile - aggressive tile configuration to maximize data reuse
-     printf("Running Flash Attention (Large Tile: aggressive config)...\n");
+    //  printf("Running Flash Attention (Large Tile: aggressive config)...\n");
      float time_flash = benchmark([&]() {
          flash_attention_forward_dispatch(
              d_Q, d_K, d_V, d_O_flash,
@@ -246,8 +226,7 @@
          );
      });
      
-     // run CUTLASS Tensor Core version - using the same configuration as Small Tile but enabling tensor cores
-     printf("Running Flash Attention (CUTLASS Tensor Core: same tile as Small)...\n");
+    //  printf("Running Flash Attention (CUTLASS Tensor Core: same tile as Small)...\n");
      float time_cutlass = benchmark([&]() {
          flash_attention_cutlass_dispatch(
              d_Q, d_K, d_V, d_O_cutlass,
@@ -256,21 +235,19 @@
          );
      });
      
-     // verify correctness
-     printf("\nVerifying correctness...\n");
-     printf("Comparing Large Tile vs Small Tile:\n");
+    //  printf("\nVerifying correctness...\n");
+    //  printf("Comparing Large Tile vs Small Tile:\n");
      float error_flash_vs_ref = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
      
-     printf("\nComparing CUTLASS vs Small Tile:\n");
+    //  printf("\nComparing CUTLASS vs Small Tile:\n");
      float error_cutlass_vs_ref = compute_max_relative_error(d_O_cutlass, d_O_ref, qkv_size);
      
-     printf("\nComparing Baseline vs Small Tile:\n");
+    //  printf("\nComparing Baseline vs Small Tile:\n");
      float error_baseline_vs_ref = compute_max_relative_error(d_O_baseline, d_O_ref, qkv_size);
      
-     printf("\nComparing Large Tile vs Baseline:\n");
+    //  printf("\nComparing Large Tile vs Baseline:\n");
      float error_flash_vs_baseline = compute_max_relative_error(d_O_flash, d_O_baseline, qkv_size);
      
-     // output results
      printf("\n");
      printf("================================================================================\n");
      printf("Performance Results:\n");
