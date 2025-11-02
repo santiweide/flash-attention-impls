@@ -4,7 +4,6 @@
 
  #include <cuda_runtime.h>
  #include <cuda_fp16.h>
- #include <mma.h>  // WMMA Tensor Core API
  #include <cutlass/cutlass.h>
  #include <cutlass/numeric_types.h>
  #include <cutlass/arch/memory.h>
@@ -67,7 +66,7 @@
      }
      
      static constexpr size_t get_smem_size() {
-         return (kTileM * kHeadDim + kTileN * HEAD_DIM * 2) * sizeof(cutlass::half_t) +
+         return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
                 (kTileM * kTileN * 2) * sizeof(float) +
                 (kTileM * 2) * sizeof(float) +
                 (kTileM * kHeadDim) * sizeof(float);
@@ -130,104 +129,7 @@
      __syncthreads();
  }
  
- // ==================== WMMA-based P@V GEMM ====================
- // P @ V: [M, N] @ [N, K] -> [M, K]
- // P is float, V is half_t
- // Using WMMA tensor cores for acceleration
-
-template<int TILE_M, int TILE_N, int HEAD_DIM>
-__device__ void gemm_pv_wmma(
-    const float* P,                    // [TILE_M, TILE_N]
-    const cutlass::half_t* V,         // [TILE_N, HEAD_DIM]
-    float* O_accum,                   // [TILE_M, HEAD_DIM] - accumulates result
-    int q_size,                        // Valid rows (≤ TILE_M)
-    int k_size                         // Valid cols (≤ TILE_N)
-) {
-    using namespace nvcuda;
-    
-    const int tid = threadIdx.x;
-    const int warpId = tid / 32;
-    const int laneId = tid % 32;
-    const int num_threads = blockDim.x;
-    const int num_warps = (num_threads + 31) / 32;
-    
-    constexpr int WMMA_M = 16;
-    constexpr int WMMA_N = 16;
-    constexpr int WMMA_K = 16;
-    
-    // Process using WMMA in chunks of 16x16x16
-    // For partial tiles at boundaries, fall back to scalar computation
-    
-    // WMMA path: process complete 16x16 blocks where possible
-    int m_blocks = (q_size + WMMA_M - 1) / WMMA_M;  // Ceiling division
-    int n_blocks = (HEAD_DIM + WMMA_N - 1) / WMMA_N;
-    
-    // Each warp handles one WMMA tile if it fits
-    for (int m_b = warpId; m_b < m_blocks; m_b += num_warps) {
-        int m_start = m_b * WMMA_M;
-        int m_end = min(m_start + WMMA_M, q_size);
-        int m_size = m_end - m_start;
-        
-        for (int n_b = 0; n_b < n_blocks; n_b++) {
-            int n_start = n_b * WMMA_N;
-            int n_end = min(n_start + WMMA_N, HEAD_DIM);
-            int n_size = n_end - n_start;
-            
-            // Only use WMMA for full 16x16 blocks
-            bool can_use_wmma = (m_size == WMMA_M && n_size == WMMA_N && k_size >= WMMA_K);
-            
-            if (can_use_wmma) {
-                // Use WMMA for this block
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, float, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-                
-                wmma::fill_fragment(c_frag, 0.0f);
-                
-                // Iterate over K dimension in chunks of 16
-                for (int k = 0; k < ((k_size + WMMA_K - 1) / WMMA_K) * WMMA_K; k += WMMA_K) {
-                    int k_actual = min(k + WMMA_K, k_size);
-                    
-                    // Load P tile: [16, 16] from [TILE_M, TILE_N]
-                    wmma::load_matrix_sync(a_frag, 
-                        P + m_start * TILE_N + k, 
-                        TILE_N);
-                    
-                    // Load V tile: [16, 16] from [TILE_N, HEAD_DIM]
-                    wmma::load_matrix_sync(b_frag, 
-                        reinterpret_cast<const half*>(V) + k * HEAD_DIM + n_start,
-                        HEAD_DIM);
-                    
-                    // Accumulate: C += A @ B
-                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-                }
-                
-                // Store result back to O_accum: [16, 16] to [TILE_M, HEAD_DIM]
-                wmma::store_matrix_sync(
-                    O_accum + m_start * HEAD_DIM + n_start,
-                    c_frag,
-                    HEAD_DIM,
-                    wmma::mem_row_major);
-                
-            } else {
-                // Fallback: use scalar computation for partial or small tiles
-                for (int i = m_start + laneId; i < m_end; i += 32) {
-                    for (int d = n_start; d < n_end; d++) {
-                        float sum = 0.0f;
-                        #pragma unroll 8
-                        for (int j = 0; j < k_size; j++) {
-                            sum += P[i * TILE_N + j] * float(V[j * HEAD_DIM + d]);
-                        }
-                        O_accum[i * HEAD_DIM + d] += sum;
-                    }
-                }
-            }
-        }
-    }
-    __syncthreads();
-}
-
-// ==================== Flash Attention: Large Tile Kernel ====================
+ // ==================== Flash Attention: Large Tile Kernel ====================
  // Uses aggressive tile sizes (e.g., 120×120 for head_dim=32) to maximize
  // data reuse at the cost of higher shared memory usage
  
@@ -357,11 +259,17 @@ __device__ void gemm_pv_wmma(
          __syncthreads();
          
          // O += P @ V
-         // Use WMMA tensor cores for P @ V acceleration
-         gemm_pv_wmma<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.P, shared_mem.V, O_accum,
-             q_size, k_size
-         );
+         for (int i = 0; i < q_size; i++) {
+             for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+                 float sum = 0.0f;
+                 const float* P_row = shared_mem.P + i * kTileN;
+                 #pragma unroll 8
+                 for (int j = 0; j < k_size; j++) {
+                     sum += P_row[j] * float(shared_mem.V[j * HEAD_DIM + d]);
+                 }
+                 O_accum[i * HEAD_DIM + d] += sum;
+             }
+         }
          __syncthreads();
      }
      
@@ -574,12 +482,15 @@ __device__ void gemm_pv_wmma(
          }
          __syncthreads();
          
-         // Use WMMA tensor cores for S @ V (same as P @ V) acceleration
-         // Note: S is reused as attention weights here
-         gemm_pv_wmma<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.S, shared_mem.V, O_accum,
-             q_size, k_size
-         );
+         for (int i = 0; i < q_size; i++) {
+             for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
+                 float sum = 0.0f;
+                 for (int j = 0; j < k_size; j++) {
+                     sum += shared_mem.S[i * kTileN + j] * float(shared_mem.V[j * HEAD_DIM + d]);
+                 }
+                 O_accum[i * HEAD_DIM + d] += sum;
+             }
+         }
          __syncthreads();
      }
      
