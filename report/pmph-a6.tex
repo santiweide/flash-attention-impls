@@ -142,16 +142,15 @@ FlashAttention leverages shared memory to reduce accesses to high-bandwidth memo
 \begin{algorithmic}[1]
 \STATE \textbf{in parallel over warps $w$:} \COMMENT{Each warp handles its own $Q_i$ tile}
 \STATE \hspace{0.5cm} initialize $O_w = 0$, normalization stats
-\FOR{each $K_j, V_j$ block}
-    \STATE \hspace{0.5cm} $S_{\text{local}} = Q_w K_j^{T}$
-    \STATE \hspace{0.5cm} $P_{\text{local}} = \text{softmax\_tile}(S_{\text{local}})$
-    \STATE \hspace{0.5cm} $O_w \mathrel{+}= P_{\text{local}} V_j$ \COMMENT{accumulate output locally}
-\ENDFOR
+\STATE \hspace{0.5cm} \textbf{for} each $K_j, V_j$ block \textbf{do}
+\STATE \hspace{1.0cm} $S_{\text{local}} = Q_w K_j^{T}$
+\STATE \hspace{1.0cm} $P_{\text{local}} = \text{softmax\_tile}(S_{\text{local}})$
+\STATE \hspace{1.0cm} $O_w \mathrel{+}= P_{\text{local}} V_j$ \COMMENT{accumulate output locally}
+\STATE \hspace{0.5cm} \textbf{end for}
 \STATE \hspace{0.5cm} finalize normalization
 \STATE \hspace{0.5cm} write $O_w$ to global output
 \end{algorithmic}
 \end{algorithm}
-
 \subsection{Work-Depth Complexity}
 
 Here we count only matrix multiplication for FLOPs calculation, since $Softmax$ involves much fewer FLOPs. For a matrix $A$ of size $m \times n$ and a matrix $B$ of size $n \times p$,  the multiplication $A \times B$ requires $m \times n \times p$ multiplications and $m \times n \times p$ additions, totaling $2mnp$ FLOPs.
