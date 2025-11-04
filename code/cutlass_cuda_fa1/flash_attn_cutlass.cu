@@ -227,14 +227,11 @@ __device__ __forceinline__ void parallel_softmax_warp(
             m_new = fmaxf(m_new, S[i * TILE_N + j]);
         }
         
-        // Reduce within warp using butterfly shuffle pattern
-        // This is a standard warp reduce for max
+        // warp reduce to get max
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             m_new = fmaxf(m_new, __shfl_down_sync(0xffffffff, m_new, offset));
         }
-        
-        // Broadcast result from lane 0 to all lanes in the warp
         m_new = __shfl_sync(0xffffffff, m_new, 0);
         
         // ========== Step 2: Compute softmax exponentials and sum ==========
@@ -250,9 +247,7 @@ __device__ __forceinline__ void parallel_softmax_warp(
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             l_new += __shfl_down_sync(0xffffffff, l_new, offset);
-        }
-        
-        // Broadcast result from lane 0 to all lanes in the warp
+        }        
         l_new = __shfl_sync(0xffffffff, l_new, 0);
         
         // ========== Step 3: Apply online softmax correction ==========
@@ -267,15 +262,12 @@ __device__ __forceinline__ void parallel_softmax_warp(
         }
         
         // Update O_accum in parallel: scale by correction factor
-        // Each lane handles part of the dimension
         for (int d = laneId; d < DIM_K; d += 32) {
             O_accum[i * DIM_K + d] *= correction;
         }
     }
     __syncthreads();
 }
-
-// ==================== Flash Attention Kernel with CUTLASS ====================
 
 template<int HEAD_DIM>
 __global__ void flash_attn_cutlass_kernel(
