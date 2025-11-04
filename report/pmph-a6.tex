@@ -326,66 +326,41 @@ This implementation leverages NVIDIA CUTLASS with WMMA (Warp-Matrix-Multiply-Acc
 \paragraph{Tensor Core Acceleration}
 The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 16 \times 16$ to match the A100 instruction format. Since the lay out handles tiles with the fixed size, there will be some remaining elements to be calculate, and they are calculated with CUDA cores then. The result is accumulated into shared memory.
 
+The complex logic in CUTLASS is while handling the remainder of tiles. First we should init matrix S with 0, and use wmma to load tiled data. For the reminder, since wmma has 3 dimensions M, N, K, we handle the remainder on all the three dimensions.
 
 \begin{lstlisting}     
-     if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
-         //   Q is [M, K] row-major
-         //   K is [N, K] row-major, need to treat as K^T [K, N]
-         for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
-             for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
-                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;  // K^T is col-major!
-                 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-                 
-                 wmma::fill_fragment(c_frag, 0.0f);
-                 
-                 // Multiply-accumulate over K dimension
-                 for (int k = 0; k < (DIM_K / WMMA_K) * WMMA_K; k += WMMA_K) {
-                     // Load A (Q[m:m+16, k:k+16]) - row major
-                     wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
-                     
-                     // Load B (K^T[k:k+16, n:n+16]) = K[n:n+16, k:k+16] as col-major
-                     // K is stored row-major as [N, K], so K[n, k] is at K + n*DIM_K + k
-                     wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
-                     
-                     // C = A @ B^T + C
-                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-                 }
-                 
-                 wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
+    // Remainder
+    // 1. K remainder (k >= k_main_loop_end)
+    // 2. M & N dim remainder
+    const int k_main_loop_end = (DIM_K / WMMA_K) * WMMA_K;
+
+    for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
+        int i = idx / k_size; // row (query)
+        int j = idx % k_size; // col (key)
+        
+        bool computed_by_wmma = false;
+        if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+             if (i < (q_size / WMMA_M) * WMMA_M && j < (k_size / WMMA_N) * WMMA_N) {
+                 computed_by_wmma = true;
              }
-         }
-         
-         __syncthreads();
-     }
-     
-     // Handle remainder with standard CUDA cores
-     // This handles: partial tiles, edge cases, and any K dimension remainder
-     for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
-         int i = idx / k_size;
-         int j = idx % k_size;
-         
-         // Skip if already computed by WMMA
-         if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
-             int m_base = (i / WMMA_M) * WMMA_M;
-             int n_base = (j / WMMA_N) * WMMA_N;
-             if (i >= m_base && i < m_base + WMMA_M && 
-                 j >= n_base && j < n_base + WMMA_N && 
-                 m_base < (q_size / WMMA_M) * WMMA_M && 
-                 n_base < (k_size / WMMA_N) * WMMA_N) {
-                 continue;  // Already computed by tensor cores
-             }
-         }
-         
-         float sum = 0.0f;
-         #pragma unroll
-         for (int k = 0; k < DIM_K; k++) {
-             sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
-         }
-         S[i * TILE_N + j] = sum;
-     }
-     __syncthreads();
- }
+        }
+
+        if (computed_by_wmma) { // 1. k dim remainder
+            float sum_remainder = 0.0f;
+            for (int k = k_main_loop_end; k < DIM_K; k++) {
+                sum_remainder += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
+            }
+            S[i * TILE_N + j] += sum_remainder;
+
+        } else { // 2. M/N dim remainder
+            float sum_full = 0.0f;
+            for (int k = 0; k < DIM_K; k++) {
+                sum_full += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
+            }
+            S[i * TILE_N + j] = sum_full;
+        }
+    }
+    __syncthreads();
 \end{lstlisting}
 
 
@@ -442,7 +417,7 @@ The naive implementation relies entirely on HBM and does not utilize shared memo
 
 The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 16 \times 16$ tile layout for Threadblock shape and Warp shape, and $16 \times 16 \times 16$ for instruction shape.
 
-See throughput result in Table~\ref{tab:throughput_comparison} and latency result in Table~\ref{tab:full_comparison}. The speed up rate of Cutlass implementation against Naive implementation indicates Flash Attention is memory bounded\footnote{However, it is quite hard to give a quantitative analysis of speedup without the help of Nsight Compute.}. Another interesting discovery is that the large tile fully utilizing shared memory is not performing as well as small tile. For large tile, the single tile will do more FLOPS, but the concurrency across tiles will be limited. 
+See throughput result in Table~\ref{tab:throughput_comparison} and latency result in Table~\ref{tab:full_comparison}. The speed up rate of Cutlass implementation against Naive implementation indicates Flash Attention is memory bounded\footnote{However, it is quite hard to give a quantitative analysis of speedup without the help of Nsight Compute.}. Another interesting discovery is that the large tile fully utilizing shared memory is not performing as well as small tile. For large tile, the single tile will do more FLOPS, but the concurrency across tiles will be limited. \footnote{I did not managed to achieve the state of art performance as the paper. The P@V is not using Tensor Core yet, and I am having trouble with cutlass layout at this point).}
 
 \begin{table}[htbp]
 \centering
