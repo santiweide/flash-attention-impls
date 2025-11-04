@@ -461,7 +461,135 @@ See throughput result in Table~\ref{tab:throughput_comparison} and latency resul
 \section{PyTorch by Yuxuan Chen}
 
 \section{PyTorch + Triton by Hongyang Cui}
+\subsection{Implementation}
 
+This implementation reproduces FlashAttention-2 in Triton with tile-wise streaming over the key/value sequence and an online softmax. We expose tiling knobs \texttt{BLOCK\_M}, \texttt{BLOCK\_N}, and \texttt{BLOCK\_D} and choose conservative defaults $128\times128\times64$ that fit head dimensions $D\le 128$ while controlling register pressure.
+
+\paragraph{Kernel layout and grid}
+We launch a 2-D grid with $\texttt{program\_id}(0)=b\cdot h$ and $\texttt{program\_id}(1)=\lceil N/\texttt{BLOCK\_M}\rceil$. Each program instance computes a $\texttt{BLOCK\_M}\times D$ output tile for one $(b,h)$. Inside a tile we iterate the key/value axis in blocks of size \texttt{BLOCK\_N}.
+
+\paragraph{Forward pass (online softmax)}
+Given $q\in\mathbb{R}^{M\times D}$, we stream $k,v$ tiles of shape $N\times D$ and maintain per-row running max $m_i$ and normalization $l_i$:
+\[
+m_{ij}=\max\!\bigl(m_i, \max\nolimits_{\text{row}}(qk)\bigr),\quad
+p=\exp(qk-m_{ij}),\quad
+l_{ij}=l_i\cdot e^{\,m_i-m_{ij}}+\sum p,
+\]
+\[
+\alpha=\frac{l_i\cdot e^{\,m_i-m_{ij}}}{l_{ij}},\quad
+\beta=\frac{1}{l_{ij}},\quad
+\mathrm{acc}\leftarrow \alpha\cdot \mathrm{acc}+\beta\cdot (p\,v).
+\]
+A causal mask (if enabled) sets logits above the diagonal to $-\infty$ tile-wise. Inputs $Q,K,V$ are \texttt{fp16}; logits/probabilities/output accumulate in \texttt{fp32}. We use \texttt{num\_warps=4}; forward uses \texttt{num\_stages=2} (double-buffering K/V), backward uses \texttt{num\_stages=1}.
+
+
+
+\paragraph{Precision and numerics}
+Logits, softmax, and output accumulation are in \texttt{fp32}. Masked logits are $-\infty$ before exponentiation; online subtraction by $m_{ij}$ prevents overflow.
+
+\subsection{Validation}
+\label{sec:validation}
+
+\paragraph{Correctness vs.\ SDPA}
+We compare forward outputs to SDPA with identical $\mathrm{scale}=1/\sqrt{D}$ and the same causal setting, reporting $\max\lvert O_{\mathrm{ours}}-O_{\mathrm{sdpa}}\rvert$ typically in the $10^{-3}$ range for $(B,H,N,D)=(1,32,8192,128)$, due to \texttt{fp16} I/O and reduction orders.
+
+\paragraph{Datasets / regimes}
+We test random \texttt{fp16} tensors over $(1,1,512,64)$, $(1,1,1024,64)$, $(1,1,2048,64)$, $(1,1,4096,64)$, $(1,1,8192,64)$ and multi-head $(1,32,8192,\{32,64,128\})$.
+
+\paragraph{Corner cases}
+\begin{itemize}
+  \item Head dim constraints: $D\le 128$ and $D\bmod 16=0$; \texttt{BLOCK\_D}$\mid D$.
+  \item Boundary tiles masked on loads/stores and for causal comparisons.
+  \item Warmup iterations to hide one-time costs in timing.
+\end{itemize}
+
+\subsection{Depth Complexity}
+
+Let $T_r=\lceil N/B_r\rceil$ and $T_c=\lceil N/B_c\rceil$, with $B_r=\texttt{BLOCK\_M}$ and $B_c=\texttt{BLOCK\_N}$. Each program instance (a query tile) must iterate sequentially across all $T_c$ K/V tiles, with near-constant in-tile reduction depth. Thus
+\[
+D_{\mathrm{FA2}}=\mathcal{O}(T_c)\approx \mathcal{O}(N/B_c)=\mathcal{O}(N),
+\]
+reflecting the streaming design (contrast with $\mathcal{O}(N^2)$ work of naive attention).
+
+\subsection{Shared Memory Access}
+\label{sec:mem-acc}
+
+This Triton kernel avoids explicit shared memory; tiles are loaded into registers, with software pipelining via \texttt{num\_stages}. Main register-resident arrays per program:
+\begin{itemize}
+  \item $\mathbf{q}$: $\texttt{BLOCK\_M}\times \texttt{BLOCK\_D}$ in \texttt{fp16}, loaded once per output tile.
+  \item $\mathrm{acc}$: $\texttt{BLOCK\_M}\times \texttt{BLOCK\_D}$ in \texttt{fp32}.
+  \item $m_i, l_i$: vectors of length $\texttt{BLOCK\_M}$ in \texttt{fp32}.
+  \item Per K/V iteration: $\mathbf{k},\mathbf{v}$ of size $\texttt{BLOCK\_N}\times \texttt{BLOCK\_D}$ (load--use--discard).
+\end{itemize}
+Global-memory traffic per output tile (forward), with $M=\texttt{BLOCK\_M}$, $N=\texttt{BLOCK\_N}$, $D=\texttt{BLOCK\_D}$:
+\[
+\text{Loads: }Q: M D\cdot 2;\quad K: N_{\mathrm{ctx}} D\cdot 2;\quad V: N_{\mathrm{ctx}} D\cdot 2.
+\]
+\[
+\text{Stores: }O: M D\cdot 2;\quad M,L: M\cdot 4 + M\cdot 4.
+\]
+(Units are bytes; \texttt{fp16}$=2$, \texttt{fp32}$=4$.) 
+
+\subsection{Evaluation and Results}
+
+All tests are run with CUDA events, $10$ warmup iterations, and synchronized streams. We report forward  latency and TFLOPs/s.\vspace{2mm}
+
+
+
+\begin{table}[htbp]
+\centering
+\caption{Forward Latency and Throughput Comparison: FA2 (Triton) vs. SDPA (PyTorch Baseline)}
+\label{tab:fa2_vs_sdpa}
+\sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
+\begin{tabular}{@{}l l S[table-format=4.2] S[table-format=4.2] S[table-format=8.2] S[table-format=4.2] S[table-format=2.2]@{}}
+\toprule
+\textbf{Config (B,H,N,D)} & \textbf{Backend} & \multicolumn{1}{c}{\textbf{Latency (ms)}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Tokens/s}} & \multicolumn{1}{c}{\textbf{Memory (MB)}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
+\midrule
+(1, 1, 512, 64) & SDPA & 0.09 & 0.79 & 6005284.72 & 0.8 & — \\
+& Triton & 0.23 & 0.30 & 2234782.61 & 0.77 & 0.39× \\
+\midrule
+(1, 1, 1024, 64) & SDPA & 0.09 & 3.11 & 11849745.32 & 2.0 & — \\
+& Triton & 0.29 & 0.94 & 3531378.10 & 1.96 & 0.30× \\
+\midrule
+(1, 1, 2048, 64) & SDPA & 0.09 & 12.53 & 23906287.58 & 4.0 & — \\
+& FA2 & 0.32 & 3.31 & 6400000.00 & 3.88 & 0.26× \\
+\midrule
+(1, 1, 4096, 64) & SDPA & 0.09 & 46.87 & 44702726.42 & 7.1 & — \\
+& FA2 & 0.43 & 9.96 & 9500000.00 & 7.00 & 0.21× \\
+\midrule
+(1, 1, 8192, 64) & SDPA & 0.14 & 124.66 & 59444197.33 & 14.1 & — \\
+& FA2 & 0.71 & 24.14 & 11538732.39 & 13.90 & 0.19× \\
+\midrule
+(1, 32, 8192, 32) & SDPA & 1.43 & 192.24 & 5729345.72 & 192.0 & — \\
+& FA2 & 4.14 & 66.42 & 1980388.41 & 190.0 & 0.35× \\
+\midrule
+(1, 32, 8192, 64) & SDPA & 2.00 & 274.28 & 4087137.79 & 384.0 & — \\
+& FA2 & 7.65 & 71.88 & 1038084.31 & 380.0 & 0.26× \\
+\midrule
+(1, 32, 8192, 128) & SDPA & 3.53 & 311.45 & 2320468.27 & 768.0 & — \\
+& FA2 & 7.50 & 146.65 & 1086400.00 & 760.0 & 0.47× \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Sensitivity to Parameters and Optimizations}
+\label{sec:params}
+
+\paragraph{Tile sizes \texttt{BLOCK\_M}, \texttt{BLOCK\_N}}
+Larger \texttt{BLOCK\_N} reduces the number of K/V iterations $\propto N/\texttt{BLOCK\_N}$ and the online-softmax update frequency, but increases per-iteration tile footprint. Larger \texttt{BLOCK\_M} amortizes $K,V$ loads across more queries but enlarges $\mathrm{acc}$ and stats $(m_i,l_i)$, potentially lowering occupancy.
+
+\paragraph{\texttt{BLOCK\_D} (per-thread sequential work)}
+Increasing \texttt{BLOCK\_D} improves math/byte ratio and reduces loop overhead but raises register usage for $\mathbf{q}$ and $\mathrm{acc}$. In practice, $64$ or $128$ are robust for $D\in\{64,128\}$.
+
+\paragraph{\texttt{num\_warps} / \texttt{num\_stages}}
+\texttt{num\_warps}$=4$ balances ILP and occupancy. Forward with \texttt{num\_stages}$=2$ overlaps global-memory latency with compute (double-buffering). Backward uses \texttt{num\_stages}$=1$ to ease register pressure alongside atomics.
+
+\paragraph{Baselines}
+Naive attention is memory-bound and materializes $N\times N$ scores. Our streaming FA2 avoids quadratic memory traffic. SDPA parity confirms numerical correctness; performance differences stem from differing fusion/tiling choices.
+
+\subsubsection{Idealized Bandwidth/Compute Considerations}
+
+Per $(b,h)$, forward loads $Q$ once, streams all $K,V$ tiles, and stores $O$ and $(M,L)$. Arithmetic intensity improves with $N$ since the same $Q$ participates in many $qk$ and $pv$ operations while per-tile overheads are constant. The remaining gap to peak (especially end-to-end) comes from (i) softmax reductions and exponentials, (ii) atomic stores to $dK,dV$, (iii) register-pressure limits on occupancy, and (iv) masking/control flow at ragged edges.
 
 \bibliography{custom}
 

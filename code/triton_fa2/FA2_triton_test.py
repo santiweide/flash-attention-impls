@@ -1,22 +1,14 @@
-# FA2_triton_bench.py
+# FA2_triton_bench_multi_config.py
 import math
 import contextlib
 import torch
 import triton
 import triton.language as tl
 
-# ========= Test Spec =========
-NUM_HEADS = 32
-HEAD_DIM   = 128          # 每头维度 = 128（满足 D % 16 == 0 且 D <= 128）
-SEQLEN     = 8192
-BATCH      = 1
-DTYPE      = torch.float16
-CAUSAL     = True
-
 # ========= Kernel Tiles (safe defaults) =========
 BLOCK_M = 128        # query rows per block
 BLOCK_N = 128        # key cols per block
-BLOCK_D = 64        # must divide HEAD_DIM; <= 128
+BLOCK_D = 64         # must divide HEAD_DIM; <= 128
 
 # ======================================
 # Forward kernel (online softmax)
@@ -182,7 +174,6 @@ class _FlashAttnFn(torch.autograd.Function):
         softmax_scale = 1.0 / math.sqrt(D)
 
         grid = (B * H, triton.cdiv(N, BLOCK_M))
-        torch.cuda.nvtx.range_push("FA2_FWD")
         _fwd_kernel[grid](
             q, k, v, o, m, l,
             B, H, N, D,
@@ -195,9 +186,8 @@ class _FlashAttnFn(torch.autograd.Function):
             softmax_scale,
             is_causal=causal,
             BLOCK_M_=BLOCK_M, BLOCK_N_=BLOCK_N, BLOCK_D_=min(BLOCK_D, D),
-            num_warps=4, num_stages=2,  # forward: double-buffer
+            num_warps=4, num_stages=2,
         )
-        torch.cuda.nvtx.range_pop()
 
         ctx.save_for_backward(q, k, v, m, l)
         ctx.causal = causal
@@ -214,7 +204,6 @@ class _FlashAttnFn(torch.autograd.Function):
         softmax_scale = 1.0 / math.sqrt(D)
 
         grid = (B * H, triton.cdiv(N, BLOCK_M))
-        torch.cuda.nvtx.range_push("FA2_BWD")
         _bwd_kernel[grid](
             q, k, v, do, dQ, dK, dV, m, l,
             B, H, N, D,
@@ -230,9 +219,8 @@ class _FlashAttnFn(torch.autograd.Function):
             softmax_scale,
             is_causal=ctx.causal,
             BLOCK_M_=BLOCK_M, BLOCK_N_=BLOCK_N, BLOCK_D_=min(BLOCK_D, D),
-            num_warps=4, num_stages=1,  # backward: single-buffer to save smem
+            num_warps=4, num_stages=1,
         )
-        torch.cuda.nvtx.range_pop()
         return dQ, dK, dV, None
 
 
@@ -266,60 +254,17 @@ def measure_latency(func, warmup=10, iters=100):
         "iters": iters,
     }
 
-def try_max_batch(base_B=1, H=NUM_HEADS, N=SEQLEN, D=HEAD_DIM, dtype=DTYPE, causal=CAUSAL):
-    device = "cuda"
-    low, high = 1, base_B
-    # grow until OOM
-    while True:
-        try:
-            q = torch.randn(high, H, N, D, device=device, dtype=dtype, requires_grad=True)
-            k = torch.randn_like(q)
-            v = torch.randn_like(q)
-            o = flash_attention(q, k, v, causal=causal)
-            loss = o.float().pow(2).mean(); loss.backward()
-            del q, k, v, o, loss
-            torch.cuda.empty_cache()
-            low = high
-            high *= 2
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                break
-            else:
-                raise
-    # binary search in (low, high)
-    L, R = low, high - 1
-    best = L
-    while L <= R:
-        mid = (L + R) // 2
-        try:
-            q = torch.randn(mid, H, N, D, device=device, dtype=dtype, requires_grad=True)
-            k = torch.randn_like(q); v = torch.randn_like(q)
-            o = flash_attention(q, k, v, causal=causal)
-            loss = o.float().pow(2).mean(); loss.backward()
-            del q, k, v, o, loss
-            torch.cuda.empty_cache()
-            best = mid
-            L = mid + 1
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                R = mid - 1
-            else:
-                raise
-    return best
-
-def sdpa_reference(q, k, v, causal=False):
-    # q,k,v: (B,H,N,D) -> (B*H, N, D)
-    B, H, N, D = q.shape
-    scale = 1.0 / math.sqrt(D)
-    q2 = q.reshape(B*H, N, D).to(torch.float32)
-    k2 = k.reshape(B*H, N, D).to(torch.float32)
-    v2 = v.reshape(B*H, N, D).to(torch.float32)
-    # PyTorch SDPA expects (B*H, N, D)
-    attn_mask = None
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q2, k2, v2, attn_mask=attn_mask, is_causal=causal, scale=scale
-    )
-    return out.reshape(B, H, N, D).to(q.dtype)
+def calculate_flops(B, H, N, D, is_fwd_only=True):
+    """
+    Calculate FLOPs for attention
+    Forward: 4*B*H*N^2*D (Q@K^T, softmax, P@V, and extra ops)
+    Backward: ~2x forward
+    """
+    fwd_flops = 4 * B * H * N * N * D
+    if is_fwd_only:
+        return fwd_flops
+    else:
+        return 3 * fwd_flops  # forward + backward
 
 # =========================
 # Main
@@ -327,49 +272,122 @@ def sdpa_reference(q, k, v, causal=False):
 if __name__ == "__main__":
     torch.manual_seed(0)
     device = "cuda"
+    DTYPE = torch.float16
+    CAUSAL = True
 
-    B, H, N, D = BATCH, NUM_HEADS, SEQLEN, HEAD_DIM
-    assert D == 128 and H == 32 and N == 8192 and B == 1, "初始延迟测试参数需满足规范"
+    # 定义测试配置 (B, H, N, D)
+    test_configs = [
+        (1, 1, 512, 64),
+        (1, 1, 1024, 64),
+        (1, 1, 2048, 64),
+        (1, 1, 4096, 64),
+        (1, 1, 8192, 64),
+        (1, 32, 8192, 32),
+        (1, 32, 8192, 64),
+        (1, 32, 8192, 128),
+    ]
 
-    q = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
-    k = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
-    v = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
+    print("="*100)
+    print("Flash Attention Performance Benchmark")
+    print("="*100)
+    print(f"Configuration: DTYPE={DTYPE}, CAUSAL={CAUSAL}")
+    print(f"Block sizes: BLOCK_M={BLOCK_M}, BLOCK_N={BLOCK_N}, BLOCK_D={BLOCK_D}")
+    print("="*100)
+    print()
 
-    # Correctness check vs SDPA (forward only)
-    with torch.no_grad():
-        ref = sdpa_reference(q, k, v, causal=CAUSAL)
-        our = flash_attention(q, k, v, causal=CAUSAL)
-        max_abs = (our - ref).abs().max().item()
-    print(f"[Correctness] max_abs_diff_vs_sdpa: {max_abs:.4e}")
+    results = []
 
-    # Latency: forward
-    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-    f_metrics = measure_latency(lambda: flash_attention(q, k, v, causal=CAUSAL), warmup=10, iters=100)
-    peak_mem_fwd = torch.cuda.max_memory_allocated()
-    tokens = B * H * N
-    print(f"[Latency|Forward] mean={f_metrics['mean_ms']:.3f} ms "
-          f"(std={f_metrics['std_ms']:.3f}, iters={f_metrics['iters']}), "
-          f"throughput={tokens / (f_metrics['mean_ms']/1e3):.1f} tokens/s, "
-          f"peak_mem={peak_mem_fwd/1e6:.1f} MB")
+    for config_idx, (B, H, N, D) in enumerate(test_configs, 1):
+        print(f"[{config_idx}/{len(test_configs)}] Testing Config (B={B}, H={H}, N={N}, D={D})")
+        print("-" * 80)
 
-    # Latency: end-to-end (fwd+bwd)
-    def fwd_bwd():
-        o = flash_attention(q, k, v, causal=CAUSAL)
-        loss = o.float().pow(2).mean()
-        loss.backward()
-        for t in (q, k, v):
-            if t.grad is not None:
-                t.grad.zero_()
-        return o
+        # Create tensors
+        q = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
+        k = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
+        v = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
 
-    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-    e2e_metrics = measure_latency(fwd_bwd, warmup=10, iters=50)
-    peak_mem_e2e = torch.cuda.max_memory_allocated()
-    print(f"[Latency|Fwd+Bwd] mean={e2e_metrics['mean_ms']:.3f} ms "
-          f"(std={e2e_metrics['std_ms']:.3f}, iters={e2e_metrics['iters']}), "
-          f"throughput={tokens / (e2e_metrics['mean_ms']/1e3):.1f} tokens/s, "
-          f"peak_mem={peak_mem_e2e/1e6:.1f} MB")
+        # Forward only test
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        try:
+            fwd_metrics = measure_latency(
+                lambda: flash_attention(q, k, v, causal=CAUSAL), 
+                warmup=10, 
+                iters=100
+            )
+            peak_mem_fwd = torch.cuda.max_memory_allocated()
+            
+            # Calculate throughput
+            fwd_flops = calculate_flops(B, H, N, D, is_fwd_only=True)
+            fwd_time_s = fwd_metrics['mean_ms'] / 1000.0
+            fwd_tflops = (fwd_flops / fwd_time_s) / 1e12
+            
+            print(f"  Forward:  {fwd_metrics['mean_ms']:.2f} ms ± {fwd_metrics['std_ms']:.2f} | "
+                  f"{fwd_tflops:.2f} TFLOPs/s | Mem: {peak_mem_fwd/1e6:.1f} MB")
+            
+        except RuntimeError as e:
+            print(f"  Forward:  FAILED - {e}")
+            fwd_metrics = None
+            fwd_tflops = 0
+            peak_mem_fwd = 0
 
-    # Max batch size search (optional)
-    max_b = try_max_batch(base_B=1, H=H, N=N, D=D, dtype=DTYPE, causal=CAUSAL)
-    print(f"[MaxBatch] max_batch_size at (H={H}, N={N}, D={D}, dtype={DTYPE}): {max_b}")
+        # Forward + Backward test
+        def fwd_bwd():
+            o = flash_attention(q, k, v, causal=CAUSAL)
+            loss = o.float().pow(2).mean()
+            loss.backward()
+            for t in (q, k, v):
+                if t.grad is not None:
+                    t.grad.zero_()
+            return o
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        try:
+            e2e_metrics = measure_latency(fwd_bwd, warmup=10, iters=50)
+            peak_mem_e2e = torch.cuda.max_memory_allocated()
+            
+            # Calculate throughput
+            e2e_flops = calculate_flops(B, H, N, D, is_fwd_only=False)
+            e2e_time_s = e2e_metrics['mean_ms'] / 1000.0
+            e2e_tflops = (e2e_flops / e2e_time_s) / 1e12
+            
+            print(f"  Fwd+Bwd:  {e2e_metrics['mean_ms']:.2f} ms ± {e2e_metrics['std_ms']:.2f} | "
+                  f"{e2e_tflops:.2f} TFLOPs/s | Mem: {peak_mem_e2e/1e6:.1f} MB")
+            
+        except RuntimeError as e:
+            print(f"  Fwd+Bwd:  FAILED - {e}")
+            e2e_metrics = None
+            e2e_tflops = 0
+            peak_mem_e2e = 0
+
+        results.append({
+            'config': f"({B}, {H}, {N}, {D})",
+            'B': B, 'H': H, 'N': N, 'D': D,
+            'fwd_ms': fwd_metrics['mean_ms'] if fwd_metrics else float('inf'),
+            'fwd_tflops': fwd_tflops,
+            'fwd_mem_mb': peak_mem_fwd / 1e6,
+            'e2e_ms': e2e_metrics['mean_ms'] if e2e_metrics else float('inf'),
+            'e2e_tflops': e2e_tflops,
+            'e2e_mem_mb': peak_mem_e2e / 1e6,
+        })
+        
+        print()
+
+    # Summary table
+    print("="*100)
+    print("SUMMARY TABLE")
+    print("="*100)
+    print(f"{'Config (B,H,N,D)':<20} {'Fwd(ms)':<12} {'Fwd TFLOPs/s':<14} {'E2E(ms)':<12} {'E2E TFLOPs/s':<14}")
+    print("-"*100)
+    
+    for r in results:
+        print(f"{r['config']:<20} "
+              f"{r['fwd_ms']:>10.2f}   "
+              f"{r['fwd_tflops']:>12.2f}   "
+              f"{r['e2e_ms']:>10.2f}   "
+              f"{r['e2e_tflops']:>12.2f}")
+    
+    print("="*100)

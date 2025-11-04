@@ -6,13 +6,12 @@ import triton
 import triton.language as tl
 
 # ========= Test Spec =========
-NUM_HEADS = 16
-HIDDEN_SIZE = 512
-HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
-SEQLEN = 1024
-BATCH = 1
-DTYPE = torch.float16
-CAUSAL = True
+NUM_HEADS = 32
+HEAD_DIM   = 128        
+SEQLEN     = 8192
+BATCH      = 1
+DTYPE      = torch.float16
+CAUSAL     = True
 
 # ========= Kernel Tiles (safe defaults) =========
 BLOCK_M = 128        # query rows per block
@@ -330,7 +329,7 @@ if __name__ == "__main__":
     device = "cuda"
 
     B, H, N, D = BATCH, NUM_HEADS, SEQLEN, HEAD_DIM
-    assert D == 32 and H == 16 and N == 1024 and B == 1, "初始延迟测试参数需满足规范"
+    assert D == 128 and H == 32 and N == 8192 and B == 1, "初始延迟测试参数需满足规范"
 
     q = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
     k = torch.randn(B, H, N, D, device=device, dtype=DTYPE, requires_grad=True)
