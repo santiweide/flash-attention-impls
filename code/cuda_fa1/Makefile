@@ -7,22 +7,19 @@ SRC    := flashAttention.cu
 MAIN_SRC := main.cu
 
 B     := 1
-H     := 32
-N     := 8192
-D     := 128
+H     := 1
+N     := 4096
+D     := 64
 M     := 16384
-RUNS  := 10
+RUNS  := 1
 
-all: $(TARGET) $(MAIN_TARGET)
-
-$(TARGET): $(SRC)
-	$(NVCC) $(FLAGS) $< -o $@
+.DEFAULT_GOAL := all
 
 $(MAIN_TARGET): $(MAIN_SRC) $(SRC)
 	$(NVCC) $(FLAGS) $(MAIN_SRC) $(SRC) -o $@
 
-run: $(TARGET)
-	@./$(TARGET) $(B) $(H) $(N) $(D) $(M) $(RUNS)
+all: $(MAIN_TARGET)
+	@./$(MAIN_TARGET)
 
 run_main: $(MAIN_TARGET)
 	@./$(MAIN_TARGET) $(B) $(H) $(N) $(D) $(M) $(RUNS)

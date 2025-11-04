@@ -49,18 +49,15 @@ __global__ void flash_attention_forward(
     __half* Kj = Qi + Br * d;
     __half* Vj = Kj + Bc * d;
     
-    // O_accum: 使用float累积器，只在最后转换为half_t
     float* O_accum = (float*)(Vj + Bc * d);
 
 
-    // 预加载当前 Q tile 到共享内存 Qi
     for (int t = threadIdx.x; t < br_size * d; t += blockDim.x) {
         int r = t / d;
         int c = t % d;
         Qi[r*d + c] = Q_bh[(qi_start + r)*d + c];
     }
     
-    // 初始化 O_accum 为 0（使用float精度）
     for (int t = threadIdx.x; t < br_size * d; t += blockDim.x) {
         O_accum[t] = 0.0f;
     }
@@ -93,13 +90,13 @@ __global__ void flash_attention_forward(
 
             float s_scores[128];
             float m_til = -1e9f;
-            float scale = 1.0f / sqrtf((float)d);  // 添加缩放因子 1/sqrt(d)
+            float scale = 1.0f / sqrtf((float)d); 
             for (int c = 0; c < bc_size; ++c) {
                 float s = 0.0f;
                 for (int t = 0; t < d; ++t) {
                     s += q_row[t] * __half2float(Kj[c*d + t]);
                 }
-                s_scores[c] = s * scale;  // 应用缩放因子
+                s_scores[c] = s * scale; 
                 if (s_scores[c] > m_til) m_til = s_scores[c];
             }
 
@@ -119,18 +116,14 @@ __global__ void flash_attention_forward(
             float b = expf(m_til - m_new);
             float l_new = a * l_row + b * l_til;
 
-            // 更新O_accum：先应用correction，再累加新的值
-            float correction = a;  // exp(m_row - m_new)
+            float correction = a;  
             for (int col = 0; col < d; ++col) {
-                // 应用correction到已有的累积值
                 O_accum[r * d + col] *= correction;
                 
-                // 计算新的贡献
                 float acc = 0.0f;
                 for (int c = 0; c < bc_size; ++c) {
                     acc += P_til[c] * __half2float(Vj[c*d + col]);
                 }
-                // 累加新值
                 O_accum[r * d + col] += b * acc;
             }
 
@@ -140,7 +133,6 @@ __global__ void flash_attention_forward(
         __syncthreads();
     }
     
-    // 最终归一化并写回（只在最后转换一次half_t，减少精度损失）
     for (int r = threadIdx.x; r < br_size; r += blockDim.x) {
         int gi = qi_start + r;
         float scale = (l_bh[gi] == 0.0f) ? 0.0f : 1.0f / l_bh[gi];

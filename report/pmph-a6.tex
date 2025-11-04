@@ -221,7 +221,11 @@ We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to se
 % 3) evaluation: performance should be evaluated for various datasets; is the performance sensitive to dataset characteristics?  (at least to size it should). Evaluate the impact of various parameters, such as Q (the number of elements processed sequentially per thread), B the block size, etc. Evaluate the impact of optimizations and compare with state of the art approaches, and if possible with ideal performace (ideal peak bandwidth performance). 
 
 \section{CUDA by sxd343}
-
+\subsection{Running Instructions}
+\begin{lstlisting}
+    make % run all configurations
+    make run_main B=1 H=1 N=512 D=64 M=128 RUNS=1 % run specific configuration
+\end{lstlisting}
 \subsection{Implementation}
 I implemented a CUDA FlashAttention kernel that uses FP16 for inputs/outputs, based on Algorithm 1 in \cite{dao2022flashattention}. It performs all computations and accumulation in FP32, and casts back to FP16 only once at the end for numerical stability. 
 \paragraph{Kernel Parameters}
@@ -292,20 +296,20 @@ The test dataset consists of FP16 random matrices used to fill Q, K, and V.
 \centering
 \caption{Latency and Throughput Comparison for CUDA FlashAttention by sxd343}
 \label{tab:latency_throughput_comparison}
-\sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
+\sisetup{table-number-alignment=center, round-mode=places, round-precision=3}
 \begin{tabular}{@{}l S[table-format=4.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2]@{}}
   \toprule
   & & \multicolumn{2}{c}{\textbf{Latency(ms)}} & \multicolumn{2}{c}{\textbf{Throughput(TFLOPs/s)}} \\
   \cmidrule(lr){2-4} \cmidrule(lr){5-7}
   \textbf{Config (B, H, N, D)} & \mcc{\textbf{Baseline}} & \mcc{\textbf{FlashAttention}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Baseline}} & \mcc{\textbf{FlashAttention}} & \mcc{\textbf{Speedup}} \\
   \midrule
-  (1, 1, 512, 64)      & 13.70  & 1.71 & 8.01x & 0.005 & 0.04 & 8x \\
-  (1, 1, 1024, 64)     & 27.74  & 3.42 & 8.11x & 0.01 & 0.079 & 7.9x \\
-  (1, 1, 2048, 64)     & 55.10  & 6.85 & 8.05x & 0.019 & 0.157 & 8.2x \\
-  (1, 1, 4096, 64)    & 121.77  & 13.68 & 8.90x & 0.035 & 0.314 & 8.97x \\
-  (1, 32, 8192, 32)   & 1165.02 & 266.11 & 4.38x & 0.236 & 1.033 & 4.38x \\
-  (1, 32, 8192, 64)   & 2353.35 & 492.03 & 4.78x & 0.234 & 1.117 & 4.77x \\
-  (1, 32, 8192, 128)  & 4507.89 & 1515.19 & 2.91x & 0.244 & 0.726 & 3.00x \\
+  (1, 1, 512, 64)      & 13.70  & 1.71 & 8.01 & 0.005 & 0.04 & 8.00 \\
+  (1, 1, 1024, 64)     & 27.74  & 3.42 & 8.11 & 0.01 & 0.079 & 7.90 \\
+  (1, 1, 2048, 64)     & 55.10  & 6.85 & 8.05 & 0.019 & 0.157 & 8.20 \\
+  (1, 1, 4096, 64)    & 121.77  & 13.68 & 8.90 & 0.035 & 0.314 & 8.97 \\
+  (1, 32, 8192, 32)   & 1165.02 & 266.11 & 4.38 & 0.236 & 1.033 & 4.38 \\
+  (1, 32, 8192, 64)   & 2353.35 & 492.03 & 4.78 & 0.234 & 1.117 & 4.77 \\
+  (1, 32, 8192, 128)  & 4507.89 & 1515.19 & 2.91 & 0.244 & 0.726 & 3.00 \\
   \bottomrule
   \end{tabular}
 \end{table}
