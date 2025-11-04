@@ -459,6 +459,117 @@ See throughput result in Table~\ref{tab:throughput_comparison} and latency resul
 \end{table}
 
 \section{PyTorch by Yuxuan Chen}
+\subsection{Implementation}
+
+This report documents a reproducible microbenchmark that compares \textbf{FlashAttention-2 (FA2)}\footnote{Invoked via \texttt{flash\_attn\_qkvpacked\_func} if available.} against \textbf{PyTorch Scaled Dot-Product Attention (SDPA)}. The harness measures latency, tokens/s throughput, and peak CUDA memory under controlled shapes and dtypes, and can also search the maximum stable batch size before out-of-memory (OOM).
+
+\paragraph{Interfaces and Tensor Layouts}
+\begin{itemize}
+\item \textbf{FA2 path:} expects a single packed tensor $qkv \in \mathbb{R}^{B \times S \times 3 \times H \times D}$ and returns the attention output in the same packed convention.
+\item \textbf{SDPA path:} requires separate $q, k, v \in \mathbb{R}^{B \times H \times S \times D}$. We therefore permute from $[B,S,H,D] \rightarrow [B,H,S,D]$ and call \texttt{contiguous()} to ensure compact layout, which introduces an extra materialization cost relative to FA2’s packed path.
+\end{itemize}
+
+\paragraph{AMP and Precision}
+We default to \textbf{BF16} autocast (\texttt{torch.cuda.amp.autocast(enabled=True, dtype=\{bf16|fp16\})}). BF16 is typically more numerically stable than FP16 while still activating tensor cores on modern GPUs. All reductions and the \texttt{total\_sum\_guard} checksum are computed in FP32 to avoid cancellation or overflow.
+
+\paragraph{Warmup, Timing, and Guard Value}
+We separate warmup ($W$ iters) from measurement ($T$ iters). The \emph{Guard value (sum)} is a checksum of the output tensor in FP32 ($\sum O$) to prevent dead-code elimination and to expose silent NaN/INF regressions across runs. Small drift across runs is expected with low-precision math, but large deviations indicate numerical or correctness issues.
+
+\paragraph{Batch Search for Capacity}
+The utility \texttt{find\_max\_batch} doubles $B$ until an OOM or CUDA error occurs, returning the last stable $B$ for the requested $(H,S,D)$ and backend. This maps memory ceilings for different shapes and dtypes.
+
+\subsection{Validation}
+
+\paragraph{Rationale}
+We validate functional equivalence by cross-checking FA2 vs.\ SDPA outputs under identical random seeds and shapes:
+\[
+\text{max\_abs\_diff} = \max |O_{\text{FA2}} - O_{\text{SDPA}}|, \qquad
+\text{rel\_err} = \frac{\|O_{\text{FA2}} - O_{\text{SDPA}}\|_2}{\|O_{\text{SDPA}}\|_2 + \epsilon}.
+\]
+Acceptable tolerances depend on dtype (BF16/FP16) and sequence length; values in the range $10^{-3}$–$10^{-2}$ are typical for long-sequence attention in low precision.
+
+\paragraph{Datasets}
+We use \textbf{synthetic} inputs ($q,k,v \sim \mathcal{N}(0,1)$) to avoid data-dependent branching and to stress uniform memory access patterns. Shapes sweep:
+\[
+(B,H,N,D) \in \{(1,1,N,64), (1,32,8192,D)\}, \quad N \in \{512,1024,2048,4096,8192\}, \ D \in \{32,64,128\}.
+\]
+
+\paragraph{Corner Cases}
+\begin{itemize}
+\item \textbf{Causal masking:} enabling the \texttt{--causal} flag increases control-flow divergence; both causal and non-causal paths are validated.
+\item \textbf{Head dimension alignment:} some kernels prefer $D$ multiples of $8$ or $16$; misaligned $D$ may reduce tensor-core efficiency.
+\item \textbf{Dropout and scaling:} tests use \texttt{dropout=0.0} and default scaling; adding dropout introduces RNG overhead.
+\item \textbf{Dtype drift:} FP16 may show larger max-abs-diff than BF16; ensure no NaNs in guard value.
+\end{itemize}
+
+\subsection{Shared and Global Memory Usage}
+
+Although we call library kernels (FA2/SDPA) rather than writing our own, we can reason about global memory traffic per forward pass ignoring caching effects:
+\[
+\text{Bytes}_{\text{in}} \approx (BHN D)_Q + (BHN D)_K + (BHN D)_V,
+\]
+\[
+\text{Bytes}_{\text{out}} \approx BHN D.
+\]
+Thus, a lower bound on traffic is $4 \cdot BHND \cdot \text{sizeof(dtype)}$. For BF16/FP16, $\text{sizeof}=2$ bytes; for FP32 internal accumulation, registers and shared memory usage increase but do not directly contribute to HBM traffic.
+
+\paragraph{Layout Effects}
+\begin{itemize}
+\item \textbf{FA2:} $qkv$ is constructed by stacking $q,k,v$ as views (\texttt{torch.stack}); this allocates a new packed buffer of size $3 \cdot BHND$, a one-time copy per run.
+\item \textbf{SDPA:} \texttt{permute(...).contiguous()} materializes separate compact $q,k,v$ tensors, adding three copies of size $BHND$ before kernel launch.
+\end{itemize}
+
+\paragraph{Registers and Shared Memory}
+\begin{itemize}
+\item \textbf{FA2 kernels:} fuse attention pipeline ($QK^{\top}$, online softmax, $PV$) with high on-chip reuse (shared-memory tiles and register accumulators) to minimize HBM traffic.
+\item \textbf{SDPA kernels:} use backend-selected fusion and tiling, with register/shared memory footprint depending on hardware and sequence length.
+\end{itemize}
+
+
+
+\subsection{Results}
+We report average latency (ms/iter), throughput (tokens/s, where tokens $=B \times S$), peak CUDA memory (MB), and a guard checksum. TFLOPs/s are computed from arithmetic intensity where available.
+\begin{table}[htbp]
+\centering
+\caption{Throughput and Latency: FA2 vs. SDPA}
+\label{tab:fa2_sdpa_perf}
+\begin{tabular}{@{}l l r r r r@{}}
+\toprule
+\textbf{Config (B,H,N,D)} & \textbf{Backend} & \textbf{Latency (ms)} & \textbf{TFLOPs/s} & \textbf{Tokens/s} & \textbf{Memory (MB)} \\
+\midrule
+(1,1,512,64) & FA2 & 0.09 & 0.78 & 5{,}933{,}309 & 0.8 \\
+(1,1,1024,64) & FA2 & 0.09 & 3.11 & 11{,}858{,}176 & 2.0 \\
+(1,1,2048,64) & FA2 & 0.09 & 11.75 & 22{,}406{,}452 & 4.0 \\
+(1,1,4096,64) & FA2 & 0.13 & 34.27 & 32{,}679{,}739 & 7.1 \\
+(1,1,8192,64) & FA2 & 0.21 & 82.23 & 39{,}209{,}920 & 14.1 \\
+(1,32,8192,64) & FA2 & 1.99 & 275.99 & 4{,}112{,}624 & 384.0 \\
+(1,32,8192,128) & FA2 & 3.53 & 311.28 & 2{,}319{,}196 & 768.0 \\
+\midrule
+(1,1,512,64) & SDPA & 0.09 & 0.79 & 6{,}005{,}284 & 0.8 \\
+(1,1,1024,64) & SDPA & 0.09 & 3.11 & 11{,}849{,}745 & 2.0 \\
+(1,1,2048,64) & SDPA & 0.09 & 12.53 & 23{,}906{,}287 & 4.0 \\
+(1,1,4096,64) & SDPA & 0.09 & 46.87 & 44{,}702{,}726 & 7.1 \\
+(1,1,8192,64) & SDPA & 0.14 & 124.66 & 59{,}444{,}197 & 14.1 \\
+(1,32,8192,128) & SDPA & 3.53 & 311.45 & 2{,}320{,}468 & 768.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Observations}
+\begin{itemize}
+\item Scaling with $N$: Both backends scale linearly in softmax depth but show super-linear throughput gains from better occupancy.
+\item Head count and $D$: Increasing $H$ and $D$ increases arithmetic intensity but raises register pressure.
+\item Backend crossover: SDPA achieves high tokens/s at small $B$, FA2 remains competitive for long-sequence workloads.
+\end{itemize}
+
+\subsection{Ideal Performance and Sensitivity}
+
+Ignoring reuse, traffic $\approx 4BHND \times \text{sizeof(dtype)}$. The ideal roofline throughput upper bound is:
+\[
+\text{Throughput}_{\text{ideal}} \le \frac{\text{HBM Bandwidth}}{\text{Bytes per Token}}.
+\]
+FA2 and SDPA both approach compute-bound regions for favorable shapes, but remain bandwidth-limited for very long sequences.
+
 
 \section{PyTorch + Triton by Hongyang Cui}
 \subsection{Implementation}
