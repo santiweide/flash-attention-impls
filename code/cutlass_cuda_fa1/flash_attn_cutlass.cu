@@ -158,37 +158,96 @@ __device__ __forceinline__ void cutlass_gemm_qk(
 }
  // Wrapper for P @ V using WMMA Tensor Cores
  // P is float, V is half_t - need to convert P to half for WMMA
- template<int TILE_M, int TILE_N, int DIM_K>
- __device__ __forceinline__ void cutlass_gemm_pv(
-     const float* P,               // [TILE_M, TILE_N]
-     const cutlass::half_t* V,    // [TILE_N, DIM_K]
-     float* O,                     // [TILE_M, DIM_K]
-     int q_size,                   // Valid rows (≤ TILE_M)
-     int k_size                    // Valid cols (≤ TILE_N)
- ) {
-     // Note: P @ V is more complex because P is in float, not half
-     // For maximum performance, would need to keep P in half
-     // For now, use CUDA cores for simplicity and correctness
-     
-     // WMMA requires FP16 inputs, but P (attention probs) are in FP32
-     // Converting would add overhead, so use CUDA cores here
-     // Future optimization: store P as half_t if precision allows
-     
-     const int tid = threadIdx.x;
-     const int num_threads = blockDim.x;
-     
-     for (int i = 0; i < q_size; i++) {
-         for (int d = tid; d < DIM_K; d += num_threads) {
-             float sum = 0.0f;
-             #pragma unroll 8
-             for (int j = 0; j < k_size; j++) {
-                 sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
-             }
-             O[i * DIM_K + d] += sum;
-         }
-     }
-     __syncthreads();
- }
+// ==================== WMMA Tensor Core GEMM (FIXED) ====================
+// ( ... cutlass_gemm_qk 函数 ... )
+
+// Wrapper for P @ V using WMMA Tensor Cores
+template<int TILE_M, int TILE_N, int DIM_K> // DIM_K == HEAD_DIM
+__device__ __forceinline__ void cutlass_gemm_pv(
+    const float* P,               // [TILE_M, TILE_N] (FP32)
+    const cutlass::half_t* V,    // [TILE_N, DIM_K] (FP16)
+    float* O,                     // [TILE_M, DIM_K] (FP32 accum)
+    int q_size,                   // Valid M
+    int k_size,                   // Valid K (P@V 的 K 维度是 TILE_N)
+    int head_dim_size = DIM_K     // Valid N
+) {
+    // WMMA 瓦片尺寸 (A100)
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
+    
+    const int warpId = threadIdx.x / 32;
+    const int numWarps = blockDim.x / 32;
+    const int laneId = threadIdx.x % 32;
+
+    // GEMM (M, K, N) = (q_size, k_size, head_dim_size)
+    // P: [M, K] (row) - A
+    // V: [K, N] (row) - B
+    // O: [M, N] (row) - C
+
+    // A(row) @ B(col) -> C(row)
+    // V row-major, but load with column major
+    
+    // M (q_size)
+    for (int m_base = warpId * WMMA_M; m_base < q_size; m_base += numWarps * WMMA_M) {
+        // N (head_dim_size)
+        for (int n_base = 0; n_base < head_dim_size; n_base += WMMA_N) {
+            
+            // --- 1. Load C (O_accum) ---
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+            
+            if (m_base < q_size && n_base < head_dim_size) {
+                wmma::load_matrix_sync(c_frag, O + m_base * DIM_K + n_base, DIM_K, wmma::mem_row_major);
+            } else { // case tile over flow 
+                wmma::fill_fragment(c_frag, 0.0f);
+            }
+            for (int k_base = 0; k_base < k_size; k_base += WMMA_K) {
+                
+                // P: [M, K] (row)
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                // V: [K, N] (col)
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+
+                // load P (FP32) -> a_frag (FP16)
+                const float* p_tile_base = P + m_base * TILE_N + k_base;
+                int frag_row = laneId % 16;
+                int frag_col_offset = (laneId < 16) ? 0 : 8;
+
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    int current_m = m_base + frag_row;
+                    int current_k = k_base + frag_col_offset + i;
+                    
+                    if (current_m < q_size && current_k < k_size) {
+                        a_frag.x[i] = __float2half_rn(p_tile_base[frag_row * TILE_N + frag_col_offset + i]);
+                    } else {
+                        a_frag.x[i] = __float2half_rn(0.0f); // 边界外用 0 填充
+                    }
+                }
+
+                // load V (FP16) -> b_frag (col_major) 
+                // store V as [TILE_N, DIM_K] (row_major)
+                // laod V[k_base:k_base+16, n_base:n_base+16]
+                // use col_major load ->  V[k_base, n_base]
+                const half* v_ptr = reinterpret_cast<const half*>(V + k_base * DIM_K + n_base);
+                
+
+                if (k_base < k_size && n_base < head_dim_size) {
+                    wmma::load_matrix_sync(b_frag, v_ptr, DIM_K, wmma::mem_col_major);
+                } else {
+                    wmma::fill_fragment(b_frag, __float2half_rn(0.0f));
+                }
+
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            
+            if (m_base < q_size && n_base < head_dim_size) {
+                wmma::store_matrix_sync(O + m_base * DIM_K + n_base, c_frag, DIM_K, wmma::mem_row_major);
+            }
+        }
+    }
+    __syncthreads();
+}
  
  // ==================== Parallel Softmax with Warp Shuffle ====================
 
