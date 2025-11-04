@@ -220,7 +220,7 @@ We compare the achieved TFLOPs/s with the state-of-art TFLOPS in FA papers to se
 \section{CUDA by Zhigao Yan}
 
 \subsection{Implementation}
-I implemented a CUDA FlashAttention kernel that uses FP16 for inputs/outputs, performs all computations and accumulation in FP32, and casts back to FP16 only once at the end for numerical stability. The pipeline is: preload the current $Q$ tile into shared memory for reuse, then load $K/V$ tiles into shared memory; for each $K/V$ tile, maintain per-row running max $m$ and normalizer $l$ for numerically stable online softmax merging. Accumulate outputs in FP32 across tiles, then perform final normalization by $l$ and write back in FP16.
+I implemented a CUDA FlashAttention kernel that uses FP16 for inputs/outputs, based on Algorithm 1 in \cite{dao2022flashattention}. It performs all computations and accumulation in FP32, and casts back to FP16 only once at the end for numerical stability. The pipeline is: preload the current $Q$ tile into shared memory for reuse, then load $K/V$ tiles into shared memory; for each $K/V$ tile, maintain per-row running max $m$ and normalizer $l$ for numerically stable online softmax merging. Accumulate outputs in FP32 across tiles, then perform final normalization by $l$ and write back in FP16.
 \begin{lstlisting}
     // preload Q tile into shared memory (reuse across KV tiles)
     for (int t = threadIdx.x; t < br_size * d; t += blockDim.x) {
@@ -257,11 +257,14 @@ I implemented a CUDA FlashAttention kernel that uses FP16 for inputs/outputs, pe
 \end{lstlisting}
 
 \subsection{Validation}
-I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and performing all dot products, softmax, and accumulations in FP32-to provide a numerically stable reference for validating correctness and assessing performance differences. 
-
-
-\subsection{Evaluation}
-
+I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and performing all dot products, softmax, and accumulations in FP32-to provide a numerically stable reference for validating correctness and assessing performance differences. Specifically, the symmetric relative error is computed element by element, with the maximum value across all elements serving as the overall metric. A 2\% threshold is then applied to determine whether the validation passes. All test are conducted on $hendrixfut03fl$.
+\subsection{Depth Complexity}
+The implementation achieves $O(N^2)$ depth complexity. The sequence is split into $B_r$ and $B_c$ chunks, forming $T_r = \lceil N/B_r \rceil$ and $T_c = \lceil N/B_c \rceil$ tiles. While $Q$ tiles are processed in parallel, each $Q$ tile must sequentially traverse all $K/V$ tiles and perform online softmax merging. Since both $T_r$ and $T_c$ scale as $O(N)$, the critical path becomes $O(T_r \times T_c) = O(N^2)$.
+\subsection{Memory}
+\subsection{Evaluation and Analysis}
+All tests have been validated, with an average error of 0.003.
+Test parameter selection balances scalability across sequence length and head dimension: The first set fixes B=1, H=1, d=64, and N from 512 to 4096, primarily evaluating performance during sequence scaling. The second set fixes B=1, H=32, N=8192, and d from 32 to 128, testing boundary conditions.
+The test dataset consists of FP16 random matrices used to fill Q, K, and V.
 \begin{table}[h]
 \centering
 \caption{Latency and Throughput Comparison for CUDA FlashAttention by sxd343}
@@ -279,10 +282,13 @@ I implemented a simple standard attention baseline in FP32-storing Q/K/V/O and p
   (1, 1, 4096, 64)    & 121.77  & 13.68 & 8.90x & 0.035 & 0.314 & 8.97x \\
   (1, 32, 8192, 32)   & 1165.02 & 266.11 & 4.38x & 0.236 & 1.033 & 4.38x \\
   (1, 32, 8192, 64)   & 2353.35 & 492.03 & 4.78x & 0.234 & 1.117 & 4.77x \\
-  (1, 32, 8192, 128)  & 4507.89 & 1515.19 & 3.00x & 0.244 & 0.726 & 3.00x \\
+  (1, 32, 8192, 128)  & 4507.89 & 1515.19 & 2.91x & 0.244 & 0.726 & 3.00x \\
   \bottomrule
   \end{tabular}
 \end{table}
+
+Results indicate that FlashAttention achieves approximately 8-9x speedup under small-scale single-head configurations (H=1, d=64), with marginal improvements as N increases. Under multi-head scenarios (H=32, N=8192), speedup reduces to 3-5x, primarily constrained by shared memory pressure and global bandwidth limitations.
+Based on the results, performance bottlenecks occur when the head dimension reaches 128. Upon increasing the head dimension to 128, the registers and shared memory required for Q/K/V and the accumulated buffer reach 40 KB. This limits each SM to concurrently processing only 1-2 thread blocks, reducing active warps. Consequently, it becomes impossible to hide memory access and synchronisation delays, leading to a performance decline.
 
 \section{CUTLASS-based FlashAttention Implementation by fng685}
 

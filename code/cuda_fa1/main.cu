@@ -454,8 +454,8 @@ int main(int argc, char** argv) {
     double GBps_flash = (bytes_per_call / (time_flash * 1e-3)) / 1e9;
 
     double flops = 4.0 * (double)B * H * N * N * d;        
-    double gflops_per_s_standard = (flops / (time_standard * 1e-3)) / 1e9; 
-    double gflops_per_s_flash = (flops / (time_flash * 1e-3)) / 1e9;
+    double tflops_per_s_standard = (flops / (time_standard * 1e-3)) / 1e12; 
+    double tflops_per_s_flash = (flops / (time_flash * 1e-3)) / 1e12;
 
     printf("\n");
     printf("================================================================================\n");
@@ -471,8 +471,8 @@ int main(int argc, char** argv) {
     printf("%-25s %10.2f GB/s\n", "Flash Throughput:", GBps_flash);
     
     printf("\n");
-    printf("%-25s %10.3f GFLOPs/s\n", "Standard Compute:", gflops_per_s_standard);
-    printf("%-25s %10.3f GFLOPs/s\n", "Flash Compute:", gflops_per_s_flash);
+    printf("%-25s %10.3f TFLOPs/s\n", "Standard Compute:", tflops_per_s_standard);
+    printf("%-25s %10.3f TFLOPs/s\n", "Flash Compute:", tflops_per_s_flash);
 
     // Cleanup
     cudaFree(Q); cudaFree(K); cudaFree(V);
