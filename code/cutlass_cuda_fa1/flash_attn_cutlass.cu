@@ -3,47 +3,6 @@
  * 
  * Uses CUTLASS tensor cores for Q@K^T and P@V matrix multiplications
  * with PARALLEL SOFTMAX using Warp Shuffle operations
- * 
- * ==================== Synchronization Optimization ====================
- * 
- * Previous Approach:
- *   - Used __syncthreads() at multiple points (heavy block-level sync)
- *   - Each sync stalls ALL threads in the block until ALL threads reach it
- *   - Many syncs are unnecessary for independent warp operations
- * 
- * Optimized Approach (Warp-Level Synchronization):
- *   - Replace block-level syncs with __syncwarp() where warps work independently
- *   - Keep block-level syncs only for true cross-warp dependencies:
- *     * After loading Q, K, V from global memory (all threads collaborate)
- *     * Before/after global memory operations
- *     * At final output write-back (ensure all warps finished)
- * 
- * Key Optimizations:
- *   1. cutlass_gemm_qk():
- *      - Each warp computes its own 16x16 WMMA tiles independently
- *      - __syncwarp() is sufficient (no cross-warp dependency)
- *      - Remainder computation is thread-local, only needs __syncwarp()
- * 
- *   2. parallel_softmax_warp():
- *      - Already pure warp-local via warp shuffle operations
- *      - __shfl_sync() implicitly synchronizes lanes
- *      - Reduced final __syncthreads() to __syncwarp()
- * 
- *   3. cutlass_gemm_pv():
- *      - Each thread independently accumulates its output dimension
- *      - No inter-thread communication needed
- *      - Only needs __syncwarp() for completion fence
- * 
- * Performance Impact:
- *   - __syncwarp() cost: ~1-5 cycles (synchronize 32 lanes)
- *   - __syncthreads() cost: ~50-200 cycles (synchronize up to 1024 threads)
- *   - Expected improvement: 5-10% latency reduction
- *   - Main benefit: Better GPU scheduling flexibility
- * 
- * Warp-Level Barrier:
- *   - warp_barrier() function uses atomic operations for warp coordination
- *   - Allows warps to reach a point before continuing
- *   - Alternative to __syncthreads() for cross-warp synchronization when lightweight
  ******************************************************************************/
 
  #include <cuda_runtime.h>
@@ -115,159 +74,139 @@
      }
  };
  
- // ==================== Warp-Level Synchronization Utilities ====================
+ // ==================== WMMA Tensor Core GEMM ====================
+ 
+ // Wrapper for Q @ K^T using WMMA Tensor Cores
+ // A100 supports m16n8k16 for FP16 inputs with FP32 accumulation
+ template<int TILE_M, int TILE_N, int DIM_K>
+ __device__ __forceinline__ void cutlass_gemm_qk(
+     const cutlass::half_t* Q,  // [TILE_M, DIM_K]
+     const cutlass::half_t* K,  // [TILE_N, DIM_K]
+     float* S,                   // [TILE_M, TILE_N]
+     int q_size,                 // Valid rows (≤ TILE_M)
+     int k_size                  // Valid cols (≤ TILE_N)
+ ) {
+     // WMMA tile dimensions for A100
+     constexpr int WMMA_M = 16;
+     constexpr int WMMA_N = 16;
+     constexpr int WMMA_K = 16;
+     
+     const int warpId = threadIdx.x / 32;
+     const int numWarps = blockDim.x / 32;
+     const int tid = threadIdx.x;
+     const int num_threads = blockDim.x;
+     
+     // Use tensor cores for aligned portions, fallback for remainder
+     if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+         //   Q is [M, K] row-major
+         //   K is [N, K] row-major, need to treat as K^T [K, N]
+         for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
+             for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
+                 // Declare fragments
+                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;  // K^T is col-major!
+                 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+                 
+                 // Initialize accumulator to zero
+                 wmma::fill_fragment(c_frag, 0.0f);
+                 
+                 // Multiply-accumulate over K dimension
+                 for (int k = 0; k < (DIM_K / WMMA_K) * WMMA_K; k += WMMA_K) {
+                     // Load A (Q[m:m+16, k:k+16]) - row major
+                     wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
+                     
+                     // Load B (K^T[k:k+16, n:n+16]) = K[n:n+16, k:k+16] as col-major
+                     // K is stored row-major as [N, K], so K[n, k] is at K + n*DIM_K + k
+                     wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
+                     
+                     // C = A @ B^T + C
+                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                 }
+                 
+                 wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
+             }
+         }
+         
+         __syncthreads();
+     }
+     
+     // Handle remainder with standard CUDA cores
+     // This handles: partial tiles, edge cases, and any K dimension remainder
+     for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
+         int i = idx / k_size;
+         int j = idx % k_size;
+         
+         // Skip if already computed by WMMA
+         if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+             int m_base = (i / WMMA_M) * WMMA_M;
+             int n_base = (j / WMMA_N) * WMMA_N;
+             if (i >= m_base && i < m_base + WMMA_M && 
+                 j >= n_base && j < n_base + WMMA_N && 
+                 m_base < (q_size / WMMA_M) * WMMA_M && 
+                 n_base < (k_size / WMMA_N) * WMMA_N) {
+                 continue;  // Already computed by tensor cores
+             }
+         }
+         
+         // Compute remainder using CUDA cores
+         float sum = 0.0f;
+         #pragma unroll
+         for (int k = 0; k < DIM_K; k++) {
+             sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
+         }
+         S[i * TILE_N + j] = sum;
+     }
+     __syncthreads();
+ }
+ 
+ // Wrapper for P @ V using WMMA Tensor Cores
+ // P is float, V is half_t - need to convert P to half for WMMA
+ template<int TILE_M, int TILE_N, int DIM_K>
+ __device__ __forceinline__ void cutlass_gemm_pv(
+     const float* P,               // [TILE_M, TILE_N]
+     const cutlass::half_t* V,    // [TILE_N, DIM_K]
+     float* O,                     // [TILE_M, DIM_K]
+     int q_size,                   // Valid rows (≤ TILE_M)
+     int k_size                    // Valid cols (≤ TILE_N)
+ ) {
+     // Note: P @ V is more complex because P is in float, not half
+     // For maximum performance, would need to keep P in half
+     // For now, use CUDA cores for simplicity and correctness
+     
+     // WMMA requires FP16 inputs, but P (attention probs) are in FP32
+     // Converting would add overhead, so use CUDA cores here
+     // Future optimization: store P as half_t if precision allows
+     
+     const int tid = threadIdx.x;
+     const int num_threads = blockDim.x;
+     
+     for (int i = 0; i < q_size; i++) {
+         for (int d = tid; d < DIM_K; d += num_threads) {
+             float sum = 0.0f;
+             #pragma unroll 8
+             for (int j = 0; j < k_size; j++) {
+                 sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
+             }
+             O[i * DIM_K + d] += sum;
+         }
+     }
+     __syncthreads();
+ }
+ 
+ // ==================== Parallel Softmax with Warp Shuffle ====================
 
-// Warp-level barrier using shared memory atomics
-// Allows warps to coordinate without blocking all threads
-// Cost: O(warps) atomic operations instead of O(threads) for __syncthreads()
-__device__ void warp_barrier(int* barrier_count, int expected_warps) {
-    const int warpId = threadIdx.x / 32;
-    const int laneId = threadIdx.x % 32;
-    
-    if (laneId == 0) {
-        // Only one thread per warp increments (reduces atomic contention)
-        atomicAdd(barrier_count, 1);
-        // Busy-wait for all warps to reach barrier
-        // This is fast because:
-        // 1. Only checking a single counter (cache locality)
-        // 2. Each lane 0 spins independently (parallelism)
-        while (atomicLoad(barrier_count) < expected_warps) {
-            // Busy loop - typically completes in microseconds
-        }
-    }
-    // Each lane waits for its warp's lane 0 thread
-    // This is much cheaper than __syncthreads() for non-aligned barriers
-    __syncwarp();
-}
-
-// ==================== WMMA Tensor Core GEMM ====================
-
-// Wrapper for Q @ K^T using WMMA Tensor Cores with optimized synchronization
-template<int TILE_M, int TILE_N, int DIM_K>
-__device__ __forceinline__ void cutlass_gemm_qk(
-    const cutlass::half_t* Q,  // [TILE_M, DIM_K]
-    const cutlass::half_t* K,  // [TILE_N, DIM_K]
-    float* S,                   // [TILE_M, TILE_N]
-    int q_size,                 // Valid rows (≤ TILE_M)
-    int k_size,                 // Valid cols (≤ TILE_N)
-    int num_threads
-) {
-    // WMMA tile dimensions for A100
-    constexpr int WMMA_M = 16;
-    constexpr int WMMA_N = 16;
-    constexpr int WMMA_K = 16;
-    
-    const int warpId = threadIdx.x / 32;
-    const int laneId = threadIdx.x % 32;
-    const int numWarps = (num_threads + 31) / 32;
-    const int tid = threadIdx.x;
-    
-    // ========== WMMA Path: Each warp processes independently ==========
-    if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
-        for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
-            for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
-                // Declare fragments
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-                
-                wmma::fill_fragment(c_frag, 0.0f);
-                
-                // Multiply-accumulate over K dimension
-                for (int k = 0; k < (DIM_K / WMMA_K) * WMMA_K; k += WMMA_K) {
-                    wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
-                    wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
-                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-                }
-                
-                wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
-            }
-        }
-        
-        // Replace block-level sync with warp-level
-        // Each warp waits only for its own stores to complete
-        __syncwarp();
-    }
-    
-    // ========== Remainder Path: Warp-local computation ==========
-    // Each thread processes remainder elements independently
-    // No cross-thread synchronization needed until final write
-    for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
-        int i = idx / k_size;
-        int j = idx % k_size;
-        
-        // Skip if already computed by WMMA
-        if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
-            int m_base = (i / WMMA_M) * WMMA_M;
-            int n_base = (j / WMMA_N) * WMMA_N;
-            if (i >= m_base && i < m_base + WMMA_M && 
-                j >= n_base && j < n_base + WMMA_N && 
-                m_base < (q_size / WMMA_M) * WMMA_M && 
-                n_base < (k_size / WMMA_N) * WMMA_N) {
-                continue;
-            }
-        }
-        
-        // Compute remainder using CUDA cores (warp-local, no sync needed)
-        float sum = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < DIM_K; k++) {
-            sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
-        }
-        S[i * TILE_N + j] = sum;
-    }
-    
-    // Single warp-level barrier to ensure all data is visible
-    // This replaces the heavy block-level __syncthreads()
-    __syncwarp();
-}
-
-// ==================== Optimized P @ V with Warp-Level Synchronization ====================
-
-template<int TILE_M, int TILE_N, int DIM_K>
-__device__ __forceinline__ void cutlass_gemm_pv(
-    const float* P,               // [TILE_M, TILE_N]
-    const cutlass::half_t* V,    // [TILE_N, DIM_K]
-    float* O,                     // [TILE_M, DIM_K]
-    int q_size,                   // Valid rows (≤ TILE_M)
-    int k_size,                   // Valid cols (≤ TILE_N)
-    int num_threads
-) {
-    const int tid = threadIdx.x;
-    const int warpId = tid / 32;
-    const int laneId = tid % 32;
-    const int numWarps = (num_threads + 31) / 32;
-    
-    // Each thread independently computes its portion of P@V
-    // No cross-thread synchronization needed within a warp
-    for (int i = 0; i < q_size; i++) {
-        // Different threads work on different output dimensions
-        for (int d = tid; d < DIM_K; d += num_threads) {
-            float sum = 0.0f;
-            #pragma unroll 8
-            for (int j = 0; j < k_size; j++) {
-                sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
-            }
-            O[i * DIM_K + d] += sum;
-        }
-    }
-    
-    // Lightweight warp-level sync - each warp waits only for its threads
-    __syncwarp();
-}
-
-// ==================== Parallel Softmax with Pure Warp-Level Synchronization ====================
-
-// Pure warp-level softmax - no block-level sync needed
+// Parallel softmax computation using warp shuffle operations
+// All threads in each warp cooperate to compute softmax for query positions
+// assigned to that warp
 template<int TILE_M, int TILE_N, int DIM_K>
 __device__ __forceinline__ void parallel_softmax_warp(
-    float* S,               // [TILE_M, TILE_N]
-    float* P,               // [TILE_M, TILE_N]
-    float* m_shared,        // [TILE_M] - shared across warps
-    float* l_shared,        // [TILE_M] - shared across warps
-    float* O_accum,         // [TILE_M, DIM_K]
-    int q_size,
-    int k_size,
+    float* S,               // [TILE_M, TILE_N] - attention scores
+    float* P,               // [TILE_M, TILE_N] - attention probabilities
+    float* m_shared,        // [TILE_M] - max values
+    float* l_shared,        // [TILE_M] - normalizing factors
+    float* O_accum,         // [TILE_M, DIM_K] - output accumulator
+    int q_size,             // Number of valid query positions
+    int k_size,             // Number of valid key positions
     int num_threads
 ) {
     const int tid = threadIdx.x;
@@ -275,31 +214,31 @@ __device__ __forceinline__ void parallel_softmax_warp(
     const int warpId = tid / 32;
     const int numWarps = (num_threads + 31) / 32;
     
-    // Each warp processes one or more query positions (warp-cooperative)
+    // Each warp processes one or more query positions
+    // With 256 threads (8 warps) and up to 45 queries, some warps handle multiple queries
     for (int i = warpId; i < q_size; i += numWarps) {
-        // Load stats (lane 0 broadcasts to warp)
         float m_old = m_shared[i];
         float l_old = l_shared[i];
         
-        // Broadcast to all lanes in warp
-        m_old = __shfl_sync(0xffffffff, m_old, 0);
-        l_old = __shfl_sync(0xffffffff, l_old, 0);
-        
-        // ========== Step 1: Warp-parallel max reduction ==========
+        // ========== Step 1: Find max in parallel ==========
+        // Each lane finds the max of its assigned columns
         float m_new = -INFINITY;
         for (int j = laneId; j < k_size; j += 32) {
             m_new = fmaxf(m_new, S[i * TILE_N + j]);
         }
         
-        // Warp-level butterfly reduction (no syncwarp needed, __shfl_down_sync handles it)
+        // Reduce within warp using butterfly shuffle pattern
+        // This is a standard warp reduce for max
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             m_new = fmaxf(m_new, __shfl_down_sync(0xffffffff, m_new, offset));
         }
         
+        // Broadcast result from lane 0 to all lanes in the warp
         m_new = __shfl_sync(0xffffffff, m_new, 0);
         
-        // ========== Step 2: Warp-parallel exponential and sum ==========
+        // ========== Step 2: Compute softmax exponentials and sum ==========
+        // Each lane computes exponentials for its assigned columns and accumulates sum
         float l_new = 0.0f;
         for (int j = laneId; j < k_size; j += 32) {
             float p = expf(S[i * TILE_N + j] - m_new);
@@ -307,33 +246,33 @@ __device__ __forceinline__ void parallel_softmax_warp(
             l_new += p;
         }
         
-        // Warp-level sum reduction
+        // Reduce sum within warp using butterfly shuffle pattern
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             l_new += __shfl_down_sync(0xffffffff, l_new, offset);
         }
         
+        // Broadcast result from lane 0 to all lanes in the warp
         l_new = __shfl_sync(0xffffffff, l_new, 0);
         
-        // ========== Step 3: Online softmax correction (warp-local) ==========
+        // ========== Step 3: Apply online softmax correction ==========
+        // Correction factor for updating the output accumulator
         float correction = expf(m_old - m_new);
         l_new = correction * l_old + l_new;
         
-        // Update statistics - only lane 0 writes (atomic or careful conflict avoidance)
+        // Update statistics (only lane 0 writes to avoid conflicts)
         if (laneId == 0) {
             m_shared[i] = m_new;
             l_shared[i] = l_new;
         }
         
-        // No __syncwarp() needed here - each lane works independently on O_accum
-        // Update O_accum in warp-parallel fashion
+        // Update O_accum in parallel: scale by correction factor
+        // Each lane handles part of the dimension
         for (int d = laneId; d < DIM_K; d += 32) {
             O_accum[i * DIM_K + d] *= correction;
         }
     }
-    
-    // Single lightweight warp sync at the end
-    __syncwarp();
+    __syncthreads();
 }
 
 // ==================== Flash Attention Kernel with CUTLASS ====================
@@ -394,7 +333,6 @@ __global__ void flash_attn_cutlass_kernel(
      for (int i = tid; i < kTileM * HEAD_DIM; i += blockDim.x) {
          O_accum[i] = 0.0f;
      }
-     // Single block-level sync after all initialization - threads must be synchronized here
      __syncthreads();
      
      // Iterate over K/V tiles
@@ -405,57 +343,40 @@ __global__ void flash_attn_cutlass_kernel(
          const int k_end = min(k_start + kTileN, seq_len);
          const int k_size = k_end - k_start;
          
-         // ========== Load K and V tiles with optimized synchronization ==========
-         // Use block-level sync here as threads collaboratively load from global memory
+         // Load K and V tiles
          for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
              int i = idx / HEAD_DIM;
              int j = idx % HEAD_DIM;
              shared_mem.K[i * HEAD_DIM + j] = K_ptr[(k_start + i) * HEAD_DIM + j];
              shared_mem.V[i * HEAD_DIM + j] = V_ptr[(k_start + i) * HEAD_DIM + j];
          }
-         // Must sync after global memory load to ensure K/V are visible
          __syncthreads();
          
-         // S = Q @ K^T using warp-optimized GEMM
+         // S = Q @ K^T using CUTLASS
          cutlass_gemm_qk<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.Q, shared_mem.K, shared_mem.S, q_size, k_size, blockDim.x
+             shared_mem.Q, shared_mem.K, shared_mem.S, q_size, k_size
          );
          
-         // ========== Apply softmax scale with warp-aware coordination ==========
-         // Each thread independently scales its assigned S elements
-         // No synchronization needed between threads - this is embarrassingly parallel
+         // Apply softmax scale (separate step, like Small Tile)
          for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
              int i = idx / k_size;
              int j = idx % k_size;
              shared_mem.S[i * kTileN + j] *= softmax_scale;
          }
-         
-         // Single lightweight sync before softmax (needed because warps must see scaled S)
-         // This replaces the heavy __syncthreads()
          __syncthreads();
          
-         // ========== Online softmax with pure warp-level synchronization ==========
-         // parallel_softmax_warp uses __syncwarp() internally
+         // Online softmax
          parallel_softmax_warp<kTileM, kTileN, HEAD_DIM>(
              shared_mem.S, shared_mem.P, m_shared, l_shared, O_accum, q_size, k_size, blockDim.x
          );
          
-         // ========== P @ V with warp-optimized computation ==========
+         // O += P @ V using CUTLASS
          cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.P, shared_mem.V, O_accum, q_size, k_size, blockDim.x
+             shared_mem.P, shared_mem.V, O_accum, q_size, k_size
          );
-         
-         // Note: No __syncthreads() needed here because:
-         // - Each warp-iteration of softmax already syncs internally with __syncwarp()
-         // - P@V writes to O_accum which is warp-local (each warp owns its rows)
-         // - Next iteration will have __syncthreads() when loading new K/V
      }
      
-     // ========== Final normalization and write-back with full block sync ==========
-     // We need block-level sync here to ensure all warps have finished P@V
-     // before reading final O_accum values
-     __syncthreads();
-     
+     // Final normalization and write back
      for (int i = 0; i < q_size; i++) {
          float scale = (l_shared[i] == 0.0f) ? 0.0f : 1.0f / l_shared[i];
          for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
