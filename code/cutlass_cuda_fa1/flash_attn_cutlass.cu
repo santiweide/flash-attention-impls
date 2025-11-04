@@ -38,8 +38,7 @@
      
      static constexpr size_t get_smem_size() {
          return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
-                (kTileM * kTileN * 2) * sizeof(float) +  // S and P (FP32)
-                (kTileM * kTileN) * sizeof(cutlass::half_t) +  // P_half (FP16) for tensor cores
+                (kTileM * kTileN * 2) * sizeof(float) +  // S and P
                 (kTileM * 2) * sizeof(float) +            // m, l
                 (kTileM * kHeadDim) * sizeof(float);      // O_accum
      }
@@ -49,12 +48,11 @@
  
  template<typename T, int TILE_M, int TILE_N, int HEAD_DIM>
  struct SharedMemoryCutlass {
-     T* Q;                           // [TILE_M, HEAD_DIM]
-     T* K;                           // [TILE_N, HEAD_DIM]
-     T* V;                           // [TILE_N, HEAD_DIM]
-     float* S;                       // [TILE_M, TILE_N]
-     float* P;                       // [TILE_M, TILE_N]
-     cutlass::half_t* P_half;        // [TILE_M, TILE_N] - P converted to FP16
+     T* Q;      // [TILE_M, HEAD_DIM]
+     T* K;      // [TILE_N, HEAD_DIM]
+     T* V;      // [TILE_N, HEAD_DIM]
+     float* S;  // [TILE_M, TILE_N]
+     float* P;  // [TILE_M, TILE_N]
      
      __device__ SharedMemoryCutlass(void* ptr) {
          char* base = reinterpret_cast<char*>(ptr);
@@ -73,9 +71,6 @@
          offset += TILE_M * TILE_N * sizeof(float);
          
          P = reinterpret_cast<float*>(base + offset);
-         offset += TILE_M * TILE_N * sizeof(float);
-         
-         P_half = reinterpret_cast<cutlass::half_t*>(base + offset);
      }
  };
  
@@ -165,93 +160,38 @@
  }
  
  // Wrapper for P @ V using WMMA Tensor Cores
- // P is converted from float to half_t for tensor core usage
- // V is already half_t, O is accumulated in float
-template<int TILE_M, int TILE_N, int DIM_K>
-__device__ __forceinline__ void cutlass_gemm_pv(
-    const float* P,                       // [TILE_M, TILE_N]
-    const cutlass::half_t* V,            // [TILE_N, DIM_K]
-    float* O,                             // [TILE_M, DIM_K]
-    cutlass::half_t* P_half,             // [TILE_M, TILE_N] - converted P
-    int q_size,                           // Valid rows (≤ TILE_M)
-    int k_size                            // Valid cols (≤ TILE_N)
-) {
-    // WMMA tile dimensions for A100
-    constexpr int WMMA_M = 16;
-    constexpr int WMMA_N = 16;
-    constexpr int WMMA_K = 16;
-    
-    const int warpId = threadIdx.x / 32;
-    const int numWarps = blockDim.x / 32;
-    const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
-    
-    // Step 1: Convert P from float to half in parallel
-    for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
-        int i = idx / k_size;
-        int j = idx % k_size;
-        P_half[i * TILE_N + j] = cutlass::half_t(P[i * TILE_N + j]);
-    }
-    __syncthreads();
-    
-    // Step 2: Use tensor cores for aligned portions
-    // P_half is [M, K], V is [K, N], compute O [M, N] = P_half @ V
-    if (q_size >= WMMA_M && k_size >= WMMA_K && DIM_K >= WMMA_N) {
-        for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
-            for (int n = 0; n < (DIM_K / WMMA_N) * WMMA_N; n += WMMA_N) {
-                // Declare fragments
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-                
-                // Initialize accumulator to zero
-                wmma::fill_fragment(c_frag, 0.0f);
-                
-                // Multiply-accumulate over K dimension (TILE_N)
-                for (int k = 0; k < (k_size / WMMA_K) * WMMA_K; k += WMMA_K) {
-                    // Load A (P_half[m:m+16, k:k+16]) - row major
-                    wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(P_half + m * TILE_N + k), TILE_N);
-                    
-                    // Load B (V[k:k+16, n:n+16]) - row major
-                    wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(V + k * DIM_K + n), DIM_K);
-                    
-                    // C = A @ B + C
-                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-                }
-                
-                wmma::store_matrix_sync(O + m * DIM_K + n, c_frag, DIM_K, wmma::mem_row_major);
-            }
-        }
-        __syncthreads();
-    }
-    
-    // Step 3: Handle remainder with CUDA cores
-    for (int idx = tid; idx < q_size * DIM_K; idx += num_threads) {
-        int i = idx / DIM_K;
-        int d = idx % DIM_K;
-        
-        // Skip if already computed by tensor cores
-        if (q_size >= WMMA_M && k_size >= WMMA_K && DIM_K >= WMMA_N) {
-            int m_base = (i / WMMA_M) * WMMA_M;
-            int n_base = (d / WMMA_N) * WMMA_N;
-            if (i >= m_base && i < m_base + WMMA_M && 
-                d >= n_base && d < n_base + WMMA_N && 
-                m_base < (q_size / WMMA_M) * WMMA_M && 
-                n_base < (DIM_K / WMMA_N) * WMMA_N) {
-                continue;  // Already computed by tensor cores
-            }
-        }
-        
-        // Compute remainder: O[i,d] = sum_j P[i,j] * V[j,d]
-        float sum = 0.0f;
-        #pragma unroll 8
-        for (int j = 0; j < k_size; j++) {
-            sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
-        }
-        O[i * DIM_K + d] += sum;
-    }
-    __syncthreads();
-}
+ // P is float, V is half_t - need to convert P to half for WMMA
+ template<int TILE_M, int TILE_N, int DIM_K>
+ __device__ __forceinline__ void cutlass_gemm_pv(
+     const float* P,               // [TILE_M, TILE_N]
+     const cutlass::half_t* V,    // [TILE_N, DIM_K]
+     float* O,                     // [TILE_M, DIM_K]
+     int q_size,                   // Valid rows (≤ TILE_M)
+     int k_size                    // Valid cols (≤ TILE_N)
+ ) {
+     // Note: P @ V is more complex because P is in float, not half
+     // For maximum performance, would need to keep P in half
+     // For now, use CUDA cores for simplicity and correctness
+     
+     // WMMA requires FP16 inputs, but P (attention probs) are in FP32
+     // Converting would add overhead, so use CUDA cores here
+     // Future optimization: store P as half_t if precision allows
+     
+     const int tid = threadIdx.x;
+     const int num_threads = blockDim.x;
+     
+     for (int i = 0; i < q_size; i++) {
+         for (int d = tid; d < DIM_K; d += num_threads) {
+             float sum = 0.0f;
+             #pragma unroll 8
+             for (int j = 0; j < k_size; j++) {
+                 sum += P[i * TILE_N + j] * float(V[j * DIM_K + d]);
+             }
+             O[i * DIM_K + d] += sum;
+         }
+     }
+     __syncthreads();
+ }
  
  // ==================== Parallel Softmax with Warp Shuffle ====================
 
@@ -432,7 +372,7 @@ __global__ void flash_attn_cutlass_kernel(
          
          // O += P @ V using CUTLASS
          cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.P, shared_mem.V, O_accum, shared_mem.P_half, q_size, k_size
+             shared_mem.P, shared_mem.V, O_accum, q_size, k_size
          );
      }
      
@@ -489,7 +429,7 @@ __global__ void flash_attn_cutlass_kernel(
          printf("  Shared memory: %.1f KB\n", smem_size / 1024.0);
          printf("  Tensor Cores: ENABLED via WMMA API\n");
          printf("    → Q@K^T: wmma::mma_sync (16x16x16 tiles, FP16→FP32)\n");
-         printf("    → P@V:   WMMA Tensor Core (FP32 input limitation)\n");
+         printf("    → P@V:   CUDA cores (FP32 input limitation)\n");
          printf("  Softmax: PARALLEL via warp shuffle (cooperative warp reduction)\n");
          printf("================================================================================\n");
          first_call = false;
