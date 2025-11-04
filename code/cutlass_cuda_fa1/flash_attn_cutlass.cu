@@ -78,84 +78,87 @@
  
  // Wrapper for Q @ K^T using WMMA Tensor Cores
  // A100 supports m16n8k16 for FP16 inputs with FP32 accumulation
-template<int TILE_M, int TILE_N, int DIM_K>
-__device__ __forceinline__ void cutlass_gemm_qk(
-    const cutlass::half_t* Q,  // [TILE_M, DIM_K]
-    const cutlass::half_t* K,  // [TILE_N, DIM_K]
-    float* S,                   // [TILE_M, TILE_N]
-    int q_size,                 // Valid rows (≤ TILE_M)
-    int k_size                  // Valid cols (≤ TILE_N)
-) {
-    constexpr int WMMA_M = 16;
-    constexpr int WMMA_N = 16;
-    constexpr int WMMA_K = 16;
-    
-    const int warpId = threadIdx.x / 32;
-    const int numWarps = blockDim.x / 32;
-    const int tid = threadIdx.x;
-    const int num_threads = blockDim.x;
-
-    for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
-        S[idx] = 0.0f;
-    }
-    __syncthreads(); 
-
-    if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
-        const int k_main_loop_end = (DIM_K / WMMA_K) * WMMA_K;
-
-        for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
-            for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag; 
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-                
-                wmma::fill_fragment(c_frag, 0.0f);
-                
-                for (int k = 0; k < k_main_loop_end; k += WMMA_K) {
-                    wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
-                    wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
-                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-                }
-                
-                wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
-            }
-        }
-        __syncthreads();
-    }
-    
-    // Remainder
-    // 1. K remainder (k >= k_main_loop_end)
-    // 2. M & N dim remainder
-    const int k_main_loop_end = (DIM_K / WMMA_K) * WMMA_K;
-
-    for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
-        int i = idx / k_size; // row (query)
-        int j = idx % k_size; // col (key)
-        
-        bool computed_by_wmma = false;
-        if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
-             if (i < (q_size / WMMA_M) * WMMA_M && j < (k_size / WMMA_N) * WMMA_N) {
-                 computed_by_wmma = true;
+ template<int TILE_M, int TILE_N, int DIM_K>
+ __device__ __forceinline__ void cutlass_gemm_qk(
+     const cutlass::half_t* Q,  // [TILE_M, DIM_K]
+     const cutlass::half_t* K,  // [TILE_N, DIM_K]
+     float* S,                   // [TILE_M, TILE_N]
+     int q_size,                 // Valid rows (≤ TILE_M)
+     int k_size                  // Valid cols (≤ TILE_N)
+ ) {
+     // WMMA tile dimensions for A100
+     constexpr int WMMA_M = 16;
+     constexpr int WMMA_N = 16;
+     constexpr int WMMA_K = 16;
+     
+     const int warpId = threadIdx.x / 32;
+     const int numWarps = blockDim.x / 32;
+     const int tid = threadIdx.x;
+     const int num_threads = blockDim.x;
+     
+     // Use tensor cores for aligned portions, fallback for remainder
+     if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+         //   Q is [M, K] row-major
+         //   K is [N, K] row-major, need to treat as K^T [K, N]
+         for (int m = warpId * WMMA_M; m < (q_size / WMMA_M) * WMMA_M; m += numWarps * WMMA_M) {
+             for (int n = 0; n < (k_size / WMMA_N) * WMMA_N; n += WMMA_N) {
+                 // Declare fragments
+                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;  // K^T is col-major!
+                 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+                 
+                 // Initialize accumulator to zero
+                 wmma::fill_fragment(c_frag, 0.0f);
+                 
+                 // Multiply-accumulate over K dimension
+                 for (int k = 0; k < (DIM_K / WMMA_K) * WMMA_K; k += WMMA_K) {
+                     // Load A (Q[m:m+16, k:k+16]) - row major
+                     wmma::load_matrix_sync(a_frag, reinterpret_cast<const half*>(Q + m * DIM_K + k), DIM_K);
+                     
+                     // Load B (K^T[k:k+16, n:n+16]) = K[n:n+16, k:k+16] as col-major
+                     // K is stored row-major as [N, K], so K[n, k] is at K + n*DIM_K + k
+                     wmma::load_matrix_sync(b_frag, reinterpret_cast<const half*>(K + n * DIM_K + k), DIM_K);
+                     
+                     // C = A @ B^T + C
+                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                 }
+                 
+                 wmma::store_matrix_sync(S + m * TILE_N + n, c_frag, TILE_N, wmma::mem_row_major);
              }
-        }
-
-        if (computed_by_wmma) { // 1. k dim remainder
-            float sum_remainder = 0.0f;
-            for (int k = k_main_loop_end; k < DIM_K; k++) {
-                sum_remainder += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
-            }
-            S[i * TILE_N + j] += sum_remainder;
-
-        } else { // 2. M/N dim remainder
-            float sum_full = 0.0f;
-            for (int k = 0; k < DIM_K; k++) {
-                sum_full += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
-            }
-            S[i * TILE_N + j] = sum_full;
-        }
-    }
-    __syncthreads();
-}
+         }
+         
+         __syncthreads();
+     }
+     
+     // Handle remainder with standard CUDA cores
+     // This handles: partial tiles, edge cases, and any K dimension remainder
+     for (int idx = tid; idx < q_size * k_size; idx += num_threads) {
+         int i = idx / k_size;
+         int j = idx % k_size;
+         
+         // Skip if already computed by WMMA
+         if (q_size >= WMMA_M && k_size >= WMMA_N && DIM_K >= WMMA_K) {
+             int m_base = (i / WMMA_M) * WMMA_M;
+             int n_base = (j / WMMA_N) * WMMA_N;
+             if (i >= m_base && i < m_base + WMMA_M && 
+                 j >= n_base && j < n_base + WMMA_N && 
+                 m_base < (q_size / WMMA_M) * WMMA_M && 
+                 n_base < (k_size / WMMA_N) * WMMA_N) {
+                 continue;  // Already computed by tensor cores
+             }
+         }
+         
+         // Compute remainder using CUDA cores
+         float sum = 0.0f;
+         #pragma unroll
+         for (int k = 0; k < DIM_K; k++) {
+             sum += float(Q[i * DIM_K + k]) * float(K[j * DIM_K + k]);
+         }
+         S[i * TILE_N + j] = sum;
+     }
+     __syncthreads();
+ }
+ 
  // Wrapper for P @ V using WMMA Tensor Cores
  // P is float, V is half_t - need to convert P to half for WMMA
  template<int TILE_M, int TILE_N, int DIM_K>
@@ -204,8 +207,7 @@ __device__ __forceinline__ void parallel_softmax_warp(
     float* O_accum,         // [TILE_M, DIM_K] - output accumulator
     int q_size,             // Number of valid query positions
     int k_size,             // Number of valid key positions
-    int num_threads,
-    float softmax_scale
+    int num_threads
 ) {
     const int tid = threadIdx.x;
     const int laneId = tid % 32;
@@ -222,7 +224,7 @@ __device__ __forceinline__ void parallel_softmax_warp(
         // Each lane finds the max of its assigned columns
         float m_new = -INFINITY;
         for (int j = laneId; j < k_size; j += 32) {
-            m_new = fmaxf(m_new, S[i * TILE_N + j] * softmax_scale);
+            m_new = fmaxf(m_new, S[i * TILE_N + j]);
         }
         
         // warp reduce to get max
@@ -236,7 +238,7 @@ __device__ __forceinline__ void parallel_softmax_warp(
         // Each lane computes exponentials for its assigned columns and accumulates sum
         float l_new = 0.0f;
         for (int j = laneId; j < k_size; j += 32) {
-            float p = expf((S[i * TILE_N + j] * softmax_scale) - m_new);
+            float p = expf(S[i * TILE_N + j] - m_new);
             P[i * TILE_N + j] = p;
             l_new += p;
         }
@@ -346,20 +348,27 @@ __global__ void flash_attn_cutlass_kernel(
          cutlass_gemm_qk<kTileM, kTileN, HEAD_DIM>(
              shared_mem.Q, shared_mem.K, shared_mem.S, q_size, k_size
          );
-
-        // Online softmax
-        parallel_softmax_warp<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.S, shared_mem.P, m_shared, l_shared, O_accum, 
-             q_size, k_size, blockDim.x,
-             softmax_scale // <-- 传入新的参数
+         
+         // Apply softmax scale (separate step, like Small Tile)
+         for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+             int i = idx / k_size;
+             int j = idx % k_size;
+             shared_mem.S[i * kTileN + j] *= softmax_scale;
+         }
+         __syncthreads();
+         
+         // Online softmax
+         parallel_softmax_warp<kTileM, kTileN, HEAD_DIM>(
+             shared_mem.S, shared_mem.P, m_shared, l_shared, O_accum, q_size, k_size, blockDim.x
          );
          
-         // O += P @ V
+         // O += P @ V using CUTLASS
          cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
              shared_mem.P, shared_mem.V, O_accum, q_size, k_size
          );
      }
      
+     // Final normalization and write back
      for (int i = 0; i < q_size; i++) {
          float scale = (l_shared[i] == 0.0f) ? 0.0f : 1.0f / l_shared[i];
          for (int d = tid; d < HEAD_DIM; d += blockDim.x) {
