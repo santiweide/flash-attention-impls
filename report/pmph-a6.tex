@@ -111,7 +111,7 @@
 
 \section{Problem Statement}
 
-Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention} \cite{dao2023flashattention}. In this report, we implement Flash Attention(FA) forward pass with different Domain Specific Languages(DSLs): CUDA, CUDA+Cutlass, PyTorch and PyTorch + Triton.
+Flash Attention proposed by Dao-AILab is an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU high bandwidth memory (HBM) and GPU on-chip SRAM\cite{dao2022flashattention} \cite{dao2023flashattention}. In this report, we implement Flash Attention(FA) forward pass with different Domain Specific Languages(DSLs): CUDA, CUDA+Tensor Core, PyTorch and PyTorch + Triton.
 
 \subsection{What is Attention and what does Flash Attention do}
 The calculation process of Attention is as follows:
@@ -317,16 +317,22 @@ The test dataset consists of FP16 random matrices used to fill Q, K, and V.
 Results indicate that FlashAttention achieves approximately 8-9x speedup under small-scale single-head configurations (H=1, d=64), with marginal improvements as N increases. Under multi-head scenarios (H=32, N=8192), speedup reduces to 3-5x, primarily constrained by shared memory pressure and global bandwidth limitations.
 Also based on the results, performance bottlenecks occur when the head dimension reaches 128. Upon increasing the head dimension to 128, the registers and shared memory required for Q/K/V and the accumulated buffer reach 40 KB. This limits each SM to concurrently processing only 1-2 thread blocks, reducing active warps. Consequently, it becomes impossible to hide memory access and synchronisation delays, leading to a performance decline.
 
-\section{CUTLASS-based FlashAttention Implementation by fng685}
+\section{Tensor Core enabled FlashAttention Implementation by fng685}
 
 \subsection{Implementation}
 
-This implementation leverages NVIDIA CUTLASS with WMMA (Warp-Matrix-Multiply-Accumulate) tensor core instructions for accelerated matrix operations in Flash Attention. For convenience we extract head dim as template variable to match different tiling size for shared memory allocation.
+This implementation leverages Tensor Core with WMMA (Warp-Matrix-Multiply-Accumulate). For convenience we extract head dim as template variable to match different tiling size for shared memory allocation. How to run:
+
+\begin{lstlisting}
+cd cutlass_cuda_fa1
+sh build_and_run.sh
+\end{lstlisting}
+
 
 \paragraph{Tensor Core Acceleration}
 The $S = Q K^{\top}$ (attention scores) computation is accelerated using WMMA tensor cores with \texttt{fp16} inputs and \texttt{fp32} accumulation, employing tile dimensions of $16 \times 16 \times 16$ to match the A100 instruction format. Since the lay out handles tiles with the fixed size, there will be some remaining elements to be calculate, and they are calculated with CUDA cores then. The result is accumulated into shared memory.
 
-The complex logic in CUTLASS is while handling the remainder of tiles. First we should init matrix S with 0, and use wmma to load tiled data. For the reminder, since wmma has 3 dimensions M, N, K, we handle the remainder on all the three dimensions.
+The complex logic to active tensor core is while handling the remainder of tiles. First we should init matrix S with 0, and use wmma to load tiled data. For the reminder, since wmma has 3 dimensions M, N, K, we handle the remainder on all the three dimensions.
 
 \begin{lstlisting}     
     // Remainder
@@ -379,7 +385,7 @@ All input tensors ($Q$, $K$, $V$) are maintained in \texttt{fp16} format. Interm
 
 \paragraph{Dataset:} Test cases were generated using randomly shaped tensors (weights and inputs) populated with random \texttt{fp16} values to prevent overflow. The shapes varied in sequence length ($N$), head number ($H$), and head dimension ($D$) to benchmark performance and approach the maximum TFLOPs/s. Based on the evaluation tables, all test cases use a fixed batch size of 1.
 
-\paragraph{Parameter Choice:} An additional key parameter in the FlashAttention algorithm is the tile size. In addition to the naive baseline, a non-CUTLASS FlashAttention was first implemented with two different tile sizes ($45 \times 90$ and $120 \times 120$) to identify a suitable configuration. These tile sizes were selected to fit within the 192KB shared memory limit per Streaming Multiprocessor (SM) of the A100-40G GPU \cite{nvidia2022a100}. The memory footprint for a given tile is calculated as shown in Section~\ref{sec:mem-acc}.
+\paragraph{Parameter Choice:} An additional key parameter in the FlashAttention algorithm is the tile size. In addition to the naive baseline, a non-tensor core FlashAttention was first implemented with two different tile sizes ($45 \times 90$ and $120 \times 120$) to identify a suitable configuration. These tile sizes were selected to fit within the 192KB shared memory limit per Streaming Multiprocessor (SM) of the A100-40G GPU \cite{nvidia2022a100}. The memory footprint for a given tile is calculated as shown in Section~\ref{sec:mem-acc}.
 
 \subsection{Depth Complexity}
 % This section has been rewritten, as the original analysis incorrectly equated
@@ -415,18 +421,18 @@ The evaluation was conducted on an A100-40G GPU, tested on CUDA 12.8 with CUTLAS
 
 The naive implementation relies entirely on HBM and does not utilize shared memory. Consequently, it is memory-bound, with the GPU spending most of its time stalled on HBM accesses rather than performing computation. In contrast, the tiled versions demonstrate significantly lower latency by leveraging shared memory.
 
-The CUTLASS-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of CUTLASS WMMA, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 16 \times 16$ tile layout for Threadblock shape and Warp shape, and $16 \times 16 \times 16$ for instruction shape.
+The tensor core-based implementation (using a $45 \times 90$ tile) achieves the best latency across all test cases. This is attributed to its use of \texttt{nvcuda::wmma::fragment}, which maps operations efficiently to the A100's Tensor Cores using a $16 \times 16 \times 16$ tile layout for Threadblock shape and Warp shape, and $16 \times 16 \times 16$ for instruction shape.
 
-See throughput result in Table~\ref{tab:throughput_comparison} and latency result in Table~\ref{tab:full_comparison}. The speed up rate of Cutlass implementation against Naive implementation indicates Flash Attention is memory bounded\footnote{However, it is quite hard to give a quantitative analysis of speedup without the help of Nsight Compute.}. Another interesting discovery is that the large tile fully utilizing shared memory is not performing as well as small tile. For large tile, the single tile will do more FLOPS, but the concurrency across tiles will be limited. \footnote{I did not managed to achieve the state of art performance as the paper. The P@V is not using Tensor Core yet, and I am having trouble with cutlass layout at this point).}
+See throughput result in Table~\ref{tab:throughput_comparison} and latency result in Table~\ref{tab:full_comparison}. The speed up rate of Tensor Core implementation against Naive implementation indicates Flash Attention is memory bounded\footnote{However, it is quite hard to give a quantitative analysis of speedup without the help of Nsight Compute.}. Another interesting discovery is that the large tile fully utilizing shared memory is not performing as well as small tile. For large tile, the single tile will do more FLOPS, but the concurrency across tiles will be limited. \footnote{I did not managed to achieve the state of art performance as the paper. The P@V is not using Tensor Core yet).}
 
 \begin{table}[htbp]
 \centering
-\caption{FA1xCutlass Throughput (TFLOPs/s and Speedup vs. Naive)}
+\caption{FA1xTensor Core(TC) Throughput (TFLOPs/s and Speedup vs. Naive)}
 \label{tab:throughput_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=1.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2] S[table-format=1.2] S[table-format=2.2]@{}}
 \toprule
-& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
+& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{TC Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
 \textbf{Config (B, H, N, D)} & \multicolumn{1}{c}{\textbf{Naive}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} & \multicolumn{1}{c}{\textbf{TFLOPs/s}} & \multicolumn{1}{c}{\textbf{Speedup}} \\
 \midrule
@@ -445,12 +451,12 @@ See throughput result in Table~\ref{tab:throughput_comparison} and latency resul
 
 \begin{table}[htbp]
 \centering
-\caption{FA1xCutlass Latency (Runtime in ms and Speedup vs. Naive)}
+\caption{FA1xTensor Core Latency (Runtime in ms and Speedup vs. Naive)}
 \label{tab:full_comparison}
 \sisetup{table-number-alignment=center, round-mode=places, round-precision=2}
 \begin{tabular}{@{}l S[table-format=4.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2] S[table-format=4.2] S[table-format=2.2]@{}}
 \toprule
-& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{CUTLASS Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
+& & \multicolumn{2}{c}{\textbf{Tile 45x90}} & \multicolumn{2}{c}{\textbf{TC Tile 45x90}} & \multicolumn{2}{c}{\textbf{Tile 120x120}} \\
 \cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8}
 \textbf{Config (B, H, N, D)} & \mcc{\textbf{Naive}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} & \mcc{\textbf{Time (ms)}} & \mcc{\textbf{Speedup}} \\
 \midrule
