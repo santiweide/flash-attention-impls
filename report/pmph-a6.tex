@@ -417,7 +417,7 @@ static constexpr size_t get_smem_size() {
 \end{lstlisting}
 
 \subsection{Evaluation and Results}
-The evaluation was conducted on an A100-40G GPU, tested on CUDA 12.8 with CUTLASS 3.4.0. The CUDA driver version was $545.23.08$. Cutlass is used mainly for the fp16 type.
+The evaluation was conducted on an A100-40G GPU(fut01), tested on CUDA 12.8 with CUTLASS 3.4.0. The CUDA driver version was $545.23.08$. Cutlass is used mainly for the fp16 type.
 
 The naive implementation relies entirely on HBM and does not utilize shared memory. Consequently, it is memory-bound, with the GPU spending most of its time stalled on HBM accesses rather than performing computation. In contrast, the tiled versions demonstrate significantly lower latency by leveraging shared memory.
 
