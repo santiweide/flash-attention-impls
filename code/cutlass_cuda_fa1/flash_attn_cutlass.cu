@@ -36,43 +36,45 @@
      static constexpr int kHeadDim = HEAD_DIM;
      static constexpr int kThreads = 256;
      
-     static constexpr size_t get_smem_size() {
-         return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +
-                (kTileM * kTileN * 2) * sizeof(float) +  // S and P
-                (kTileM * 2) * sizeof(float) +            // m, l
-                (kTileM * kHeadDim) * sizeof(float);      // O_accum
-     }
+    static constexpr size_t get_smem_size() {
+        return (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t) +  // Q, K, V
+               (kTileM * kTileN) * sizeof(float) +        // S (intermediate scores, FP32 for accuracy)
+               (kTileM * kTileN) * sizeof(cutlass::half_t) +  // P_fp16 (WMMA-ready)
+               (kTileM * 2) * sizeof(float) +            // m, l
+               (kTileM * kHeadDim) * sizeof(float);      // O_accum
+    }
  };
  
  // ==================== Shared Memory Layout ====================
  
- template<typename T, int TILE_M, int TILE_N, int HEAD_DIM>
- struct SharedMemoryCutlass {
-     T* Q;      // [TILE_M, HEAD_DIM]
-     T* K;      // [TILE_N, HEAD_DIM]
-     T* V;      // [TILE_N, HEAD_DIM]
-     float* S;  // [TILE_M, TILE_N]
-     float* P;  // [TILE_M, TILE_N]
-     
-     __device__ SharedMemoryCutlass(void* ptr) {
-         char* base = reinterpret_cast<char*>(ptr);
-         size_t offset = 0;
-         
-         Q = reinterpret_cast<T*>(base + offset);
-         offset += TILE_M * HEAD_DIM * sizeof(T);
-         
-         K = reinterpret_cast<T*>(base + offset);
-         offset += TILE_N * HEAD_DIM * sizeof(T);
-         
-         V = reinterpret_cast<T*>(base + offset);
-         offset += TILE_N * HEAD_DIM * sizeof(T);
-         
-         S = reinterpret_cast<float*>(base + offset);
-         offset += TILE_M * TILE_N * sizeof(float);
-         
-         P = reinterpret_cast<float*>(base + offset);
-     }
- };
+template<typename T, int TILE_M, int TILE_N, int HEAD_DIM>
+struct SharedMemoryCutlass {
+    T* Q;                      // [TILE_M, HEAD_DIM]
+    T* K;                      // [TILE_N, HEAD_DIM]
+    T* V;                      // [TILE_N, HEAD_DIM]
+    float* S;                  // [TILE_M, TILE_N] (intermediate attention scores)
+    cutlass::half_t* P_fp16;   // [TILE_M, TILE_N] (attention probs in FP16 for WMMA)
+    
+    __device__ SharedMemoryCutlass(void* ptr) {
+        char* base = reinterpret_cast<char*>(ptr);
+        size_t offset = 0;
+        
+        Q = reinterpret_cast<T*>(base + offset);
+        offset += TILE_M * HEAD_DIM * sizeof(T);
+        
+        K = reinterpret_cast<T*>(base + offset);
+        offset += TILE_N * HEAD_DIM * sizeof(T);
+        
+        V = reinterpret_cast<T*>(base + offset);
+        offset += TILE_N * HEAD_DIM * sizeof(T);
+        
+        S = reinterpret_cast<float*>(base + offset);
+        offset += TILE_M * TILE_N * sizeof(float);
+        
+        // P stored as FP16 for direct WMMA usage
+        P_fp16 = reinterpret_cast<cutlass::half_t*>(base + offset);
+    }
+};
  
  // ==================== WMMA Tensor Core GEMM ====================
  
@@ -156,22 +158,20 @@ __device__ __forceinline__ void cutlass_gemm_qk(
     }
     __syncthreads();
 }
- // Wrapper for P @ V using WMMA Tensor Cores
- // P is float, V is half_t - need to convert P to half for WMMA
-// ==================== WMMA Tensor Core GEMM (FIXED) ====================
-// ( ... cutlass_gemm_qk 函数 ... )
-
+// ==================== WMMA Tensor Core GEMM: P@V with FP16 P ====================
 // Wrapper for P @ V using WMMA Tensor Cores
+// P is now FP16 (converted immediately after softmax), V is FP16
+// This enables full utilization of WMMA tensor cores for all operations
 template<int TILE_M, int TILE_N, int DIM_K> // DIM_K == HEAD_DIM
 __device__ __forceinline__ void cutlass_gemm_pv(
-    const float* P,               // [TILE_M, TILE_N] (FP32)
-    const cutlass::half_t* V,    // [TILE_N, DIM_K] (FP16)
-    float* O,                     // [TILE_M, DIM_K] (FP32 accum)
-    int q_size,                   // Valid M
-    int k_size,                   // Valid K (P@V 的 K 维度是 TILE_N)
-    int head_dim_size = DIM_K     // Valid N
+    const cutlass::half_t* P_fp16,     // [TILE_M, TILE_N] (FP16 from softmax)
+    const cutlass::half_t* V,          // [TILE_N, DIM_K] (FP16)
+    float* O,                           // [TILE_M, DIM_K] (FP32 accum)
+    int q_size,                         // Valid M
+    int k_size,                         // Valid K (P@V's K dimension is TILE_N)
+    int head_dim_size = DIM_K           // Valid N
 ) {
-    // WMMA 瓦片尺寸 (A100)
+    // WMMA tile sizes (A100: 16x16x16 for FP16→FP32)
     constexpr int WMMA_M = 16;
     constexpr int WMMA_N = 16;
     constexpr int WMMA_K = 16;
@@ -180,67 +180,52 @@ __device__ __forceinline__ void cutlass_gemm_pv(
     const int numWarps = blockDim.x / 32;
     const int laneId = threadIdx.x % 32;
 
-    // GEMM (M, K, N) = (q_size, k_size, head_dim_size)
-    // P: [M, K] (row) - A
-    // V: [K, N] (row) - B
-    // O: [M, N] (row) - C
-
-    // A(row) @ B(col) -> C(row)
-    // V row-major, but load with column major
+    // GEMM dimensions: (M, K, N) = (q_size, k_size, head_dim_size)
+    // P_fp16: [q_size, k_size] (row-major) - Matrix A
+    // V:      [k_size, head_dim_size] (row-major, loaded as col-major) - Matrix B
+    // O:      [q_size, head_dim_size] (row-major) - Matrix C
     
-    // M (q_size)
+    // Iterate over M dimension (query positions)
     for (int m_base = warpId * WMMA_M; m_base < q_size; m_base += numWarps * WMMA_M) {
-        // N (head_dim_size)
+        // Iterate over N dimension (output dimension)
         for (int n_base = 0; n_base < head_dim_size; n_base += WMMA_N) {
             
-            // --- 1. Load C (O_accum) ---
+            // Load accumulator C (O values from previous K/V iterations)
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
             
             if (m_base < q_size && n_base < head_dim_size) {
                 wmma::load_matrix_sync(c_frag, O + m_base * DIM_K + n_base, DIM_K, wmma::mem_row_major);
-            } else { // case tile over flow 
+            } else {
                 wmma::fill_fragment(c_frag, 0.0f);
             }
+            
+            // Iterate over K dimension (context sequence)
             for (int k_base = 0; k_base < k_size; k_base += WMMA_K) {
-                
-                // P: [M, K] (row)
+                // Load A fragment: P_fp16[m_base:m_base+16, k_base:k_base+16]
                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-                // V: [K, N] (col)
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
-
-                // load P (FP32) -> a_frag (FP16)
-                const float* p_tile_base = P + m_base * TILE_N + k_base;
-                int frag_row = laneId % 16;
-                int frag_col_offset = (laneId < 16) ? 0 : 8;
-
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    int current_m = m_base + frag_row;
-                    int current_k = k_base + frag_col_offset + i;
-                    
-                    if (current_m < q_size && current_k < k_size) {
-                        a_frag.x[i] = __float2half_rn(p_tile_base[frag_row * TILE_N + frag_col_offset + i]);
-                    } else {
-                        a_frag.x[i] = __float2half_rn(0.0f); // 边界外用 0 填充
-                    }
+                const half* p_ptr = reinterpret_cast<const half*>(P_fp16 + m_base * TILE_N + k_base);
+                
+                if (m_base < q_size && k_base < k_size) {
+                    wmma::load_matrix_sync(a_frag, p_ptr, TILE_N, wmma::mem_row_major);
+                } else {
+                    wmma::fill_fragment(a_frag, __float2half_rn(0.0f));
                 }
 
-                // load V (FP16) -> b_frag (col_major) 
-                // store V as [TILE_N, DIM_K] (row_major)
-                // laod V[k_base:k_base+16, n_base:n_base+16]
-                // use col_major load ->  V[k_base, n_base]
+                // Load B fragment: V[k_base:k_base+16, n_base:n_base+16]
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
                 const half* v_ptr = reinterpret_cast<const half*>(V + k_base * DIM_K + n_base);
                 
-
                 if (k_base < k_size && n_base < head_dim_size) {
                     wmma::load_matrix_sync(b_frag, v_ptr, DIM_K, wmma::mem_col_major);
                 } else {
                     wmma::fill_fragment(b_frag, __float2half_rn(0.0f));
                 }
 
+                // Perform tensor core matrix multiplication: C += A @ B
                 wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
             }
             
+            // Store accumulated result back to O
             if (m_base < q_size && n_base < head_dim_size) {
                 wmma::store_matrix_sync(O + m_base * DIM_K + n_base, c_frag, DIM_K, wmma::mem_row_major);
             }
@@ -256,13 +241,13 @@ __device__ __forceinline__ void cutlass_gemm_pv(
 // assigned to that warp
 template<int TILE_M, int TILE_N, int DIM_K>
 __device__ __forceinline__ void parallel_softmax_warp(
-    float* S,               // [TILE_M, TILE_N] - attention scores
-    float* P,               // [TILE_M, TILE_N] - attention probabilities
-    float* m_shared,        // [TILE_M] - max values
-    float* l_shared,        // [TILE_M] - normalizing factors
-    float* O_accum,         // [TILE_M, DIM_K] - output accumulator
-    int q_size,             // Number of valid query positions
-    int k_size,             // Number of valid key positions
+    float* S,                       // [TILE_M, TILE_N] - attention scores (FP32)
+    cutlass::half_t* P_fp16,        // [TILE_M, TILE_N] - attention probs (FP16 for WMMA)
+    float* m_shared,                // [TILE_M] - max values
+    float* l_shared,                // [TILE_M] - normalizing factors
+    float* O_accum,                 // [TILE_M, DIM_K] - output accumulator
+    int q_size,                     // Number of valid query positions
+    int k_size,                     // Number of valid key positions
     int num_threads,
     float softmax_scale
 ) {
@@ -296,11 +281,12 @@ __device__ __forceinline__ void parallel_softmax_warp(
         
         // ========== Step 2: Compute softmax exponentials and sum ==========
         // Each lane computes exponentials for its assigned columns and accumulates sum
+        // DIRECTLY CONVERT TO FP16 for WMMA usage
         float l_new = 0.0f;
         for (int j = laneId; j < k_size; j += 32) {
-            float p = expf((S[i * TILE_N + j] * softmax_scale) - m_new);
-            P[i * TILE_N + j] = p;
-            l_new += p;
+            float p_fp32 = expf((S[i * TILE_N + j] * softmax_scale) - m_new);
+            P_fp16[i * TILE_N + j] = cutlass::half_t(p_fp32);  // Convert to FP16 immediately
+            l_new += p_fp32;  // Accumulate in FP32 for precision
         }
         
         // Reduce sum within warp using butterfly shuffle pattern
@@ -414,16 +400,16 @@ __global__ void flash_attn_cutlass_kernel(
              shared_mem.Q, shared_mem.K, shared_mem.S, q_size, k_size
          );
 
-        // Online softmax
+        // Online softmax (computes P_fp16 directly for WMMA)
         parallel_softmax_warp<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.S, shared_mem.P, m_shared, l_shared, O_accum, 
+             shared_mem.S, shared_mem.P_fp16, m_shared, l_shared, O_accum, 
              q_size, k_size, blockDim.x,
-             softmax_scale // <-- 传入新的参数
+             softmax_scale
          );
          
-         // O += P @ V
+         // O += P @ V (now using FP16 P with full WMMA support)
          cutlass_gemm_pv<kTileM, kTileN, HEAD_DIM>(
-             shared_mem.P, shared_mem.V, O_accum, q_size, k_size
+             shared_mem.P_fp16, shared_mem.V, O_accum, q_size, k_size
          );
      }
      
@@ -474,13 +460,14 @@ __global__ void flash_attn_cutlass_kernel(
          printf("================================================================================\n");
          printf("Flash Attention - WMMA Tensor Core + Parallel Softmax (head_dim=%d)\n", HEAD_DIM);
          printf("================================================================================\n");
-         printf("  Tile size: %dx%d (same as Small Tile)\n", Config::kTileM, Config::kTileN);
+         printf("  Tile size: %dx%d\n", Config::kTileM, Config::kTileN);
          printf("  Threads: %d (%d warps)\n", Config::kThreads, Config::kThreads / 32);
          printf("  Shared memory: %.1f KB\n", smem_size / 1024.0);
-         printf("  Tensor Cores: ENABLED via WMMA API\n");
-         printf("    → Q@K^T: wmma::mma_sync (16x16x16 tiles, FP16→FP32)\n");
-         printf("    → P@V:   CUDA cores (FP32 input limitation)\n");
+         printf("  Tensor Cores: FULLY ENABLED via WMMA API (FP16→FP32)\n");
+         printf("    ✓ Q@K^T: wmma::mma_sync (16x16x16 tiles)\n");
+         printf("    ✓ P@V:   wmma::mma_sync (16x16x16 tiles) [FP32→FP16 conversion optimized]\n");
          printf("  Softmax: PARALLEL via warp shuffle (cooperative warp reduction)\n");
+         printf("    → P computed as FP16 directly in softmax for zero-copy to WMMA\n");
          printf("================================================================================\n");
          first_call = false;
      }
