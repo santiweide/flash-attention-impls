@@ -428,40 +428,57 @@ __global__ void flash_attn_cutlass_kernel(
                          }
                      }
                      
-                     __syncthreads();
-                     
-                     // Step 3: Reload P_frag (softmaxed) and apply correction to V
-                     wmma::load_matrix_sync(s_frag, s_temp, 16, wmma::mem_row_major);
-                     
-                     // Load V for this k_base, n_base region
-                     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> v_frag;
-                     const half* v_ptr = reinterpret_cast<const half*>(
-                         shared_mem.V + k_base * HEAD_DIM + n_base);
-                     
-                     if (k_base < k_size && n_base < HEAD_DIM) {
-                         wmma::load_matrix_sync(v_frag, v_ptr, HEAD_DIM);
-                         
-                         // Apply correction scaling to O_accum before accumulation
-                         // This preserves previous KV tiles' contributions
-                         if (!is_first_kv_tile) {
-                             // Extract O to temp, scale by correction, reload
-                             wmma::store_matrix_sync(o_temp, O_accum, 16, wmma::mem_row_major);
-                             __syncthreads();
-                             
-                             for (int idx = tid; idx < 16 * 16; idx += blockDim.x) {
-                                 int i = idx / 16;
-                                 int j = idx % 16;
-                                 if (i < m_valid) {
-                                     o_temp[i * 16 + j] *= correction_reg[i];
-                                 }
-                             }
-                             __syncthreads();
-                             
-                             wmma::load_matrix_sync(O_accum, o_temp, 16, wmma::mem_row_major);
-                         }
-                         
-                         // Accumulate: O += P @ V
-                         wmma::mma_sync(O_accum, s_frag, v_frag, O_accum);
+                    __syncthreads();
+                    
+                    // Step 3: Reload P_frag (softmaxed) as matrix_a for P@V computation
+                    // After softmax, S values are now P (attention probabilities in FP32)
+                    // Convert to FP16 and load as matrix_a for tensor core operation
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+                    
+                    // Convert FP32 P values in s_temp to FP16 and load into p_frag
+                    float* p_temp = (float*)s_temp;  // Reuse s_temp space for conversion
+                    for (int idx = tid; idx < 16 * 16; idx += blockDim.x) {
+                        int i = idx / 16;
+                        int j = idx % 16;
+                        // s_temp contains FP32 softmax values, convert to FP16
+                        half* p_half_ptr = reinterpret_cast<half*>(s_temp + (16 * 16)); // Use upper half of s_temp for FP16
+                        p_half_ptr[i * 16 + j] = __float2half(p_temp[i * 16 + j]);
+                    }
+                    __syncthreads();
+                    
+                    // Load P as matrix_a (FP16)
+                    half* p_half_ptr = reinterpret_cast<half*>(s_temp + (16 * 16));
+                    wmma::load_matrix_sync(p_frag, p_half_ptr, 16, wmma::mem_row_major);
+                    
+                    // Load V for this k_base, n_base region
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> v_frag;
+                    const half* v_ptr = reinterpret_cast<const half*>(
+                        shared_mem.V + k_base * HEAD_DIM + n_base);
+                    
+                    if (k_base < k_size && n_base < HEAD_DIM) {
+                        wmma::load_matrix_sync(v_frag, v_ptr, HEAD_DIM);
+                        
+                        // Apply correction scaling to O_accum before accumulation
+                        // This preserves previous KV tiles' contributions
+                        if (!is_first_kv_tile) {
+                            // Extract O to temp, scale by correction, reload
+                            wmma::store_matrix_sync(o_temp, O_accum, 16, wmma::mem_row_major);
+                            __syncthreads();
+                            
+                            for (int idx = tid; idx < 16 * 16; idx += blockDim.x) {
+                                int i = idx / 16;
+                                int j = idx % 16;
+                                if (i < m_valid) {
+                                    o_temp[i * 16 + j] *= correction_reg[i];
+                                }
+                            }
+                            __syncthreads();
+                            
+                            wmma::load_matrix_sync(O_accum, o_temp, 16, wmma::mem_row_major);
+                        }
+                        
+                        // Accumulate: O += P @ V (now with correct fragment types)
+                        wmma::mma_sync(O_accum, p_frag, v_frag, O_accum);
                      }
                  }
                  
