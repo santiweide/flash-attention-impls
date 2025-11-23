@@ -35,15 +35,14 @@ struct CutlassSmallTileConfig {
     static constexpr int kThreads = 256;
     
     static constexpr size_t get_smem_size() {
-        // 1. Q, K, V 的大小
         size_t qkv_size = (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t);
         
-        // - s_temp (float 16x16) = 256 * 4 bytes = 1024 bytes
-        // - p_half_ptr (half 16x16) = 256 * 2 bytes = 512 bytes (用于类型转换)
-        // 加上一些对齐 padding，我们预留 2KB 足够安全
-        size_t scratch_size = 2048; 
+        if (qkv_size % 16 != 0) qkv_size += (16 - (qkv_size % 16));
 
-        return qkv_size + scratch_size;
+        int num_warps = kThreads / 32;
+        size_t scratch_per_warp = 2048;
+        
+        return qkv_size + (num_warps * scratch_per_warp);
     }
 };
  
