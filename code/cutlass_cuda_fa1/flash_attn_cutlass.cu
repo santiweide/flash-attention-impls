@@ -19,19 +19,23 @@ struct CutlassSmallTileConfig {
         return 32;
     }
     
-    // M=16, N=32 for HeadDim=128
+    // 对于 HeadDim=128, M=16 (一个Warp处理一块), N=32
     static constexpr int kTileM = compute_small_tile_size() / 2; 
     static constexpr int kTileN = compute_small_tile_size();     
     static constexpr int kHeadDim = HEAD_DIM;
-    // [OPTIONAL] We could reduce threads to 32 since M=16 only uses 1 warp.
-    // But keeping 128 allows faster Shared Mem loading.
     static constexpr int kThreads = 128;
     
     static constexpr size_t get_smem_size() {
         size_t qkv_size = (kTileM * kHeadDim + kTileN * kHeadDim * 2) * sizeof(cutlass::half_t);
+        // Align QKV end to 16 bytes
         if (qkv_size % 16 != 0) qkv_size += (16 - (qkv_size % 16));
+        
         int num_warps = kThreads / 32;
-        size_t scratch_per_warp = 2048 + 1024; 
+        // Scratch per warp: 
+        // 1. S_matrix (float 16x16) = 1024 bytes
+        // 2. O_rescale (float 16x16) = 1024 bytes
+        // Total 2048 bytes + padding
+        size_t scratch_per_warp = 2048 + 512; 
         return qkv_size + (num_warps * scratch_per_warp);
     }
 };
@@ -42,9 +46,12 @@ struct SharedMemoryCutlass {
     T* Q;
     T* K;
     T* V;
-    __device__ SharedMemoryCutlass(void* ptr) {
-        char* base = reinterpret_cast<char*>(ptr);
+    
+    __device__ SharedMemoryCutlass(void* base_ptr) {
+        // base_ptr MUST be 16-byte aligned
+        char* base = reinterpret_cast<char*>(base_ptr);
         Q = reinterpret_cast<T*>(base);
+        // Offsets are pre-calculated to be naturally aligned if TILE/HEAD_DIM are standard
         K = reinterpret_cast<T*>(base + TILE_M * HEAD_DIM * sizeof(T));
         V = reinterpret_cast<T*>(base + (TILE_M * HEAD_DIM + TILE_N * HEAD_DIM) * sizeof(T));
     }
@@ -58,8 +65,13 @@ __device__ __forceinline__ void apply_rescaling_via_smem(
     int m_valid,
     int laneId
 ) {
+    // 1. Store Fragment to Shared Memory (float)
     wmma::store_matrix_sync(scratch_ptr, o_frag, 16, wmma::mem_row_major);
     __syncwarp();
+
+    // 2. Apply correction spatially
+    // scratch_ptr is 16x16 floats.
+    // We treat it as a linear array where index = row * 16 + col
     #pragma unroll
     for (int i = laneId; i < 256; i += 32) {
         int row = i / 16;
@@ -68,6 +80,8 @@ __device__ __forceinline__ void apply_rescaling_via_smem(
         }
     }
     __syncwarp();
+
+    // 3. Load back to Fragment
     wmma::load_matrix_sync(o_frag, scratch_ptr, 16, wmma::mem_row_major);
 }
 
@@ -88,6 +102,9 @@ __global__ void flash_attn_cutlass_kernel(
      constexpr int kTileM = Config::kTileM;
      constexpr int kTileN = Config::kTileN;
      
+     // [FIX] CRITICAL: Align Shared Memory Base to 16 Bytes for WMMA
+     extern __shared__ __align__(16) char smem[];
+     
      const int batch_idx = blockIdx.z;
      const int head_idx = blockIdx.y;
      const int q_block_idx = blockIdx.x;
@@ -97,6 +114,7 @@ __global__ void flash_attn_cutlass_kernel(
      
      const int q_start = q_block_idx * kTileM;
      if (q_start >= seq_len) return;
+     
      const int q_end = min(q_start + kTileM, seq_len);
      const int q_size = q_end - q_start;
      
@@ -106,13 +124,18 @@ __global__ void flash_attn_cutlass_kernel(
      const cutlass::half_t* V_base = V + offset;
      cutlass::half_t* O_base = O + offset;
      
-     extern __shared__ char smem[];
      SharedMemoryCutlass<cutlass::half_t, kTileM, kTileN, HEAD_DIM> shared_mem(smem);
      
-     size_t qkv_offset = (kTileM * HEAD_DIM + kTileN * HEAD_DIM * 2) * sizeof(cutlass::half_t);
-     if (qkv_offset % 16 != 0) qkv_offset += (16 - (qkv_offset % 16));
+     // Setup Scratchpad Pointers
+     size_t qkv_size = (kTileM * HEAD_DIM + kTileN * HEAD_DIM * 2) * sizeof(cutlass::half_t);
+     // Align offset to 16 bytes
+     if (qkv_size % 16 != 0) qkv_size += (16 - (qkv_size % 16));
      
-     float* s_scratch = reinterpret_cast<float*>(smem + qkv_offset + (warpId * 3072));
+     // Scratch Memory per Warp
+     // s_scratch: for storing S (float) and P (float)
+     float* s_scratch = reinterpret_cast<float*>(smem + qkv_size + (warpId * 2560)); // Stride > 2048 for safety
+     // o_scratch: for rescaling O (float) and P (half) conversion
+     // Offset by 256 floats (1024 bytes)
      float* o_scratch = s_scratch + 256; 
      
      // 1. Load Q Tile (Persistent)
@@ -142,13 +165,13 @@ __global__ void flash_attn_cutlass_kernel(
 
      const int num_kv_tiles = (seq_len + kTileN - 1) / kTileN;
 
-     // [FIX] Loop MUST be outside the warp check to ensure syncthreads works!
+     // Loop over KV tiles
      for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
          const int k_start = kv_tile_idx * kTileN;
          const int k_end = min(k_start + kTileN, seq_len);
          const int k_size = k_end - k_start;
          
-         // 1. Load K and V tiles (ALL threads participate)
+         // 1. Load K and V tiles (All threads participate)
          __syncthreads(); 
          for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
              int i = idx / HEAD_DIM;
@@ -156,9 +179,11 @@ __global__ void flash_attn_cutlass_kernel(
              shared_mem.K[i * HEAD_DIM + j] = K_base[(k_start + i) * HEAD_DIM + j];
              shared_mem.V[i * HEAD_DIM + j] = V_base[(k_start + i) * HEAD_DIM + j];
          }
-         __syncthreads(); // Barrier safe here because all threads reach it
+         __syncthreads();
          
          // 2. Compute (Only active warps)
+         // NOTE: m_valid > 0 only for Warp 0 if TileM=16. 
+         // Other warps skip this block entirely.
          if (m_valid > 0) {
              for (int k_base = 0; k_base < k_size; k_base += 16) {
                  int k_valid = min(16, k_size - k_base);
@@ -171,15 +196,17 @@ __global__ void flash_attn_cutlass_kernel(
                      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> q_frag;
                      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> k_frag;
                      
+                     // Cast to standard half* for WMMA
                      const half* q_p = reinterpret_cast<const half*>(shared_mem.Q + m_base_warp * HEAD_DIM + h_dim);
-                     const half* k_ptr_correct = reinterpret_cast<const half*>(shared_mem.K + (k_base) * HEAD_DIM + h_dim);
+                     // K is loaded Col-Major from Row-Major memory -> effectively K^T
+                     const half* k_p = reinterpret_cast<const half*>(shared_mem.K + (k_base) * HEAD_DIM + h_dim);
 
                      wmma::load_matrix_sync(q_frag, q_p, HEAD_DIM);
-                     wmma::load_matrix_sync(k_frag, k_ptr_correct, HEAD_DIM);
+                     wmma::load_matrix_sync(k_frag, k_p, HEAD_DIM);
                      wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
                  }
                  
-                 // --- Step B: Softmax ---
+                 // --- Step B: Softmax (Exp, Sum, Update Stats) ---
                  wmma::store_matrix_sync(s_scratch, s_frag, 16, wmma::mem_row_major);
                  __syncwarp();
                  
@@ -187,6 +214,7 @@ __global__ void flash_attn_cutlass_kernel(
                  
                  for (int row = 0; row < m_valid; row++) {
                      float row_max = -INFINITY;
+                     // Only consider valid K columns
                      for (int col = laneId; col < k_valid; col += 32) {
                          row_max = fmaxf(row_max, s_scratch[row * 16 + col] * softmax_scale);
                      }
@@ -203,7 +231,7 @@ __global__ void flash_attn_cutlass_kernel(
                      for (int col = laneId; col < k_valid; col += 32) {
                          float val = s_scratch[row * 16 + col] * softmax_scale;
                          float p = expf(val - m_curr);
-                         s_scratch[row * 16 + col] = p; 
+                         s_scratch[row * 16 + col] = p; // Overwrite S with P
                          row_sum += p;
                      }
                      #pragma unroll
@@ -218,11 +246,13 @@ __global__ void flash_attn_cutlass_kernel(
                  __syncwarp();
                  
                  // --- Step C: Rescale O Accumulators ---
+                 // Apply 'correction' to existing O
                  for(int f = 0; f < MAX_FRAGS; f++) {
                      apply_rescaling_via_smem(O_accums[f], o_scratch, row_corrections, m_valid, laneId);
                  }
                  
                  // --- Step D: Compute P @ V ---
+                 // Convert P (float in s_scratch) to Half (into o_scratch buffer)
                  cutlass::half_t* p_half_ptr = reinterpret_cast<cutlass::half_t*>(o_scratch);
                  for (int idx = laneId; idx < 16 * 16; idx += 32) {
                      p_half_ptr[idx] = cutlass::half_t(s_scratch[idx]);
@@ -234,6 +264,7 @@ __global__ void flash_attn_cutlass_kernel(
                  
                  for (int h_chunk = 0; h_chunk < MAX_FRAGS; h_chunk++) {
                      int h_dim = h_chunk * 16;
+                     // V Loaded as Row Major (Standard MatMul P x V)
                      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
                      const half* v_p = reinterpret_cast<const half*>(shared_mem.V + k_base * HEAD_DIM + h_dim);
                      
@@ -242,14 +273,15 @@ __global__ void flash_attn_cutlass_kernel(
                          wmma::mma_sync(O_accums[h_chunk], p_frag, v_frag, O_accums[h_chunk]);
                      }
                  }
-             } 
-         } // End Compute Block
-     } // End KV-Tile Loop
+             } // End K-block
+         } // End Compute
+     } // End KV-Tile
      
      // ==== FINALIZATION ====
      if (m_valid > 0) {
          for(int h_chunk = 0; h_chunk < MAX_FRAGS; h_chunk++) {
              int h_dim = h_chunk * 16;
+             // Store unnormalized O to scratch
              wmma::store_matrix_sync(s_scratch, O_accums[h_chunk], 16, wmma::mem_row_major);
              __syncwarp();
              
@@ -262,7 +294,7 @@ __global__ void flash_attn_cutlass_kernel(
                      float norm = (l_reg[r] == 0.0f) ? 0.0f : (1.0f / l_reg[r]);
                      
                      int global_row = q_start + m_base_warp + r;
-                     if (global_row < seq_len) { // Correct boundary check
+                     if (global_row < seq_len) {
                         O_base[global_row * HEAD_DIM + (h_dim + c)] = cutlass::half_t(val * norm);
                      }
                  }
@@ -286,11 +318,15 @@ void flash_attn_cutlass_forward(
 ) {
     using Config = CutlassSmallTileConfig<HEAD_DIM>;
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+    
+    // Check if seq_len is covered
     const int num_q_blocks = (seq_len + Config::kTileM - 1) / Config::kTileM;
+    
     dim3 grid(num_q_blocks, num_heads, batch_size);
     dim3 block(Config::kThreads);
     size_t smem_size = Config::get_smem_size();
     
+    // Ensure we have enough Shared Mem
     cudaFuncSetAttribute(flash_attn_cutlass_kernel<HEAD_DIM>, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
     
     flash_attn_cutlass_kernel<HEAD_DIM><<<grid, block, smem_size, stream>>>(
