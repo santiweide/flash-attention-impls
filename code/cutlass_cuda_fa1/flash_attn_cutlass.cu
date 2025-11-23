@@ -228,8 +228,12 @@ __device__ __forceinline__ void accumulate_pv_fragment(
             wmma::fill_fragment(v_frag, 0.0f);
         }
         
-        // O_accum += S_frag @ V_frag
-        wmma::mma_sync(o_accum_frag, s_frag, v_frag, o_accum_frag);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+
+        for (int i = 0; i < p_frag.num_elements; i++) {
+            p_frag.x[i] = __float2half(s_frag.x[i]); 
+        }
+        wmma::mma_sync(o_accum_frag, p_frag, v_frag, o_accum_frag);
     }
 }
  
@@ -448,7 +452,7 @@ __global__ void flash_attn_cutlass_kernel(
                     
                     // Load P as matrix_a (FP16)
                     half* p_half_ptr = reinterpret_cast<half*>(s_temp + (16 * 16));
-                    wmma::load_matrix_sync(p_frag, p_half_ptr, 16, wmma::mem_row_major);
+                    wmma::load_matrix_sync(p_frag, p_half_ptr, 16);
                     
                     // Load V for this k_base, n_base region
                     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> v_frag;
