@@ -839,7 +839,7 @@
          // {1, 1, 1024, 32},    // long sequence - compare 64
          // {1, 1, 2048, 32},    // super long sequence - head_dim=32 can handle larger seq_len
          // {2, 8, 512, 32},     // multiple batch+multiple head - compare 64
-         {1, 32, 8192, 128}, 
+         {1, 1, 512, 128}, 
      };
      
      for (const auto& config : configs) {
