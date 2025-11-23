@@ -157,7 +157,6 @@ __global__ void flash_attn_cutlass_kernel(
                  int k_valid = min(16, k_size - k_base);
                  
                  // --- Step A: Compute S = Q @ K^T ---
-                 // K is loaded Col-Major to transpose it effectively
                  wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
                  wmma::fill_fragment(s_frag, 0.0f);
                  
@@ -228,8 +227,7 @@ __global__ void flash_attn_cutlass_kernel(
                  
                  for (int h_chunk = 0; h_chunk < MAX_FRAGS; h_chunk++) {
                      int h_dim = h_chunk * 16;
-                     // [FIX] USE ROW MAJOR FOR V! We want standard MatMul P x V here.
-                     // P has Cols=Keys, V has Rows=Keys.
+                     // [FIX] Row Major for V
                      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
                      
                      const half* v_p = reinterpret_cast<const half*>(shared_mem.V + k_base * HEAD_DIM + h_dim);
@@ -256,9 +254,10 @@ __global__ void flash_attn_cutlass_kernel(
                      float val = s_scratch[i];
                      float norm = (l_reg[r] == 0.0f) ? 0.0f : (1.0f / l_reg[r]);
                      
+                     // [FIX] CORRECT GLOBAL OFFSET: Add q_start!
                      int global_row = q_start + m_base_warp + r;
-                     if (global_row < q_size + q_start) {
-                        O_base[(m_base_warp + r) * HEAD_DIM + (h_dim + c)] = cutlass::half_t(val * norm);
+                     if (global_row < seq_len) {
+                        O_base[global_row * HEAD_DIM + (h_dim + c)] = cutlass::half_t(val * norm);
                      }
                  }
              }
