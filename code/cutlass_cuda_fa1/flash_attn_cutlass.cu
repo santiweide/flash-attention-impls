@@ -321,110 +321,108 @@ __global__ void flash_attn_cutlass_kernel(
          correction_reg[i] = 1.0f;  // No scaling for first KV tile
      }
      
-    // ... (Main Loop 开始) ...
-    const int num_kv_tiles = (seq_len + kTileN - 1) / kTileN;
-    bool is_first_kv_tile = true;
-    
-    for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
-        // ... (加载 KV 保持不变) ...
-        const int k_start = kv_tile_idx * kTileN;
-        const int k_end = min(k_start + kTileN, seq_len);
-        const int k_size = k_end - k_start;
+     // ... (Main Loop 开始) ...
+     const int num_kv_tiles = (seq_len + kTileN - 1) / kTileN;
+     bool is_first_kv_tile = true;
+     
+     for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
+         // ... (加载 KV 保持不变) ...
+         const int k_start = kv_tile_idx * kTileN;
+         const int k_end = min(k_start + kTileN, seq_len);
+         const int k_size = k_end - k_start;
 
-        for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
-            int i = idx / HEAD_DIM;
-            int j = idx % HEAD_DIM;
-            shared_mem.K[i * HEAD_DIM + j] = K_ptr[(k_start + i) * HEAD_DIM + j];
-            shared_mem.V[i * HEAD_DIM + j] = V_ptr[(k_start + i) * HEAD_DIM + j];
-        }
-        __syncthreads();
-        
-        // ... (m_base 循环 和 n_base 循环保持不变) ...
-        for (int m_base = warpId * 16; m_base < q_size; m_base += numWarps * 16) {
-            int m_valid = min(16, q_size - m_base);
-            
-            for (int n_base = 0; n_base < HEAD_DIM; n_base += 16) {
-                int n_valid = min(16, HEAD_DIM - n_base);
-                
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> O_accum;
-                wmma::fill_fragment(O_accum, 0.0f);
-                
-                // 如果不是第一个 block，需要恢复 O_accum 的值 (这里逻辑比较复杂，简化处理先置0或仅在最后写回)
-                // 注意：真正的 Flash Attention 这里的 O_accum 应该跨越 KV 循环累加，不能在这里清零！
-                // 修正逻辑：O_accum 定义应该提到 KV 循环外面，或者如果是 Block-Parallel，需要 load partial O
-                // 为了修复 Crash，我们先关注内存，逻辑上要注意 O_accum 的生命周期。
-                
-                // [警告]：在你的原代码逻辑中，O_accum 在每个 n_base 循环里被重置了。
-                // 这对于 Head Dim 分块是对的，但是对于 KV 循环是不对的。
-                // 但为了不改变太多逻辑导致混淆，我们先解决 Memory Access 问题。
+         for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
+             int i = idx / HEAD_DIM;
+             int j = idx % HEAD_DIM;
+             shared_mem.K[i * HEAD_DIM + j] = K_ptr[(k_start + i) * HEAD_DIM + j];
+             shared_mem.V[i * HEAD_DIM + j] = V_ptr[(k_start + i) * HEAD_DIM + j];
+         }
+         __syncthreads();
+         
+         // ... (m_base 循环 和 n_base 循环保持不变) ...
+         for (int m_base = warpId * 16; m_base < q_size; m_base += numWarps * 16) {
+             int m_valid = min(16, q_size - m_base);
+             
+             for (int n_base = 0; n_base < HEAD_DIM; n_base += 16) {
+                 int n_valid = min(16, HEAD_DIM - n_base);
+                 
+                 wmma::fragment<wmma::accumulator, 16, 16, 16, float> O_accum;
+                 wmma::fill_fragment(O_accum, 0.0f);
+                 
+                 // 如果不是第一个 block，需要恢复 O_accum 的值 (这里逻辑比较复杂，简化处理先置0或仅在最后写回)
+                 // 注意：真正的 Flash Attention 这里的 O_accum 应该跨越 KV 循环累加，不能在这里清零！
+                 // 修正逻辑：O_accum 定义应该提到 KV 循环外面，或者如果是 Block-Parallel，需要 load partial O
+                 // 为了修复 Crash，我们先关注内存，逻辑上要注意 O_accum 的生命周期。
+                 
+                 // [警告]：在你的原代码逻辑中，O_accum 在每个 n_base 循环里被重置了。
+                 // 这对于 Head Dim 分块是对的，但是对于 KV 循环是不对的。
+                 // 但为了不改变太多逻辑导致混淆，我们先解决 Memory Access 问题。
 
-                for (int k_base = 0; k_base < k_size; k_base += 16) {
-                    // ... (Q@K 计算部分，用到 s_frag) ...
-                    int k_valid = min(16, k_size - k_base);
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> q_frag;
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> k_frag;
-                    wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
-                    wmma::fill_fragment(s_frag, 0.0f);
+                 for (int k_base = 0; k_base < k_size; k_base += 16) {
+                     // ... (Q@K 计算部分，用到 s_frag) ...
+                     int k_valid = min(16, k_size - k_base);
+                     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> q_frag;
+                     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> k_frag;
+                     wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
+                     wmma::fill_fragment(s_frag, 0.0f);
 
-                    // ... (mma loop) ...
-                    const int k_main_loop = (HEAD_DIM / 16) * 16; 
-                    // [FIX] 注意这里的 k 是 Head Dim 维度的，不应该混淆
-                    // 原代码逻辑似乎把 K loop 当作 accumulation 维度。
-                    // Q [M, d], K [N, d]. Q@K^T -> [M, N]. Accumulation axis is d (HEAD_DIM).
-                    // 所以内部循环是 correct 的。
-                    
-                    for (int k = 0; k < k_main_loop; k += 16) {
-                        const half* q_ptr = shared_mem.Q + m_base * HEAD_DIM + k;
-                        const half* k_ptr = shared_mem.K + k_base * HEAD_DIM + k;
-                        wmma::load_matrix_sync(q_frag, q_ptr, HEAD_DIM);
-                        wmma::load_matrix_sync(k_frag, k_ptr, HEAD_DIM);
-                        wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
-                    }
-                    
-                    // ... (Remainder logic, Store to s_temp) ...
-                    // [这里是 Crash 点 1]
-                    wmma::store_matrix_sync(s_temp, s_frag, 16, wmma::mem_row_major);
-                    __syncthreads(); // 必须同步，因为下面用 thread 访问
+                     // Q@K dot product over HEAD_DIM dimension
+                     const int k_main_loop = (HEAD_DIM / 16) * 16; 
+                     // [FIX] 注意这里的 k 是 Head Dim 维度的，不应该混淆
+                     // 原代码逻辑似乎把 K loop 当作 accumulation 维度。
+                     // Q [M, d], K [N, d]. Q@K^T -> [M, N]. Accumulation axis is d (HEAD_DIM).
+                     // 所以内部循环是 correct 的。
+                     
+                     for (int k = 0; k < k_main_loop; k += 16) {
+                         const half* q_ptr = reinterpret_cast<const half*>(shared_mem.Q + m_base * HEAD_DIM + k);
+                         const half* k_ptr = reinterpret_cast<const half*>(shared_mem.K + k_base * HEAD_DIM + k);
+                         wmma::load_matrix_sync(q_frag, q_ptr, HEAD_DIM);
+                         wmma::load_matrix_sync(k_frag, k_ptr, HEAD_DIM);
+                         wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
+                     }
+                     
+                     // ... (Remainder logic, Store to s_temp) ...
+                     // [这里是 Crash 点 1]
+                     wmma::store_matrix_sync(s_temp, s_frag, 16, wmma::mem_row_major);
+                     __syncthreads(); // 必须同步，因为下面用 thread 访问
 
-                    // ... (Softmax Logic, Writes back to s_temp) ...
-                    // [这里是 Crash 点 2 - 读写 s_temp]
-                    
-                    __syncthreads();
+                     // ... (Softmax Logic, Writes back to s_temp) ...
+                     // [这里是 Crash 点 2 - 读写 s_temp]
+                     
+                     __syncthreads();
 
-                    // Step 3: Reload P_frag
-                    // 将 s_temp (float) 转为 p_half_temp (half)
-                    float* p_src = s_temp;
-                    cutlass::half_t* p_dst = p_half_temp;
+                     // Step 3: Reload P_frag
+                     // 将 s_temp (float) 转为 p_half_temp (half)
+                     float* p_src = s_temp;
+                     cutlass::half_t* p_dst = p_half_temp;
 
-                    for (int idx = tid; idx < 16 * 16; idx += blockDim.x) {
-                    int r = idx / 16;
-                    int c = idx % 16;
-                    p_dst[r * 16 + c] = cutlass::half_t(p_src[r * 16 + c]);
-                    }
-                    __syncthreads();
-                    
-                    // Load P as matrix_a
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-                    // [这里是 Crash 点 3] 加载 p_half_temp
-                    wmma::load_matrix_sync(p_frag, (half*)p_half_temp, 16); 
+                     for (int idx = tid; idx < 16 * 16; idx += blockDim.x) {
+                        int r = idx / 16;
+                        int c = idx % 16;
+                        p_dst[r * 16 + c] = cutlass::half_t(p_src[r * 16 + c]);
+                     }
+                     __syncthreads();
+                     
+                     // Load P as matrix_a
+                     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+                     // [这里是 Crash 点 3] 加载 p_half_temp
+                     wmma::load_matrix_sync(p_frag, (half*)p_half_temp, 16); 
 
-                    // ... (后续 P@V 计算) ...
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> v_frag;
-                    // V 是 [N, d], V^T 这种布局比较复杂，这里假设 V 在 SMEM 是 RowMajor
-                    // P [16, 16] @ V [16, d_chunk]. 
-                    // 你的代码用 n_base 索引 V，似乎在切分 V 的列。
-                    const half* v_ptr = shared_mem.V + k_base * HEAD_DIM + n_base;
-                    wmma::load_matrix_sync(v_frag, v_ptr, HEAD_DIM);
-                    
-                    wmma::mma_sync(O_accum, p_frag, v_frag, O_accum);
-                }
-                 // Store O_accum back to shared memory for final output writing
-                 wmma::store_matrix_sync(o_temp, O_accum, 16, wmma::mem_row_major);
-                 __syncthreads();
-            }
-        }
-        is_first_kv_tile = false;
-    }
+                     // Load V for this k_base, n_base region
+                     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> v_frag;
+                     // V 是 [N, d], V^T 这种布局比较复杂，这里假设 V 在 SMEM 是 RowMajor
+                     // P [16, 16] @ V [16, d_chunk]. 
+                     // 你的代码用 n_base 索引 V，似乎在切分 V 的列。
+                     const half* v_ptr = reinterpret_cast<const half*>(shared_mem.V + k_base * HEAD_DIM + n_base);
+                     wmma::load_matrix_sync(v_frag, v_ptr, HEAD_DIM);
+                     
+                     wmma::mma_sync(O_accum, p_frag, v_frag, O_accum);
+                 }
+                 // ...
+             }
+         }
+         is_first_kv_tile = false;
+     }
 
 // ===== FINALIZATION: Normalize and write to global memory =====
     // Each thread writes its assigned output positions
