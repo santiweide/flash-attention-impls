@@ -197,8 +197,13 @@ __device__ __forceinline__ void fused_qk_softmax_step(
         const half* v_ptr = reinterpret_cast<const half*>(V + n_idx * DIM_K + v_base);
         wmma::load_matrix_sync(v_frag, v_ptr, DIM_K);
         
-        // Accumulate: O += P @ V (s_frag is now P after softmax)
-        wmma::mma_sync(O_accum_frag, s_frag, v_frag, O_accum_frag);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+
+        for (int i = 0; i < p_frag.num_elements; i++) {
+            p_frag.x[i] = __float2half(s_frag.x[i]);
+        }
+
+        wmma::mma_sync(O_accum_frag, p_frag, v_frag, O_accum_frag);
     }
 }
 // ==================== Direct P@V in Fragment Form (no separate shared memory) ====================
