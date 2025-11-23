@@ -105,17 +105,18 @@ __global__ void flash_attn_cutlass_kernel(
      int num_heads,
      int seq_len
 ) {
-     using Config = CutlassSmallTileConfig<HEAD_DIM>;
-     constexpr int kTileM = Config::kTileM;
-     constexpr int kTileN = Config::kTileN;
-     
-     const int batch_idx = blockIdx.z;
-     const int head_idx = blockIdx.y;
-     const int q_block_idx = blockIdx.x;
-     const int tid = threadIdx.x;
-     const int warpId = tid / 32;
-     
-     // Bounds check
+    using Config = CutlassSmallTileConfig<HEAD_DIM>;
+    constexpr int kTileM = Config::kTileM;
+    constexpr int kTileN = Config::kTileN;
+    
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warpId = tid / 32;
+    const int laneId = tid % 32;
+    
+    // Bounds check
      const int q_start = q_block_idx * kTileM;
      if (q_start >= seq_len) return;
      
@@ -216,7 +217,6 @@ __global__ void flash_attn_cutlass_kernel(
                  wmma::store_matrix_sync(s_scratch, s_frag, 16, wmma::mem_row_major);
                  __syncwarp();
                  
-                 const int laneId = tid % 32;
                  float row_corrections[16]; // Store corrections to apply to O later
                  
                  for (int row = 0; row < m_valid; row++) {
