@@ -19,9 +19,12 @@ struct CutlassSmallTileConfig {
         return 32;
     }
     
+    // M=16, N=32 for HeadDim=128
     static constexpr int kTileM = compute_small_tile_size() / 2; 
     static constexpr int kTileN = compute_small_tile_size();     
     static constexpr int kHeadDim = HEAD_DIM;
+    // [OPTIONAL] We could reduce threads to 32 since M=16 only uses 1 warp.
+    // But keeping 128 allows faster Shared Mem loading.
     static constexpr int kThreads = 128;
     
     static constexpr size_t get_smem_size() {
@@ -112,7 +115,7 @@ __global__ void flash_attn_cutlass_kernel(
      float* s_scratch = reinterpret_cast<float*>(smem + qkv_offset + (warpId * 3072));
      float* o_scratch = s_scratch + 256; 
      
-     // 1. Load Q Tile
+     // 1. Load Q Tile (Persistent)
      for (int idx = tid; idx < q_size * HEAD_DIM; idx += blockDim.x) {
          int i = idx / HEAD_DIM;
          int j = idx % HEAD_DIM;
@@ -120,6 +123,7 @@ __global__ void flash_attn_cutlass_kernel(
      }
      __syncthreads();
 
+     // Initialize Accumulators
      constexpr int MAX_FRAGS = HEAD_DIM / 16; 
      wmma::fragment<wmma::accumulator, 16, 16, 16, float> O_accums[MAX_FRAGS];
      #pragma unroll
@@ -138,21 +142,24 @@ __global__ void flash_attn_cutlass_kernel(
 
      const int num_kv_tiles = (seq_len + kTileN - 1) / kTileN;
 
-     if (m_valid > 0) {
-         for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
-             const int k_start = kv_tile_idx * kTileN;
-             const int k_end = min(k_start + kTileN, seq_len);
-             const int k_size = k_end - k_start;
-             
-             __syncthreads(); 
-             for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
-                 int i = idx / HEAD_DIM;
-                 int j = idx % HEAD_DIM;
-                 shared_mem.K[i * HEAD_DIM + j] = K_base[(k_start + i) * HEAD_DIM + j];
-                 shared_mem.V[i * HEAD_DIM + j] = V_base[(k_start + i) * HEAD_DIM + j];
-             }
-             __syncthreads();
-             
+     // [FIX] Loop MUST be outside the warp check to ensure syncthreads works!
+     for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
+         const int k_start = kv_tile_idx * kTileN;
+         const int k_end = min(k_start + kTileN, seq_len);
+         const int k_size = k_end - k_start;
+         
+         // 1. Load K and V tiles (ALL threads participate)
+         __syncthreads(); 
+         for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
+             int i = idx / HEAD_DIM;
+             int j = idx % HEAD_DIM;
+             shared_mem.K[i * HEAD_DIM + j] = K_base[(k_start + i) * HEAD_DIM + j];
+             shared_mem.V[i * HEAD_DIM + j] = V_base[(k_start + i) * HEAD_DIM + j];
+         }
+         __syncthreads(); // Barrier safe here because all threads reach it
+         
+         // 2. Compute (Only active warps)
+         if (m_valid > 0) {
              for (int k_base = 0; k_base < k_size; k_base += 16) {
                  int k_valid = min(16, k_size - k_base);
                  
@@ -227,9 +234,7 @@ __global__ void flash_attn_cutlass_kernel(
                  
                  for (int h_chunk = 0; h_chunk < MAX_FRAGS; h_chunk++) {
                      int h_dim = h_chunk * 16;
-                     // [FIX] Row Major for V
                      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-                     
                      const half* v_p = reinterpret_cast<const half*>(shared_mem.V + k_base * HEAD_DIM + h_dim);
                      
                      if (k_base < k_size) {
@@ -237,10 +242,12 @@ __global__ void flash_attn_cutlass_kernel(
                          wmma::mma_sync(O_accums[h_chunk], p_frag, v_frag, O_accums[h_chunk]);
                      }
                  }
-             } // End K-block
-         } // End KV-Tile
-         
-         // ==== FINALIZATION ====
+             } 
+         } // End Compute Block
+     } // End KV-Tile Loop
+     
+     // ==== FINALIZATION ====
+     if (m_valid > 0) {
          for(int h_chunk = 0; h_chunk < MAX_FRAGS; h_chunk++) {
              int h_dim = h_chunk * 16;
              wmma::store_matrix_sync(s_scratch, O_accums[h_chunk], 16, wmma::mem_row_major);
@@ -254,9 +261,8 @@ __global__ void flash_attn_cutlass_kernel(
                      float val = s_scratch[i];
                      float norm = (l_reg[r] == 0.0f) ? 0.0f : (1.0f / l_reg[r]);
                      
-                     // [FIX] CORRECT GLOBAL OFFSET: Add q_start!
                      int global_row = q_start + m_base_warp + r;
-                     if (global_row < seq_len) {
+                     if (global_row < seq_len) { // Correct boundary check
                         O_base[global_row * HEAD_DIM + (h_dim + c)] = cutlass::half_t(val * norm);
                      }
                  }
