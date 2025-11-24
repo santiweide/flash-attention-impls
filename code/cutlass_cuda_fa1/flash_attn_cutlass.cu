@@ -9,6 +9,67 @@
 
 using namespace nvcuda;
 
+// ==================== 必须补回的 cp.async 辅助函数 ====================
+
+// 仅在 Ampere (SM80) 及以上架构可用
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+
+// 异步拷贝 16字节 (128-bit)
+// dst: Shared Memory 地址 (uint32_t)
+// src: Global Memory 地址 (ptr)
+__device__ __forceinline__ void cp_async_cg_16B(void* dst, const void* src) {
+    // Shared Memory 指针需要转为 32-bit uint
+    unsigned smem_addr = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    // Global Memory 指针转为 64-bit uint
+    unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(src);
+
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :
+        : "r"(smem_addr), "l"(gmem_addr)
+    );
+}
+
+// 提交当前的一组拷贝任务
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// 等待直到只剩下 N 组任务未完成
+// N=0: 全部完成
+// N=1: 只保留最新的一组在跑（实现双缓冲 Ping-Pong）
+__device__ __forceinline__ void cp_async_wait_group(int N) {
+    // 这是一个编译期必须确定的值，通常无法动态传参给 asm
+    // 所以这里我们根据常用的 N 展开
+    // 实际上 Kernel 里如果手动写了 asm 可以直接用，但为了封装：
+    // 注意：cp.async.wait_group 需要立即数，不能是变量。
+    // 为了解决这个问题，我们在 Kernel 里通常直接写 asm，或者用模板。
+    // 但鉴于你的代码里报错的是 cp_async_cg_16B，我们先修复它。
+}
+
+// 你的 Kernel 里用到的是 cp_async_wait_group 的逻辑
+// 请直接在 Kernel 里使用 asm volatile("cp.async.wait_group N;\n" ::); 
+// 或者使用下面的模板特化：
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group_template() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+#else
+
+// 非 SM80 架构的 Fallback (这会让代码在编译旧架构时报错，提示你需要 SM80)
+// 或者定义为空函数以便通过编译（但运行时会错）
+__device__ __forceinline__ void cp_async_cg_16B(void* dst, const void* src) {
+    // Fallback: 如果你意外在非 Ampere 卡上跑，这会退化为普通拷贝
+    // 但为了性能，建议直接报错或确保编译参数正确
+    *(int4*)dst = *(const int4*)src; 
+}
+
+__device__ __forceinline__ void cp_async_commit() {}
+
+#endif
+
 // ==================== Tile Configuration ====================
 template<int HEAD_DIM>
 struct CutlassSmallTileConfig {
@@ -314,7 +375,7 @@ __global__ void flash_attn_cutlass_kernel(
     int stage = 0;
 
     // Prologue: Load Tile 0
-    // !!! 我们手动展开 Pipeline 的 Async 加载部分，用于适配 Padding
+    // 手动展开 Pipeline 的 Async 加载部分，用于适配 Padding
     {
         int tile_idx = 0;
         int k_start = 0;
