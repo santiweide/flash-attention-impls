@@ -70,16 +70,16 @@ __global__ void flash_attn_cutlass_kernel(
      int batch_size,
      int num_heads,
      int seq_len,
-     // Explicit Strides to fix Memory Layout issues
-     int stride_b, // Batch Stride
-     int stride_h, // Head Stride
-     int stride_s  // Sequence Stride
+
+     int stride_b,
+     int stride_h,
+     int stride_s
 ) {
      using Config = CutlassSmallTileConfig<HEAD_DIM>;
      constexpr int kTileM = Config::kTileM;
      constexpr int kTileN = Config::kTileN;
      
-     // [FIX] Force 128-bit alignment for Dynamic Shared Memory
+     // Force 128-bit alignment for Dynamic Shared Memory
      extern __shared__ __align__(16) char smem[];
      
      const int tid = threadIdx.x;
@@ -198,7 +198,7 @@ __global__ void flash_attn_cutlass_kernel(
                      // 2. Stats Update
                      float m_prev = m_reg[row];
                      float m_curr = fmaxf(m_prev, row_max);
-                     float correction = expf(m_prev - m_curr);
+                     float correction = __expf(m_prev - m_curr);
                      row_corrections[row] = correction;
                      
                      float row_sum = 0.0f;
@@ -208,7 +208,7 @@ __global__ void flash_attn_cutlass_kernel(
                      for (int col = laneId; col < 16; col += 32) {
                          if (col < k_valid) {
                              float val = s_scratch[row * 16 + col] * softmax_scale;
-                             float p = expf(val - m_curr);
+                             float p = __expf(val - m_curr);
                              s_scratch[row * 16 + col] = p;
                              row_sum += p;
                          } else {
