@@ -38,17 +38,17 @@ __device__ __forceinline__ void apply_rescaling_in_frag(
     const float* corrections,
     int m_valid
 ) {
-    // 16x16 tile => 每行 16 个元素
-    // 这里假设 fragment 元素在 x[] 中按行顺序分组（与 row_major 对应），
-    // 这也是编译器和文档目前的实现方式。
+    using Frag = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+
     #pragma unroll
-    for (int i = 0; i < decltype(o_frag)::num_elements; ++i) {
-        int row = i / 16;   // 每 16 个元素是一行
+    for (int i = 0; i < Frag::num_elements; ++i) {
+        int row = i / 16;   // 假设 16 个元素一行（注意：这依赖于当前实现的布局）
         if (row < m_valid) {
             o_frag.x[i] *= corrections[row];
         }
     }
 }
+
 // ==================== Kernel ====================
 
 template<int HEAD_DIM>
