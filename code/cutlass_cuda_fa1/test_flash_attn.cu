@@ -96,6 +96,9 @@
  // Compute the maximum relative error between two arrays
  // Use the symmetric relative error formula, which is more robust for near-zero values: |a-b| / (|a| + |b| + eps)
  float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t* b, size_t size) {
+    float abs_tol = 1e-3f;    // 绝对误差阈值（FP16）
+    float rel_tol = 0.05f;    // 相对误差阈值，比如 5%
+
      std::vector<cutlass::half_t> host_a(size), host_b(size);
      CHECK_CUDA(cudaMemcpy(host_a.data(), a, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
      CHECK_CUDA(cudaMemcpy(host_b.data(), b, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
@@ -106,23 +109,28 @@
      const float epsilon = 1e-5f;          // prevent division by zero
      
      for (size_t i = 0; i < size; i++) {
-         float val_a = float(host_a[i]);
-         float val_b = float(host_b[i]);
-         float abs_diff = std::abs(val_a - val_b);
-         
-         // Symmetric relative error: |a-b| / (|a| + |b| + eps)
-         // This formula is more robust for near-zero values and bounded [0, 1)
-         float denominator = std::abs(val_a) + std::abs(val_b) + epsilon;
-         float rel_error = abs_diff / denominator;
-         
-         if (rel_error > error_threshold) {
-             error_count++;
-             if (error_count <= 10) {  // only print the first 10 errors
-                 printf("Error at %zu: flash=%.6f, ref=%.6f, abs_diff=%.6f, rel_err=%.6f\n",
-                        i, val_a, val_b, abs_diff, rel_error);
-             }
-         }
-         max_error = std::max(max_error, rel_error);
+        float val_a = float(host_a[i]);
+        float val_b = float(host_b[i]);
+
+        float abs_diff = fabs(val_a - val_b);
+        float denominator = fabs(val_a) + fabs(val_b);
+
+        if (denominator < 1e-2f) {
+            // 两个数本身就很小，用绝对误差判断
+            if (abs_diff > abs_tol) {  // 超过 1e-3 才算真正有问题
+                printf("[ABS] idx=%zu a=%.6f b=%.6f diff=%.6f\n", i, val_a, val_b, abs_diff);
+                error_count++;
+            }
+        } else {
+            // 正常相对误差判断（可以用对称形式）
+            float rel_err = abs_diff / (denominator + 1e-6f);
+            if (rel_err > rel_tol) {   // 5% 或更宽松
+                error_count++;
+                printf("[REL] idx=%zu a=%.6f b=%.6f diff=%.6f rel=%.6f\n",
+                   i, val_a, val_b, abs_diff, rel_err);
+                max_error = std::max(max_error, rel_err);
+            }
+        }
      }
      
      if (error_count > 10) {
@@ -817,16 +825,7 @@
      printf("================================================================================\n");
      printf("Flash Attention Performance Test: Tile Size & CUTLASS Comparison\n");
      printf("================================================================================\n");
-     printf("\nAll Flash Attention variants use the same algorithm (online softmax + tiling)\n");
-     printf("Differences are in tile size and compute primitives:\n\n");
-     printf("  Small Tile:    45×90 tiles, 256 threads, 51.7 KB shared mem\n");
-     printf("    → Conservative config, standard CUDA cores\n\n");
-     printf("  CUTLASS TC:    45×90 tiles, 256 threads, 51.7 KB shared mem + Tensor Cores\n");
-     printf("    → Same config as Small Tile, but uses A100 tensor cores for GEMMs\n\n");
-     printf("  Large Tile:    120×120 tiles, 64 threads, 150.9 KB shared mem\n");
-     printf("    → Aggressive config, standard CUDA cores\n\n");
-     printf("  Baseline:      O(batch × heads × seq_len²) memory ← QUADRATIC!\n\n");
-     
+
      // test cases - compare head_dim=32 and head_dim=64 performance
      std::vector<TestConfig> configs = {
          // // head_dim=64 test

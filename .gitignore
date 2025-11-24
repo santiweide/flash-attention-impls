@@ -11,3 +11,4 @@ hwj*
 test_flash_attn
 perf
 res
+code/cutlass_cuda_fa1/perf_flash_attn_cutlass
