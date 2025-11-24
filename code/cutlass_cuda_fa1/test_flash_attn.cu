@@ -105,9 +105,7 @@
      
      float max_error = 0.0f;
      int error_count = 0;
-     const float error_threshold = 0.01f;  // 1% relative error threshold
-     const float epsilon = 1e-5f;          // prevent division by zero
-     
+
      for (size_t i = 0; i < size; i++) {
         float val_a = float(host_a[i]);
         float val_b = float(host_b[i]);
@@ -839,6 +837,8 @@
          // {1, 1, 2048, 32},    // super long sequence - head_dim=32 can handle larger seq_len
          // {2, 8, 512, 32},     // multiple batch+multiple head - compare 64
          {1, 32, 8192, 128}, 
+        {16, 32, 8192, 64}, 
+
      };
      
      for (const auto& config : configs) {

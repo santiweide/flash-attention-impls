@@ -161,7 +161,7 @@ int main() {
     std::vector<TestConfig> configs = {
         {1, 32, 8192, 64},
         {1, 64, 8192, 64},
-        {32, 128, 8192, 64},
+        {16, 64, 8192, 64},
     };
     
     // Print header

@@ -35,17 +35,32 @@ struct CutlassSmallTileConfig {
 
 __device__ __forceinline__ void apply_rescaling_in_frag(
     wmma::fragment<wmma::accumulator, 16, 16, 16, float>& o_frag,
-    const float* corrections,
-    int m_valid
+    const float* corrections, // 每个线程都有完整的 corrections 数组(16个)
+    int m_valid,
+    int laneId
 ) {
-    using Frag = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
-
+    // === 核心映射逻辑 ===
+    // 这种映射适用于 Volta/Ampere/Hopper 架构的 FP32 Accumulator
+    // Thread 0-3  持有 Row 0 和 Row 8
+    // Thread 4-7  持有 Row 1 和 Row 9
+    // ...
+    // Thread 28-31 持有 Row 7 和 Row 15
+    
+    int row_group1 = laneId / 4;       // 范围 0-7
+    int row_group2 = row_group1 + 8;   // 范围 8-15
+    
+    // 处理前 4 个元素 (属于 row_group1)
+    float c1 = (row_group1 < m_valid) ? corrections[row_group1] : 1.0f;
     #pragma unroll
-    for (int i = 0; i < Frag::num_elements; ++i) {
-        int row = i / 16;   // 假设 16 个元素一行（注意：这依赖于当前实现的布局）
-        if (row < m_valid) {
-            o_frag.x[i] *= corrections[row];
-        }
+    for (int i = 0; i < 4; ++i) {
+        o_frag.x[i] *= c1;
+    }
+
+    // 处理后 4 个元素 (属于 row_group2)
+    float c2 = (row_group2 < m_valid) ? corrections[row_group2] : 1.0f;
+    #pragma unroll
+    for (int i = 4; i < 8; ++i) {
+        o_frag.x[i] *= c2;
     }
 }
 
@@ -104,9 +119,9 @@ __global__ void flash_attn_cutlass_kernel(
      half* smem_K = reinterpret_cast<half*>(smem + q_sz);
      half* smem_V = reinterpret_cast<half*>(smem + q_sz + k_sz);
      
-     // Scratch memory setup
-     float* s_scratch = reinterpret_cast<float*>(smem + q_sz + k_sz + v_sz + (warpId * 2304));
-     float* o_scratch = s_scratch + 256; 
+    // Scratch memory setup
+    size_t scratch_per_warp = 256 * sizeof(float) + 256 * sizeof(half); // 或者再紧一点
+    float* s_scratch = reinterpret_cast<float*>(smem + q_sz + k_sz + v_sz + warpId * scratch_per_warp);
 
      // ================= Load Q Tile (Cooperative) =================
      // Note: We use stride_s to jump between sequence rows
@@ -143,7 +158,6 @@ __global__ void flash_attn_cutlass_kernel(
          const int k_size = k_end - k_start;
          
          // 1. Load K and V (Cooperative)
-         __syncthreads(); 
          for (int idx = tid; idx < k_size * HEAD_DIM; idx += blockDim.x) {
              int r = idx / HEAD_DIM;
              int c = idx % HEAD_DIM;
@@ -222,7 +236,8 @@ __global__ void flash_attn_cutlass_kernel(
                  }
                  
                  // --- Step D: P @ V ---
-                 half* p_half_ptr = reinterpret_cast<half*>(o_scratch);
+                half*  p_half_ptr = 
+                    reinterpret_cast<half*>(reinterpret_cast<char*>(s_scratch) + 256 * sizeof(float));
                  for (int idx = laneId; idx < 16 * 16; idx += 32) {
                      p_half_ptr[idx] = (half)s_scratch[idx];
                  }
