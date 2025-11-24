@@ -2,852 +2,869 @@
  * Flash Attention Test Diff & Performance
  ******************************************************************************/
 
- #include <cuda_runtime.h>
- #include <cuda_fp16.h>
- #include <cutlass/cutlass.h>
- #include <cutlass/numeric_types.h>
- #include <iostream>
- #include <random>
- #include <cmath>
- #include <chrono>
- 
- // Declare Large Tile interface
- void flash_attention_forward_dispatch(
-     const cutlass::half_t* Q,
-     const cutlass::half_t* K,
-     const cutlass::half_t* V,
-     cutlass::half_t* O,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim,
-     cudaStream_t stream
- );
- 
- // Declare Small Tile interface
- void attention_reference_dispatch(
-     const cutlass::half_t* Q,
-     const cutlass::half_t* K,
-     const cutlass::half_t* V,
-     cutlass::half_t* O,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim,
-     cudaStream_t stream
- );
- 
- // Declare CUTLASS Tensor Core interface
- void flash_attention_cutlass_dispatch(
-     const cutlass::half_t* Q,
-     const cutlass::half_t* K,
-     const cutlass::half_t* V,
-     cutlass::half_t* O,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim,
-     cudaStream_t stream
- );
- 
- // Declare Baseline implementation (forward declaration, implemented later)
- void attention_baseline(
-     const cutlass::half_t* Q,
-     const cutlass::half_t* K,
-     const cutlass::half_t* V,
-     cutlass::half_t* O,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim,
-     cudaStream_t stream
- );
- 
- #define CHECK_CUDA(call) \
-     do { \
-         cudaError_t status = call; \
-         if (status != cudaSuccess) { \
-             fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
-                     cudaGetErrorString(status)); \
-             exit(1); \
-         } \
-     } while(0)
- 
- void init_random(cutlass::half_t* data, size_t size, float mean = 0.0f, float stddev = 0.02f) {
-     std::vector<float> host_data(size);
-     std::mt19937 gen(42);
-     std::normal_distribution<float> dist(mean, stddev);
-     
-     for (size_t i = 0; i < size; i++) {
-         host_data[i] = dist(gen);
-     }
-     
-     // convert to half and copy to device
-     std::vector<cutlass::half_t> host_data_half(size);
-     for (size_t i = 0; i < size; i++) {
-         host_data_half[i] = cutlass::half_t(host_data[i]);
-     }
-     
-     CHECK_CUDA(cudaMemcpy(data, host_data_half.data(), 
-                           size * sizeof(cutlass::half_t), 
-                           cudaMemcpyHostToDevice));
- }
- 
- // Compute the maximum relative error between two arrays
- // Use the symmetric relative error formula, which is more robust for near-zero values: |a-b| / (|a| + |b| + eps)
- float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t* b, size_t size) {
-    float abs_tol = 1e-3f;    // 绝对误差阈值（FP16）
-    float rel_tol = 0.05f;    // 相对误差阈值，比如 5%
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <iostream>
+#include <random>
+#include <cmath>
+#include <chrono>
+#include <vector>
 
-     std::vector<cutlass::half_t> host_a(size), host_b(size);
-     CHECK_CUDA(cudaMemcpy(host_a.data(), a, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
-     CHECK_CUDA(cudaMemcpy(host_b.data(), b, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
-     
-     float max_error = 0.0f;
-     int error_count = 0;
+// Declare Large Tile interface
+void flash_attention_forward_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
 
-     for (size_t i = 0; i < size; i++) {
-        float val_a = float(host_a[i]);
-        float val_b = float(host_b[i]);
+// Declare Small Tile interface
+void attention_reference_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
 
-        float abs_diff = fabs(val_a - val_b);
-        float denominator = fabs(val_a) + fabs(val_b);
+// Declare CUTLASS Tensor Core interface
+void flash_attention_cutlass_dispatch(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
 
-        if (denominator < 1e-2f) {
-            // 两个数本身就很小，用绝对误差判断
-            if (abs_diff > abs_tol) {  // 超过 1e-3 才算真正有问题
-                printf("[ABS] idx=%zu a=%.6f b=%.6f diff=%.6f\n", i, val_a, val_b, abs_diff);
-                error_count++;
+// Declare Baseline implementation (forward declaration, implemented later)
+void attention_baseline(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+);
+
+#define CHECK_CUDA(call) \
+    do { \
+        cudaError_t status = call; \
+        if (status != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+                    cudaGetErrorString(status)); \
+            exit(1); \
+        } \
+    } while(0)
+
+void init_random(cutlass::half_t* data, size_t size, float mean = 0.0f, float stddev = 0.02f) {
+    std::vector<float> host_data(size);
+    std::mt19937 gen(42);
+    std::normal_distribution<float> dist(mean, stddev);
+    
+    for (size_t i = 0; i < size; i++) {
+        host_data[i] = dist(gen);
+    }
+    
+    // convert to half and copy to device
+    std::vector<cutlass::half_t> host_data_half(size);
+    for (size_t i = 0; i < size; i++) {
+        host_data_half[i] = cutlass::half_t(host_data[i]);
+    }
+    
+    CHECK_CUDA(cudaMemcpy(data, host_data_half.data(), 
+                          size * sizeof(cutlass::half_t), 
+                          cudaMemcpyHostToDevice));
+}
+
+// Compute the maximum relative error between two arrays
+// Use the symmetric relative error formula, which is more robust for near-zero values: |a-b| / (|a| + |b| + eps)
+float compute_max_relative_error(const cutlass::half_t* a, const cutlass::half_t* b, size_t size) {
+   float abs_tol = 1e-3f;    // 绝对误差阈值（FP16）
+   float rel_tol = 0.05f;    // 相对误差阈值，比如 5%
+
+    std::vector<cutlass::half_t> host_a(size), host_b(size);
+    CHECK_CUDA(cudaMemcpy(host_a.data(), a, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(host_b.data(), b, size * sizeof(cutlass::half_t), cudaMemcpyDeviceToHost));
+    
+    float max_error = 0.0f;
+    int error_count = 0;
+
+    for (size_t i = 0; i < size; i++) {
+       float val_a = float(host_a[i]);
+       float val_b = float(host_b[i]);
+
+       float abs_diff = fabs(val_a - val_b);
+       float denominator = fabs(val_a) + fabs(val_b);
+
+       if (denominator < 1e-2f) {
+           // 两个数本身就很小，用绝对误差判断
+           if (abs_diff > abs_tol) {  // 超过 1e-3 才算真正有问题
+               printf("[ABS] idx=%zu a=%.6f b=%.6f diff=%.6f\n", i, val_a, val_b, abs_diff);
+               error_count++;
+           }
+       } else {
+           // 正常相对误差判断（可以用对称形式）
+           float rel_err = abs_diff / (denominator + 1e-6f);
+           if (rel_err > rel_tol) {   // 5% 或更宽松
+               error_count++;
+               printf("[REL] idx=%zu a=%.6f b=%.6f diff=%.6f rel=%.6f\n",
+                  i, val_a, val_b, abs_diff, rel_err);
+               max_error = std::max(max_error, rel_err);
+           }
+       }
+    }
+    
+    if (error_count > 10) {
+        printf("... and %d more errors\n", error_count - 10);
+    }
+    
+    return max_error;
+}
+
+// Benchmark function
+template<typename Func>
+float benchmark(Func func, int warmup = 5, int repeats = 20) {
+    for (int i = 0; i < warmup; i++) { // warmup
+        func();
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+    
+    // time measurement
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < repeats; i++) {
+        func();
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    std::chrono::duration<float, std::milli> duration = end - start;
+    return duration.count() / repeats;
+}
+
+
+struct TestConfig {
+    int batch_size;
+    int num_heads;
+    int seq_len;
+    int head_dim;
+    
+    size_t get_qkv_size() const {
+        return batch_size * num_heads * seq_len * head_dim;
+    }
+    
+    void print() const {
+        printf("Config: batch=%d, heads=%d, seqlen=%d, headdim=%d\n",
+               batch_size, num_heads, seq_len, head_dim);
+    }
+};
+
+/**
+ * 计算“真实算子 FLOPs”（近似）：
+ * - QK^T:  2 * B * H * S * S * D
+ * - PV:    2 * B * H * S * S * D
+ * - softmax: 约 6 FLOPs per score
+ *      - scale (mul)
+ *      - 减 max
+ *      - exp
+ *      - 累加 sum
+ *      - 归一化 (div / mul)
+ *      - 一些比较操作近似算进去
+ *
+ * 总计：
+ *   FLOPs_total ≈ 4 * B * H * S^2 * D + 6 * B * H * S^2
+ */
+double compute_attention_flops_real(const TestConfig& cfg) {
+    double B = cfg.batch_size;
+    double H = cfg.num_heads;
+    double S = cfg.seq_len;
+    double D = cfg.head_dim;
+
+    double flops_matmul = 4.0 * B * H * S * S * D;   // QK^T + PV
+    double flops_softmax = 6.0 * B * H * S * S;      // approximate
+    return flops_matmul + flops_softmax;
+}
+
+void run_test(const TestConfig& config) {
+    printf("\n");
+    config.print();
+    
+    const size_t qkv_size = config.get_qkv_size();
+    const size_t bytes = qkv_size * sizeof(cutlass::half_t);
+    
+    const size_t scores_buffer_size = (size_t)config.batch_size * config.num_heads * 
+                                      config.seq_len * config.seq_len * sizeof(float);
+    
+    printf("Memory per tensor: %.2f MB (Q/K/V/O)\n", bytes / 1024.0 / 1024.0);
+    printf("Baseline scores buffer: %.2f MB (batch×heads×seq²×4bytes)\n", 
+           scores_buffer_size / 1024.0 / 1024.0);
+    printf("Total memory: %.2f MB (+ 1 MB for CUTLASS output)\n", 
+           (bytes * 4 + scores_buffer_size) / 1024.0 / 1024.0);
+    
+    cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline, *d_O_cutlass;
+    CHECK_CUDA(cudaMalloc(&d_Q, bytes));
+    CHECK_CUDA(cudaMalloc(&d_K, bytes));
+    CHECK_CUDA(cudaMalloc(&d_V, bytes));
+    CHECK_CUDA(cudaMalloc(&d_O_flash, bytes));
+    CHECK_CUDA(cudaMalloc(&d_O_ref, bytes));
+    CHECK_CUDA(cudaMalloc(&d_O_baseline, bytes));
+    CHECK_CUDA(cudaMalloc(&d_O_cutlass, bytes));
+    
+   //  printf("Initializing inputs...\n");
+    init_random(d_Q, qkv_size);
+    init_random(d_K, qkv_size);
+    init_random(d_V, qkv_size);
+    
+   //  printf("Running Baseline (Naive, no shared mem, no online softmax)...\n");
+    float time_baseline = benchmark([&]() {
+        attention_baseline(
+            d_Q, d_K, d_V, d_O_baseline,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
+    });
+    
+   //  printf("Running Flash Attention (Small Tile: conservative config)...\n");
+    float time_ref = benchmark([&]() {
+        attention_reference_dispatch(
+            d_Q, d_K, d_V, d_O_ref,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
+    });
+    
+   //  printf("Running Flash Attention (Large Tile: aggressive config)...\n");
+    float time_flash = benchmark([&]() {
+        flash_attention_forward_dispatch(
+            d_Q, d_K, d_V, d_O_flash,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
+    });
+    
+   //  printf("Running Flash Attention (CUTLASS Tensor Core: same tile as Small)...\n");
+    float time_cutlass = benchmark([&]() {
+        flash_attention_cutlass_dispatch(
+            d_Q, d_K, d_V, d_O_cutlass,
+            config.batch_size, config.num_heads, config.seq_len, config.head_dim,
+            0
+        );
+    });
+    
+   //  printf("\nVerifying correctness...\n");
+   //  printf("Comparing Large Tile vs Small Tile:\n");
+    float error_flash_vs_ref = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
+    
+   //  printf("\nComparing CUTLASS vs Small Tile:\n");
+    float error_cutlass_vs_ref = compute_max_relative_error(d_O_cutlass, d_O_ref, qkv_size);
+    
+   //  printf("\nComparing Baseline vs Small Tile:\n");
+    float error_baseline_vs_ref = compute_max_relative_error(d_O_baseline, d_O_ref, qkv_size);
+    
+   //  printf("\nComparing Large Tile vs Baseline:\n");
+    float error_flash_vs_baseline = compute_max_relative_error(d_O_flash, d_O_baseline, qkv_size);
+    
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Performance Results:\n");
+    printf("================================================================================\n");
+    printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Baseline (Naive):", time_baseline, 1.0f);
+    printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Flash Attn (Small Tile):", time_ref, time_baseline / time_ref);
+    printf("%-35s %10.3f ms  (%.2fx vs baseline, %.2fx vs Small)\n", 
+           "Flash Attn (CUTLASS Tensor Core):", time_cutlass, time_baseline / time_cutlass, time_ref / time_cutlass);
+    printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
+           "Flash Attn (Large Tile):", time_flash, time_baseline / time_flash);
+    
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Accuracy Results (symmetric relative error):\n");
+    printf("================================================================================\n");
+    printf("Large Tile vs Small Tile:  %.6f\n", error_flash_vs_ref);
+    printf("CUTLASS vs Small Tile:     %.6f\n", error_cutlass_vs_ref);
+    printf("Baseline vs Small Tile:    %.6f\n", error_baseline_vs_ref);
+    printf("Large Tile vs Baseline:    %.6f\n", error_flash_vs_baseline);
+    
+    // check if passed (1-2% error in FP16 is acceptable)
+    const float error_threshold = 0.02f;  // 2% 误差阈值
+    bool test_passed = (error_flash_vs_ref < error_threshold) && 
+                       (error_cutlass_vs_ref < error_threshold);
+    
+    if (test_passed) {
+        printf("\n✅ TEST PASSED (All implementations agree within %.1f%%)\n", error_threshold * 100);
+    } else {
+        printf("\n❌ TEST FAILED (Some implementations differ by >= %.1f%%)\n", error_threshold * 100);
+    }
+    
+    // ==== 新的 FLOPs 统计：matmul + softmax 统算 ====
+    double flops_total = compute_attention_flops_real(config);  // 单位：浮点运算数
+    double gflops_total = flops_total / 1e9;                    // GFLOPs
+    
+    // TFLOPs/s
+    double tflops_baseline = flops_total / (time_baseline * 1e-3) / 1e12;
+    double tflops_ref      = flops_total / (time_ref      * 1e-3) / 1e12;
+    double tflops_cutlass  = flops_total / (time_cutlass  * 1e-3) / 1e12;
+    double tflops_flash    = flops_total / (time_flash    * 1e-3) / 1e12;
+    
+    // compute memory bandwidth utilization (rough estimate)
+    // read Q, K, V + write O = 4 * bytes （这里不算 baseline 的 scores buffer，为了对比公平）
+    const size_t memory_ops = 4 * qkv_size * sizeof(cutlass::half_t);
+    const float bandwidth_cutlass = memory_ops / (time_cutlass * 1e-3f) / 1e9f;  // GB/s
+    const float bandwidth_flash   = memory_ops / (time_flash   * 1e-3f) / 1e9f;  // GB/s
+    
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Throughput (Including Matmul + Softmax Approx FLOPs):\n");
+    printf("================================================================================\n");
+    printf("Approx Total FLOPs:           %.2f GFLOPs (%.2f million ops)\n", gflops_total, gflops_total * 1000.0);
+    printf("Baseline (Naive):              %.2f TFLOPs/s\n", tflops_baseline);
+    printf("Flash Attn (Small Tile):       %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
+    printf("Flash Attn (CUTLASS TC):       %.2f TFLOPs/s (%.2fx vs baseline, %.2fx vs Small)\n", 
+           tflops_cutlass, tflops_cutlass / tflops_baseline, tflops_cutlass / tflops_ref);
+    printf("Flash Attn (Large Tile):       %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
+    printf("\nMemory Bandwidth (Q/K/V/O only):\n");
+    printf("Flash Attn (CUTLASS TC):       %.2f GB/s\n", bandwidth_cutlass);
+    printf("Flash Attn (Large Tile):       %.2f GB/s\n", bandwidth_flash);
+    printf("A100 HBM peak:                 ~1555 GB/s\n");
+    printf("\nNote: FLOPs now include QK^T + PV + approx softmax cost.\n");
+    printf("      Values are more representative than counting only matmuls.\n");
+    
+    // clean up
+    CHECK_CUDA(cudaFree(d_Q));
+    CHECK_CUDA(cudaFree(d_K));
+    CHECK_CUDA(cudaFree(d_V));
+    CHECK_CUDA(cudaFree(d_O_flash));
+    CHECK_CUDA(cudaFree(d_O_ref));
+    CHECK_CUDA(cudaFree(d_O_baseline));
+    CHECK_CUDA(cudaFree(d_O_cutlass));
+}
+
+// ==================== Reference Implementation (Tiled version, head_dim=32 optimized) ====================
+
+// Tile sizes for head_dim=32 (use moderate tiles to stay within shared memory limit)
+constexpr int kRefTileM_32 = 24;  // Query tile size (1.5x larger than dim64's 16)
+constexpr int kRefTileN_32 = 48;  // Key/Value tile size (1.5x larger than dim64's 32)
+constexpr int kRefHeadDim_32 = 32;
+
+__global__ void attention_reference_kernel_dim32(
+    const cutlass::half_t* __restrict__ Q,
+    const cutlass::half_t* __restrict__ K,
+    const cutlass::half_t* __restrict__ V,
+    cutlass::half_t* __restrict__ O,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim
+) {
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    const int q_start = q_block_idx * kRefTileM_32;
+    const int q_end = min(q_start + kRefTileM_32, seq_len);
+    const int q_size = q_end - q_start;
+    
+    if (q_size <= 0) return;
+    
+    const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
+    const cutlass::half_t* Q_ptr = Q + offset;
+    const cutlass::half_t* K_ptr = K + offset;
+    const cutlass::half_t* V_ptr = V + offset;
+    cutlass::half_t* O_ptr = O + offset;
+    
+    extern __shared__ char smem[];
+    cutlass::half_t* Q_tile = (cutlass::half_t*)smem;
+    cutlass::half_t* K_tile = Q_tile + kRefTileM_32 * kRefHeadDim_32;
+    cutlass::half_t* V_tile = K_tile + kRefTileN_32 * kRefHeadDim_32;
+    float* S_tile = (float*)(V_tile + kRefTileN_32 * kRefHeadDim_32);
+    
+    float* m_shared = S_tile + kRefTileM_32 * kRefTileN_32;
+    float* l_shared = m_shared + kRefTileM_32;
+    float* O_accum = l_shared + kRefTileM_32;
+    
+    // Load Q tile
+    for (int idx = tid; idx < q_size * head_dim; idx += blockDim.x) {
+        int i = idx / head_dim;
+        int j = idx % head_dim;
+        Q_tile[i * kRefHeadDim_32 + j] = Q_ptr[(q_start + i) * head_dim + j];
+    }
+    
+    for (int i = tid; i < kRefTileM_32; i += blockDim.x) {
+        m_shared[i] = -INFINITY;
+        l_shared[i] = 0.0f;
+    }
+    for (int i = tid; i < kRefTileM_32 * kRefHeadDim_32; i += blockDim.x) {
+        O_accum[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    const int num_kv_tiles = (seq_len + kRefTileN_32 - 1) / kRefTileN_32;
+    
+    for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
+        const int k_start = kv_tile_idx * kRefTileN_32;
+        const int k_end = min(k_start + kRefTileN_32, seq_len);
+        const int k_size = k_end - k_start;
+        
+        for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
+            int i = idx / head_dim;
+            int j = idx % head_dim;
+            K_tile[i * kRefHeadDim_32 + j] = K_ptr[(k_start + i) * head_dim + j];
+            V_tile[i * kRefHeadDim_32 + j] = V_ptr[(k_start + i) * head_dim + j];
+        }
+        __syncthreads();
+        
+        for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+            int i = idx / k_size;
+            int j = idx % k_size;
+            
+            float sum = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < head_dim; d++) {
+                sum += float(Q_tile[i * kRefHeadDim_32 + d]) * float(K_tile[j * kRefHeadDim_32 + d]);
             }
-        } else {
-            // 正常相对误差判断（可以用对称形式）
-            float rel_err = abs_diff / (denominator + 1e-6f);
-            if (rel_err > rel_tol) {   // 5% 或更宽松
-                error_count++;
-                printf("[REL] idx=%zu a=%.6f b=%.6f diff=%.6f rel=%.6f\n",
-                   i, val_a, val_b, abs_diff, rel_err);
-                max_error = std::max(max_error, rel_err);
+            S_tile[i * kRefTileN_32 + j] = sum * softmax_scale;
+        }
+        __syncthreads();
+        
+        for (int i = 0; i < q_size; i++) {
+            if (tid == 0) {
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, S_tile[i * kRefTileN_32 + j]);
+                }
+                
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    float p = expf(S_tile[i * kRefTileN_32 + j] - m_new);
+                    S_tile[i * kRefTileN_32 + j] = p;
+                    l_new += p;
+                }
+                
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                for (int d = 0; d < head_dim; d++) {
+                    O_accum[i * kRefHeadDim_32 + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
             }
         }
-     }
-     
-     if (error_count > 10) {
-         printf("... and %d more errors\n", error_count - 10);
-     }
-     
-     return max_error;
- }
- 
- // Benchmark function
- template<typename Func>
- float benchmark(Func func, int warmup = 5, int repeats = 20) {
-     for (int i = 0; i < warmup; i++) { // warmup
-         func();
-     }
-     CHECK_CUDA(cudaDeviceSynchronize());
-     
-     // time measurement
-     auto start = std::chrono::high_resolution_clock::now();
-     for (int i = 0; i < repeats; i++) {
-         func();
-     }
-     CHECK_CUDA(cudaDeviceSynchronize());
-     auto end = std::chrono::high_resolution_clock::now();
-     
-     std::chrono::duration<float, std::milli> duration = end - start;
-     return duration.count() / repeats;
- }
- 
- 
- struct TestConfig {
-     int batch_size;
-     int num_heads;
-     int seq_len;
-     int head_dim;
-     
-     size_t get_qkv_size() const {
-         return batch_size * num_heads * seq_len * head_dim;
-     }
-     
-     void print() const {
-         printf("Config: batch=%d, heads=%d, seqlen=%d, headdim=%d\n",
-                batch_size, num_heads, seq_len, head_dim);
-     }
- };
- 
- void run_test(const TestConfig& config) {
-     printf("\n");
-     config.print();
-     
-     const size_t qkv_size = config.get_qkv_size();
-     const size_t bytes = qkv_size * sizeof(cutlass::half_t);
-     
-     const size_t scores_buffer_size = (size_t)config.batch_size * config.num_heads * 
-                                       config.seq_len * config.seq_len * sizeof(float);
-     
-     printf("Memory per tensor: %.2f MB (Q/K/V/O)\n", bytes / 1024.0 / 1024.0);
-     printf("Baseline scores buffer: %.2f MB (batch×heads×seq²×4bytes)\n", 
-            scores_buffer_size / 1024.0 / 1024.0);
-     printf("Total memory: %.2f MB (+ 1 MB for CUTLASS output)\n", 
-            (bytes * 4 + scores_buffer_size) / 1024.0 / 1024.0);
-     
-     cutlass::half_t *d_Q, *d_K, *d_V, *d_O_flash, *d_O_ref, *d_O_baseline, *d_O_cutlass;
-     CHECK_CUDA(cudaMalloc(&d_Q, bytes));
-     CHECK_CUDA(cudaMalloc(&d_K, bytes));
-     CHECK_CUDA(cudaMalloc(&d_V, bytes));
-     CHECK_CUDA(cudaMalloc(&d_O_flash, bytes));
-     CHECK_CUDA(cudaMalloc(&d_O_ref, bytes));
-     CHECK_CUDA(cudaMalloc(&d_O_baseline, bytes));
-     CHECK_CUDA(cudaMalloc(&d_O_cutlass, bytes));
-     
-    //  printf("Initializing inputs...\n");
-     init_random(d_Q, qkv_size);
-     init_random(d_K, qkv_size);
-     init_random(d_V, qkv_size);
-     
-    //  printf("Running Baseline (Naive, no shared mem, no online softmax)...\n");
-     float time_baseline = benchmark([&]() {
-         attention_baseline(
-             d_Q, d_K, d_V, d_O_baseline,
-             config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-             0
-         );
-     });
-     
-    //  printf("Running Flash Attention (Small Tile: conservative config)...\n");
-     float time_ref = benchmark([&]() {
-         attention_reference_dispatch(
-             d_Q, d_K, d_V, d_O_ref,
-             config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-             0
-         );
-     });
-     
-    //  printf("Running Flash Attention (Large Tile: aggressive config)...\n");
-     float time_flash = benchmark([&]() {
-         flash_attention_forward_dispatch(
-             d_Q, d_K, d_V, d_O_flash,
-             config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-             0
-         );
-     });
-     
-    //  printf("Running Flash Attention (CUTLASS Tensor Core: same tile as Small)...\n");
-     float time_cutlass = benchmark([&]() {
-         flash_attention_cutlass_dispatch(
-             d_Q, d_K, d_V, d_O_cutlass,
-             config.batch_size, config.num_heads, config.seq_len, config.head_dim,
-             0
-         );
-     });
-     
-    //  printf("\nVerifying correctness...\n");
-    //  printf("Comparing Large Tile vs Small Tile:\n");
-     float error_flash_vs_ref = compute_max_relative_error(d_O_flash, d_O_ref, qkv_size);
-     
-    //  printf("\nComparing CUTLASS vs Small Tile:\n");
-     float error_cutlass_vs_ref = compute_max_relative_error(d_O_cutlass, d_O_ref, qkv_size);
-     
-    //  printf("\nComparing Baseline vs Small Tile:\n");
-     float error_baseline_vs_ref = compute_max_relative_error(d_O_baseline, d_O_ref, qkv_size);
-     
-    //  printf("\nComparing Large Tile vs Baseline:\n");
-     float error_flash_vs_baseline = compute_max_relative_error(d_O_flash, d_O_baseline, qkv_size);
-     
-     printf("\n");
-     printf("================================================================================\n");
-     printf("Performance Results:\n");
-     printf("================================================================================\n");
-     printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
-            "Baseline (Naive):", time_baseline, 1.0f);
-     printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
-            "Flash Attn (Small Tile):", time_ref, time_baseline / time_ref);
-     printf("%-35s %10.3f ms  (%.2fx vs baseline, %.2fx vs Small)\n", 
-            "Flash Attn (CUTLASS Tensor Core):", time_cutlass, time_baseline / time_cutlass, time_ref / time_cutlass);
-     printf("%-35s %10.3f ms  (%.2fx vs baseline)\n", 
-            "Flash Attn (Large Tile):", time_flash, time_baseline / time_flash);
-     
-     printf("\n");
-     printf("================================================================================\n");
-     printf("Accuracy Results (symmetric relative error):\n");
-     printf("================================================================================\n");
-     printf("Large Tile vs Small Tile:  %.6f\n", error_flash_vs_ref);
-     printf("CUTLASS vs Small Tile:     %.6f\n", error_cutlass_vs_ref);
-     printf("Baseline vs Small Tile:    %.6f\n", error_baseline_vs_ref);
-     printf("Large Tile vs Baseline:    %.6f\n", error_flash_vs_baseline);
-     
-     // check if passed (1-2% error in FP16 is acceptable)
-     const float error_threshold = 0.02f;  // 2% 误差阈值
-     bool test_passed = (error_flash_vs_ref < error_threshold) && 
-                        (error_cutlass_vs_ref < error_threshold);
-     
-     if (test_passed) {
-         printf("\n✅ TEST PASSED (All implementations agree within %.1f%%)\n", error_threshold * 100);
-     } else {
-         printf("\n❌ TEST FAILED (Some implementations differ by >= %.1f%%)\n", error_threshold * 100);
-     }
-     
-     // compute FLOPs and memory bandwidth
-     const int64_t flops = 4LL * config.batch_size * config.num_heads * 
-                           config.seq_len * config.seq_len * config.head_dim;
-     const float gflops = flops / 1e9;  // GFLOPs
-     const float tflops_baseline = flops / (time_baseline * 1e-3) / 1e12;
-     const float tflops_ref = flops / (time_ref * 1e-3) / 1e12;
-     const float tflops_cutlass = flops / (time_cutlass * 1e-3) / 1e12;
-     const float tflops_flash = flops / (time_flash * 1e-3) / 1e12;
-     
-     // compute memory bandwidth utilization (rough estimate)
-     // read Q, K, V + write O = 4 * bytes
-     const size_t memory_ops = 4 * qkv_size * sizeof(cutlass::half_t);
-     const float bandwidth_cutlass = memory_ops / (time_cutlass * 1e-3) / 1e9;  // GB/s
-     const float bandwidth_flash = memory_ops / (time_flash * 1e-3) / 1e9;  // GB/s
-     
-     printf("\n");
-     printf("================================================================================\n");
-     printf("Throughput:\n");
-     printf("================================================================================\n");
-     printf("Total FLOPs:                   %.2f GFLOPs (%.2f million ops)\n", gflops, gflops * 1000);
-     printf("Baseline (Naive):              %.2f TFLOPs/s\n", tflops_baseline);
-     printf("Flash Attn (Small Tile):       %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_ref, tflops_ref / tflops_baseline);
-     printf("Flash Attn (CUTLASS TC):       %.2f TFLOPs/s (%.2fx vs baseline, %.2fx vs Small)\n", 
-            tflops_cutlass, tflops_cutlass / tflops_baseline, tflops_cutlass / tflops_ref);
-     printf("Flash Attn (Large Tile):       %.2f TFLOPs/s (%.2fx vs baseline)\n", tflops_flash, tflops_flash / tflops_baseline);
-     printf("\nMemory Bandwidth:\n");
-     printf("Flash Attn (CUTLASS TC):       %.2f GB/s\n", bandwidth_cutlass);
-     printf("Flash Attn (Large Tile):       %.2f GB/s\n", bandwidth_flash);
-     printf("A100 HBM peak:                 ~1555 GB/s\n");
-     printf("\nNote: Attention is memory-bound. CUTLASS tensor cores help but limited by bandwidth.\n");
-     printf("      To see higher TFLOPs, use larger batch sizes or longer sequences.\n");
-     
-     // clean up
-     CHECK_CUDA(cudaFree(d_Q));
-     CHECK_CUDA(cudaFree(d_K));
-     CHECK_CUDA(cudaFree(d_V));
-     CHECK_CUDA(cudaFree(d_O_flash));
-     CHECK_CUDA(cudaFree(d_O_ref));
-     CHECK_CUDA(cudaFree(d_O_baseline));
-     CHECK_CUDA(cudaFree(d_O_cutlass));
- }
- 
- // ==================== Reference Implementation (Tiled version, head_dim=32 optimized) ====================
- 
- // Tile sizes for head_dim=32 (use moderate tiles to stay within shared memory limit)
- constexpr int kRefTileM_32 = 24;  // Query tile size (1.5x larger than dim64's 16)
- constexpr int kRefTileN_32 = 48;  // Key/Value tile size (1.5x larger than dim64's 32)
- constexpr int kRefHeadDim_32 = 32;
- 
- __global__ void attention_reference_kernel_dim32(
-     const cutlass::half_t* __restrict__ Q,
-     const cutlass::half_t* __restrict__ K,
-     const cutlass::half_t* __restrict__ V,
-     cutlass::half_t* __restrict__ O,
-     float softmax_scale,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim
- ) {
-     const int batch_idx = blockIdx.z;
-     const int head_idx = blockIdx.y;
-     const int q_block_idx = blockIdx.x;
-     const int tid = threadIdx.x;
-     
-     const int q_start = q_block_idx * kRefTileM_32;
-     const int q_end = min(q_start + kRefTileM_32, seq_len);
-     const int q_size = q_end - q_start;
-     
-     if (q_size <= 0) return;
-     
-     const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
-     const cutlass::half_t* Q_ptr = Q + offset;
-     const cutlass::half_t* K_ptr = K + offset;
-     const cutlass::half_t* V_ptr = V + offset;
-     cutlass::half_t* O_ptr = O + offset;
-     
-     extern __shared__ char smem[];
-     cutlass::half_t* Q_tile = (cutlass::half_t*)smem;
-     cutlass::half_t* K_tile = Q_tile + kRefTileM_32 * kRefHeadDim_32;
-     cutlass::half_t* V_tile = K_tile + kRefTileN_32 * kRefHeadDim_32;
-     float* S_tile = (float*)(V_tile + kRefTileN_32 * kRefHeadDim_32);
-     
-     float* m_shared = S_tile + kRefTileM_32 * kRefTileN_32;
-     float* l_shared = m_shared + kRefTileM_32;
-     float* O_accum = l_shared + kRefTileM_32;
-     
-     // Load Q tile
-     for (int idx = tid; idx < q_size * head_dim; idx += blockDim.x) {
-         int i = idx / head_dim;
-         int j = idx % head_dim;
-         Q_tile[i * kRefHeadDim_32 + j] = Q_ptr[(q_start + i) * head_dim + j];
-     }
-     
-     for (int i = tid; i < kRefTileM_32; i += blockDim.x) {
-         m_shared[i] = -INFINITY;
-         l_shared[i] = 0.0f;
-     }
-     for (int i = tid; i < kRefTileM_32 * kRefHeadDim_32; i += blockDim.x) {
-         O_accum[i] = 0.0f;
-     }
-     __syncthreads();
-     
-     const int num_kv_tiles = (seq_len + kRefTileN_32 - 1) / kRefTileN_32;
-     
-     for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
-         const int k_start = kv_tile_idx * kRefTileN_32;
-         const int k_end = min(k_start + kRefTileN_32, seq_len);
-         const int k_size = k_end - k_start;
-         
-         for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
-             int i = idx / head_dim;
-             int j = idx % head_dim;
-             K_tile[i * kRefHeadDim_32 + j] = K_ptr[(k_start + i) * head_dim + j];
-             V_tile[i * kRefHeadDim_32 + j] = V_ptr[(k_start + i) * head_dim + j];
-         }
-         __syncthreads();
-         
-         for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
-             int i = idx / k_size;
-             int j = idx % k_size;
-             
-             float sum = 0.0f;
-             #pragma unroll
-             for (int d = 0; d < head_dim; d++) {
-                 sum += float(Q_tile[i * kRefHeadDim_32 + d]) * float(K_tile[j * kRefHeadDim_32 + d]);
-             }
-             S_tile[i * kRefTileN_32 + j] = sum * softmax_scale;
-         }
-         __syncthreads();
-         
-         for (int i = 0; i < q_size; i++) {
-             if (tid == 0) {
-                 float m_old = m_shared[i];
-                 float l_old = l_shared[i];
-                 
-                 float m_new = m_old;
-                 for (int j = 0; j < k_size; j++) {
-                     m_new = fmaxf(m_new, S_tile[i * kRefTileN_32 + j]);
-                 }
-                 
-                 float l_new = 0.0f;
-                 for (int j = 0; j < k_size; j++) {
-                     float p = expf(S_tile[i * kRefTileN_32 + j] - m_new);
-                     S_tile[i * kRefTileN_32 + j] = p;
-                     l_new += p;
-                 }
-                 
-                 float correction = expf(m_old - m_new);
-                 l_new = correction * l_old + l_new;
-                 
-                 for (int d = 0; d < head_dim; d++) {
-                     O_accum[i * kRefHeadDim_32 + d] *= correction;
-                 }
-                 
-                 m_shared[i] = m_new;
-                 l_shared[i] = l_new;
-             }
-         }
-         __syncthreads();
-         
-         for (int i = 0; i < q_size; i++) {
-             for (int d = tid; d < head_dim; d += blockDim.x) {
-                 float sum = 0.0f;
-                 #pragma unroll 8
-                 for (int j = 0; j < k_size; j++) {
-                     sum += S_tile[i * kRefTileN_32 + j] * float(V_tile[j * kRefHeadDim_32 + d]);
-                 }
-                 O_accum[i * kRefHeadDim_32 + d] += sum;
-             }
-         }
-         __syncthreads();
-     }
-     
-     for (int i = 0; i < q_size; i++) {
-         float scale = 1.0f / l_shared[i];
-         for (int d = tid; d < head_dim; d += blockDim.x) {
-             float val = O_accum[i * kRefHeadDim_32 + d] * scale;
-             O_ptr[(q_start + i) * head_dim + d] = cutlass::half_t(val);
-         }
-     }
- }
- 
- void attention_reference_dim32(
-     const cutlass::half_t* Q,
-     const cutlass::half_t* K,
-     const cutlass::half_t* V,
-     cutlass::half_t* O,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim,
-     cudaStream_t stream
- ) {
-     assert(head_dim == kRefHeadDim_32 && "This reference expects head_dim=32");
-     
-     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-     
-     const int num_q_blocks = (seq_len + kRefTileM_32 - 1) / kRefTileM_32;
-     dim3 grid(num_q_blocks, num_heads, batch_size);
-     dim3 block(128);
-     
-     size_t smem_size = (kRefTileM_32 * kRefHeadDim_32 + kRefTileN_32 * kRefHeadDim_32 * 2) * sizeof(cutlass::half_t) +
-                        (kRefTileM_32 * kRefTileN_32) * sizeof(float) +
-                        (kRefTileM_32 * 2) * sizeof(float) +
-                        (kRefTileM_32 * kRefHeadDim_32) * sizeof(float);
-     
-     if (smem_size > 48 * 1024) {
-         cudaFuncSetAttribute(
-             attention_reference_kernel_dim32,
-             cudaFuncAttributeMaxDynamicSharedMemorySize,
-             smem_size
-         );
-     }
-     
-     attention_reference_kernel_dim32<<<grid, block, smem_size, stream>>>(
-         Q, K, V, O,
-         softmax_scale,
-         batch_size, num_heads, seq_len, head_dim
-     );
-     
-     cudaError_t err = cudaGetLastError();
-     if (err != cudaSuccess) {
-         fprintf(stderr, "Reference (dim32) kernel launch failed: %s\n", 
-                 cudaGetErrorString(err));
-     }
- }
- 
- // ==================== Baseline Implementation (Naive version, no shared memory and online softmax) ====================
- 
- /**
- * Simplest Attention implementation, for performance and accuracy comparison
-  * 
-  * Features:
-  * - No shared memory (only global memory)
-  * - No online softmax (standard two-pass scan)
-  * - Each thread processes one query position
-  * - Allocate global memory to store attention scores
-  * 
-  * This is the most straightforward implementation, but the worst performance, many HBM access
-  */
- __global__ void attention_baseline_kernel(
-     const cutlass::half_t* __restrict__ Q,
-     const cutlass::half_t* __restrict__ K,
-     const cutlass::half_t* __restrict__ V,
-     cutlass::half_t* __restrict__ O,
-     float* __restrict__ scores_buffer,  // global memory: [batch, heads, seq, seq]
-     float softmax_scale,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim
- ) {
-     // each thread processes one query position
-     const int batch_idx = blockIdx.z;
-     const int head_idx = blockIdx.y;
-     const int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
-     
-     if (q_idx >= seq_len) return;
-     
-     const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
-     const cutlass::half_t* Q_ptr = Q + offset;
-     const cutlass::half_t* K_ptr = K + offset;
-     const cutlass::half_t* V_ptr = V + offset;
-     cutlass::half_t* O_ptr = O + offset;
-     
-     // calculate the position of this query in the scores buffer
-     const int64_t scores_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_idx) * seq_len;
-     float* my_scores = scores_buffer + scores_offset;
-     
-     // Step 1: calculate S = Q[q_idx] @ K^T (store in global memory)
-     for (int k_idx = 0; k_idx < seq_len; k_idx++) {
-         float sum = 0.0f;
-         for (int d = 0; d < head_dim; d++) {
-             float q_val = float(Q_ptr[q_idx * head_dim + d]);
-             float k_val = float(K_ptr[k_idx * head_dim + d]);
-             sum += q_val * k_val;
-         }
-         my_scores[k_idx] = sum * softmax_scale;
-     }
-     
-     // Step 2: Softmax - first pass: find max
-     float max_score = -INFINITY;
-     for (int i = 0; i < seq_len; i++) {
-         max_score = fmaxf(max_score, my_scores[i]);
-     }
-     
-     // Step 3: Softmax - second pass: calculate exp and sum
-     float sum_exp = 0.0f;
-     for (int i = 0; i < seq_len; i++) {
-         my_scores[i] = expf(my_scores[i] - max_score);
-         sum_exp += my_scores[i];
-     }
-     
-     // Step 4: Softmax - normalization
-     for (int i = 0; i < seq_len; i++) {
-         my_scores[i] /= sum_exp;
-     }
-     
-     // Step 5: calculate O = softmax(S) @ V
-     for (int d = 0; d < head_dim; d++) {
-         float sum = 0.0f;
-         for (int k_idx = 0; k_idx < seq_len; k_idx++) {
-             float v_val = float(V_ptr[k_idx * head_dim + d]);
-             sum += my_scores[k_idx] * v_val;
-         }
-         O_ptr[q_idx * head_dim + d] = cutlass::half_t(sum);
-     }
- }
- 
- void attention_baseline(
-     const cutlass::half_t* Q,
-     const cutlass::half_t* K,
-     const cutlass::half_t* V,
-     cutlass::half_t* O,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim,
-     cudaStream_t stream
- ) {
-     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-     
-     const int threads = 256;
-     const int blocks_x = (seq_len + threads - 1) / threads;
-     dim3 grid(blocks_x, num_heads, batch_size);
-     dim3 block(threads);
-     
-     size_t scores_size = (size_t)batch_size * num_heads * seq_len * seq_len * sizeof(float);
-     float* d_scores_buffer;
-     CHECK_CUDA(cudaMalloc(&d_scores_buffer, scores_size));
-     attention_baseline_kernel<<<grid, block, 0, stream>>>(
-         Q, K, V, O,
-         d_scores_buffer,
-         softmax_scale,
-         batch_size, num_heads, seq_len, head_dim
-     );
-     
-     cudaError_t err = cudaGetLastError();
-     if (err != cudaSuccess) {
-         fprintf(stderr, "Baseline kernel launch failed: %s\n", cudaGetErrorString(err));
-     }
-     
-     CHECK_CUDA(cudaStreamSynchronize(stream));
-     CHECK_CUDA(cudaFree(d_scores_buffer));
- }
- 
- // ==================== Reference Implementation (Tiled version) ====================
- 
- /**
-  * Standard Attention implementation: O = softmax(Q @ K^T / sqrt(d)) @ V
-  * 
-  * Use tiled approach to efficiently use shared memory
-  * Each block processes multiple query positions, using online softmax
-  * 
-  * This only stores tiles instead of the entire sequence, greatly reducing shared memory usage
-  */
- 
- // Tile sizes for reference implementation
- constexpr int kRefTileM = 16;  // Query tile size
- constexpr int kRefTileN = 32;  // Key/Value tile size
- constexpr int kRefHeadDim = 64;
- 
- __global__ void attention_reference_kernel(
-     const cutlass::half_t* __restrict__ Q,
-     const cutlass::half_t* __restrict__ K,
-     const cutlass::half_t* __restrict__ V,
-     cutlass::half_t* __restrict__ O,
-     float softmax_scale,
-     int batch_size,
-     int num_heads,
-     int seq_len,
-     int head_dim
- ) {
-     // Each block processes kRefTileM queries
-     const int batch_idx = blockIdx.z;
-     const int head_idx = blockIdx.y;
-     const int q_block_idx = blockIdx.x;
-     const int tid = threadIdx.x;
-     
-     const int q_start = q_block_idx * kRefTileM;
-     const int q_end = min(q_start + kRefTileM, seq_len);
-     const int q_size = q_end - q_start;
-     
-     if (q_size <= 0) return;
-     
-     const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
-     const cutlass::half_t* Q_ptr = Q + offset;
-     const cutlass::half_t* K_ptr = K + offset;
-     const cutlass::half_t* V_ptr = V + offset;
-     cutlass::half_t* O_ptr = O + offset;
-     
-     // Shared memory layout:
-     // - Q_tile: [kRefTileM, kRefHeadDim]
-     // - K_tile: [kRefTileN, kRefHeadDim]
-     // - V_tile: [kRefTileN, kRefHeadDim]
-     // - S_tile: [kRefTileM, kRefTileN] (scores)
-     extern __shared__ char smem[];
-     cutlass::half_t* Q_tile = (cutlass::half_t*)smem;
-     cutlass::half_t* K_tile = Q_tile + kRefTileM * kRefHeadDim;
-     cutlass::half_t* V_tile = K_tile + kRefTileN * kRefHeadDim;
-     float* S_tile = (float*)(V_tile + kRefTileN * kRefHeadDim);
-     
-     // Per-query statistics and accumulator (in shared memory)
-     float* m_shared = S_tile + kRefTileM * kRefTileN;
-     float* l_shared = m_shared + kRefTileM;
-     float* O_accum = l_shared + kRefTileM;  // [kRefTileM, kRefHeadDim]
-     
-     // Load Q tile
-     for (int idx = tid; idx < q_size * head_dim; idx += blockDim.x) {
-         int i = idx / head_dim;
-         int j = idx % head_dim;
-         Q_tile[i * kRefHeadDim + j] = Q_ptr[(q_start + i) * head_dim + j];
-     }
-     
-     // Initialize statistics and output accumulator
-     for (int i = tid; i < kRefTileM; i += blockDim.x) {
-         m_shared[i] = -INFINITY;
-         l_shared[i] = 0.0f;
-     }
-     for (int i = tid; i < kRefTileM * kRefHeadDim; i += blockDim.x) {
-         O_accum[i] = 0.0f;
-     }
-     __syncthreads();
-     
-     // Iterate over K/V tiles
-     const int num_kv_tiles = (seq_len + kRefTileN - 1) / kRefTileN;
-     
-     for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
-         const int k_start = kv_tile_idx * kRefTileN;
-         const int k_end = min(k_start + kRefTileN, seq_len);
-         const int k_size = k_end - k_start;
-         
-         // Load K tile
-         for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
-             int i = idx / head_dim;
-             int j = idx % head_dim;
-             K_tile[i * kRefHeadDim + j] = K_ptr[(k_start + i) * head_dim + j];
-         }
-         
-         // Load V tile
-         for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
-             int i = idx / head_dim;
-             int j = idx % head_dim;
-             V_tile[i * kRefHeadDim + j] = V_ptr[(k_start + i) * head_dim + j];
-         }
-         __syncthreads();
-         
-         // Compute S = Q @ K^T for this tile
-         for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
-             int i = idx / k_size;  // query index in tile
-             int j = idx % k_size;  // key index in tile
-             
-             float sum = 0.0f;
-             for (int d = 0; d < head_dim; d++) {
-                 sum += float(Q_tile[i * kRefHeadDim + d]) * float(K_tile[j * kRefHeadDim + d]);
-             }
-             S_tile[i * kRefTileN + j] = sum * softmax_scale;
-         }
-         __syncthreads();
-         
-         // Online softmax update for each query
-         for (int i = 0; i < q_size; i++) {
-             if (tid == 0) {
-                 float m_old = m_shared[i];
-                 float l_old = l_shared[i];
-                 
-                 // Find new max
-                 float m_new = m_old;
-                 for (int j = 0; j < k_size; j++) {
-                     m_new = fmaxf(m_new, S_tile[i * kRefTileN + j]);
-                 }
-                 
-                 // Compute exp and new sum
-                 float l_new = 0.0f;
-                 for (int j = 0; j < k_size; j++) {
-                     float p = expf(S_tile[i * kRefTileN + j] - m_new);
-                     S_tile[i * kRefTileN + j] = p;  // Store P values
-                     l_new += p;
-                 }
-                 
-                 // Correction factor for old accumulator
-                 float correction = expf(m_old - m_new);
-                 l_new = correction * l_old + l_new;
-                 
-                 // Apply correction to accumulator
-                 for (int d = 0; d < head_dim; d++) {
-                     O_accum[i * kRefHeadDim + d] *= correction;
-                 }
-                 
-                 m_shared[i] = m_new;
-                 l_shared[i] = l_new;
-             }
-         }
-         __syncthreads();
-         
-         // Accumulate O += P @ V
-         for (int i = 0; i < q_size; i++) {
-             for (int d = tid; d < head_dim; d += blockDim.x) {
-                 float sum = 0.0f;
-                 for (int j = 0; j < k_size; j++) {
-                     sum += S_tile[i * kRefTileN + j] * float(V_tile[j * kRefHeadDim + d]);
-                 }
-                 O_accum[i * kRefHeadDim + d] += sum;
-             }
-         }
-         __syncthreads();
-     }
-     
-     // Final normalization and write back
-     for (int i = 0; i < q_size; i++) {
-         float scale = 1.0f / l_shared[i];
-         for (int d = tid; d < head_dim; d += blockDim.x) {
-             float val = O_accum[i * kRefHeadDim + d] * scale;
-             O_ptr[(q_start + i) * head_dim + d] = cutlass::half_t(val);
-         }
-     }
- }
- 
- int main() {
-     printf("Flash Attention Minimal Implementation Test\n");
-     printf("================================================================================\n");
-     
-     // GPU信息
-     int device;
-     CHECK_CUDA(cudaGetDevice(&device));
-     cudaDeviceProp prop;
-     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
-     printf("GPU: %s\n", prop.name);
-     printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
-     printf("================================================================================\n");
-     
-     printf("\n");
-     printf("================================================================================\n");
-     printf("Flash Attention Performance Test: Tile Size & CUTLASS Comparison\n");
-     printf("================================================================================\n");
+        __syncthreads();
+        
+        for (int i = 0; i < q_size; i++) {
+            for (int d = tid; d < head_dim; d += blockDim.x) {
+                float sum = 0.0f;
+                #pragma unroll 8
+                for (int j = 0; j < k_size; j++) {
+                    sum += S_tile[i * kRefTileN_32 + j] * float(V_tile[j * kRefHeadDim_32 + d]);
+                }
+                O_accum[i * kRefHeadDim_32 + d] += sum;
+            }
+        }
+        __syncthreads();
+    }
+    
+    for (int i = 0; i < q_size; i++) {
+        float scale = 1.0f / l_shared[i];
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = O_accum[i * kRefHeadDim_32 + d] * scale;
+            O_ptr[(q_start + i) * head_dim + d] = cutlass::half_t(val);
+        }
+    }
+}
 
-     // test cases - compare head_dim=32 and head_dim=64 performance
-     std::vector<TestConfig> configs = {
-         // // head_dim=64 test
-         // {1, 1, 512, 64},     // baseline
-         // {1, 1, 1024, 64},    // long sequence
-         // {2, 8, 512, 64},     // multiple batch+multiple head
-         
-         // // head_dim=32 test (optimized version, larger tiles)
-         // {1, 1, 512, 32},     // baseline - compare 64
-         // {1, 1, 1024, 32},    // long sequence - compare 64
-         // {1, 1, 2048, 32},    // super long sequence - head_dim=32 can handle larger seq_len
-         // {2, 8, 512, 32},     // multiple batch+multiple head - compare 64
-         {1, 32, 8192, 128}, 
-        {16, 32, 8192, 64}, 
+void attention_reference_dim32(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+) {
+    assert(head_dim == kRefHeadDim_32 && "This reference expects head_dim=32");
+    
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    
+    const int num_q_blocks = (seq_len + kRefTileM_32 - 1) / kRefTileM_32;
+    dim3 grid(num_q_blocks, num_heads, batch_size);
+    dim3 block(128);
+    
+    size_t smem_size = (kRefTileM_32 * kRefHeadDim_32 + kRefTileN_32 * kRefHeadDim_32 * 2) * sizeof(cutlass::half_t) +
+                       (kRefTileM_32 * kRefTileN_32) * sizeof(float) +
+                       (kRefTileM_32 * 2) * sizeof(float) +
+                       (kRefTileM_32 * kRefHeadDim_32) * sizeof(float);
+    
+    if (smem_size > 48 * 1024) {
+        cudaFuncSetAttribute(
+            attention_reference_kernel_dim32,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size
+        );
+    }
+    
+    attention_reference_kernel_dim32<<<grid, block, smem_size, stream>>>(
+        Q, K, V, O,
+        softmax_scale,
+        batch_size, num_heads, seq_len, head_dim
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Reference (dim32) kernel launch failed: %s\n", 
+                cudaGetErrorString(err));
+    }
+}
 
-     };
-     
-     for (const auto& config : configs) {
-         run_test(config);
-     }
-     
-     printf("\n");
-     printf("================================================================================\n");
-     printf("All tests completed!\n");
-     
-     return 0;
- }
+// ==================== Baseline Implementation (Naive version, no shared memory and online softmax) ====================
+
+/**
+* Simplest Attention implementation, for performance and accuracy comparison
+ * 
+ * Features:
+ * - No shared memory (only global memory)
+ * - No online softmax (standard two-pass scan)
+ * - Each thread processes one query position
+ * - Allocate global memory to store attention scores
+ * 
+ * This is the most straightforward implementation, but the worst performance, many HBM access
+ */
+__global__ void attention_baseline_kernel(
+    const cutlass::half_t* __restrict__ Q,
+    const cutlass::half_t* __restrict__ K,
+    const cutlass::half_t* __restrict__ V,
+    cutlass::half_t* __restrict__ O,
+    float* __restrict__ scores_buffer,  // global memory: [batch, heads, seq, seq]
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim
+) {
+    // each thread processes one query position
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (q_idx >= seq_len) return;
+    
+    const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
+    const cutlass::half_t* Q_ptr = Q + offset;
+    const cutlass::half_t* K_ptr = K + offset;
+    const cutlass::half_t* V_ptr = V + offset;
+    cutlass::half_t* O_ptr = O + offset;
+    
+    // calculate the position of this query in the scores buffer
+    const int64_t scores_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_idx) * seq_len;
+    float* my_scores = scores_buffer + scores_offset;
+    
+    // Step 1: calculate S = Q[q_idx] @ K^T (store in global memory)
+    for (int k_idx = 0; k_idx < seq_len; k_idx++) {
+        float sum = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            float q_val = float(Q_ptr[q_idx * head_dim + d]);
+            float k_val = float(K_ptr[k_idx * head_dim + d]);
+            sum += q_val * k_val;
+        }
+        my_scores[k_idx] = sum * softmax_scale;
+    }
+    
+    // Step 2: Softmax - first pass: find max
+    float max_score = -INFINITY;
+    for (int i = 0; i < seq_len; i++) {
+        max_score = fmaxf(max_score, my_scores[i]);
+    }
+    
+    // Step 3: Softmax - second pass: calculate exp and sum
+    float sum_exp = 0.0f;
+    for (int i = 0; i < seq_len; i++) {
+        my_scores[i] = expf(my_scores[i] - max_score);
+        sum_exp += my_scores[i];
+    }
+    
+    // Step 4: Softmax - normalization
+    for (int i = 0; i < seq_len; i++) {
+        my_scores[i] /= sum_exp;
+    }
+    
+    // Step 5: calculate O = softmax(S) @ V
+    for (int d = 0; d < head_dim; d++) {
+        float sum = 0.0f;
+        for (int k_idx = 0; k_idx < seq_len; k_idx++) {
+            float v_val = float(V_ptr[k_idx * head_dim + d]);
+            sum += my_scores[k_idx] * v_val;
+        }
+        O_ptr[q_idx * head_dim + d] = cutlass::half_t(sum);
+    }
+}
+
+void attention_baseline(
+    const cutlass::half_t* Q,
+    const cutlass::half_t* K,
+    const cutlass::half_t* V,
+    cutlass::half_t* O,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    cudaStream_t stream
+) {
+    float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    
+    const int threads = 256;
+    const int blocks_x = (seq_len + threads - 1) / threads;
+    dim3 grid(blocks_x, num_heads, batch_size);
+    dim3 block(threads);
+    
+    size_t scores_size = (size_t)batch_size * num_heads * seq_len * seq_len * sizeof(float);
+    float* d_scores_buffer;
+    CHECK_CUDA(cudaMalloc(&d_scores_buffer, scores_size));
+    attention_baseline_kernel<<<grid, block, 0, stream>>>(
+        Q, K, V, O,
+        d_scores_buffer,
+        softmax_scale,
+        batch_size, num_heads, seq_len, head_dim
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Baseline kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+    
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    CHECK_CUDA(cudaFree(d_scores_buffer));
+}
+
+// ==================== Reference Implementation (Tiled version) ====================
+
+/**
+ * Standard Attention implementation: O = softmax(Q @ K^T / sqrt(d)) @ V
+ * 
+ * Use tiled approach to efficiently use shared memory
+ * Each block processes multiple query positions, using online softmax
+ * 
+ * This only stores tiles instead of the entire sequence, greatly reducing shared memory usage
+ */
+
+// Tile sizes for reference implementation
+constexpr int kRefTileM = 16;  // Query tile size
+constexpr int kRefTileN = 32;  // Key/Value tile size
+constexpr int kRefHeadDim = 64;
+
+__global__ void attention_reference_kernel(
+    const cutlass::half_t* __restrict__ Q,
+    const cutlass::half_t* __restrict__ K,
+    const cutlass::half_t* __restrict__ V,
+    cutlass::half_t* __restrict__ O,
+    float softmax_scale,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim
+) {
+    // Each block processes kRefTileM queries
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int q_block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    const int q_start = q_block_idx * kRefTileM;
+    const int q_end = min(q_start + kRefTileM, seq_len);
+    const int q_size = q_end - q_start;
+    
+    if (q_size <= 0) return;
+    
+    const int64_t offset = (batch_idx * num_heads + head_idx) * seq_len * head_dim;
+    const cutlass::half_t* Q_ptr = Q + offset;
+    const cutlass::half_t* K_ptr = K + offset;
+    const cutlass::half_t* V_ptr = V + offset;
+    cutlass::half_t* O_ptr = O + offset;
+    
+    // Shared memory layout:
+    // - Q_tile: [kRefTileM, kRefHeadDim]
+    // - K_tile: [kRefTileN, kRefHeadDim]
+    // - V_tile: [kRefTileN, kRefHeadDim]
+    // - S_tile: [kRefTileM, kRefTileN] (scores)
+    extern __shared__ char smem[];
+    cutlass::half_t* Q_tile = (cutlass::half_t*)smem;
+    cutlass::half_t* K_tile = Q_tile + kRefTileM * kRefHeadDim;
+    cutlass::half_t* V_tile = K_tile + kRefTileN * kRefHeadDim;
+    float* S_tile = (float*)(V_tile + kRefTileN * kRefHeadDim);
+    
+    // Per-query statistics and accumulator (in shared memory)
+    float* m_shared = S_tile + kRefTileM * kRefTileN;
+    float* l_shared = m_shared + kRefTileM;
+    float* O_accum = l_shared + kRefTileM;  // [kRefTileM, kRefHeadDim]
+    
+    // Load Q tile
+    for (int idx = tid; idx < q_size * head_dim; idx += blockDim.x) {
+        int i = idx / head_dim;
+        int j = idx % head_dim;
+        Q_tile[i * kRefHeadDim + j] = Q_ptr[(q_start + i) * head_dim + j];
+    }
+    
+    // Initialize statistics and output accumulator
+    for (int i = tid; i < kRefTileM; i += blockDim.x) {
+        m_shared[i] = -INFINITY;
+        l_shared[i] = 0.0f;
+    }
+    for (int i = tid; i < kRefTileM * kRefHeadDim; i += blockDim.x) {
+        O_accum[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Iterate over K/V tiles
+    const int num_kv_tiles = (seq_len + kRefTileN - 1) / kRefTileN;
+    
+    for (int kv_tile_idx = 0; kv_tile_idx < num_kv_tiles; kv_tile_idx++) {
+        const int k_start = kv_tile_idx * kRefTileN;
+        const int k_end = min(k_start + kRefTileN, seq_len);
+        const int k_size = k_end - k_start;
+        
+        // Load K tile
+        for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
+            int i = idx / head_dim;
+            int j = idx % head_dim;
+            K_tile[i * kRefHeadDim + j] = K_ptr[(k_start + i) * head_dim + j];
+        }
+        
+        // Load V tile
+        for (int idx = tid; idx < k_size * head_dim; idx += blockDim.x) {
+            int i = idx / head_dim;
+            int j = idx % head_dim;
+            V_tile[i * kRefHeadDim + j] = V_ptr[(k_start + i) * head_dim + j];
+        }
+        __syncthreads();
+        
+        // Compute S = Q @ K^T for this tile
+        for (int idx = tid; idx < q_size * k_size; idx += blockDim.x) {
+            int i = idx / k_size;  // query index in tile
+            int j = idx % k_size;  // key index in tile
+            
+            float sum = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                sum += float(Q_tile[i * kRefHeadDim + d]) * float(K_tile[j * kRefHeadDim + d]);
+            }
+            S_tile[i * kRefTileN + j] = sum * softmax_scale;
+        }
+        __syncthreads();
+        
+        // Online softmax update for each query
+        for (int i = 0; i < q_size; i++) {
+            if (tid == 0) {
+                float m_old = m_shared[i];
+                float l_old = l_shared[i];
+                
+                // Find new max
+                float m_new = m_old;
+                for (int j = 0; j < k_size; j++) {
+                    m_new = fmaxf(m_new, S_tile[i * kRefTileN + j]);
+                }
+                
+                // Compute exp and new sum
+                float l_new = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    float p = expf(S_tile[i * kRefTileN + j] - m_new);
+                    S_tile[i * kRefTileN + j] = p;  // Store P values
+                    l_new += p;
+                }
+                
+                // Correction factor for old accumulator
+                float correction = expf(m_old - m_new);
+                l_new = correction * l_old + l_new;
+                
+                // Apply correction to accumulator
+                for (int d = 0; d < head_dim; d++) {
+                    O_accum[i * kRefHeadDim + d] *= correction;
+                }
+                
+                m_shared[i] = m_new;
+                l_shared[i] = l_new;
+            }
+        }
+        __syncthreads();
+        
+        // Accumulate O += P @ V
+        for (int i = 0; i < q_size; i++) {
+            for (int d = tid; d < head_dim; d += blockDim.x) {
+                float sum = 0.0f;
+                for (int j = 0; j < k_size; j++) {
+                    sum += S_tile[i * kRefTileN + j] * float(V_tile[j * kRefHeadDim + d]);
+                }
+                O_accum[i * kRefHeadDim + d] += sum;
+            }
+        }
+        __syncthreads();
+    }
+    
+    // Final normalization and write back
+    for (int i = 0; i < q_size; i++) {
+        float scale = 1.0f / l_shared[i];
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = O_accum[i * kRefHeadDim + d] * scale;
+            O_ptr[(q_start + i) * head_dim + d] = cutlass::half_t(val);
+        }
+    }
+}
+
+int main() {
+    printf("Flash Attention Minimal Implementation Test\n");
+    printf("================================================================================\n");
+    
+    // GPU信息
+    int device;
+    CHECK_CUDA(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+    printf("GPU: %s\n", prop.name);
+    printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
+    printf("================================================================================\n");
+    
+    printf("\n");
+    printf("================================================================================\n");
+    printf("Flash Attention Performance Test: Tile Size & CUTLASS Comparison\n");
+    printf("================================================================================\n");
+
+    // test cases
+    std::vector<TestConfig> configs = {
+        {1, 32, 8192, 128},
+        {16, 32, 8192, 64},
+    };
+    
+    for (const auto& config : configs) {
+        run_test(config);
+    }
+    
+    printf("\n");
+    printf("================================================================================\n");
+    printf("All tests completed!\n");
+    
+    return 0;
+}
