@@ -215,7 +215,7 @@ __global__ void flash_attn_cutlass_kernel(
                  }
                  __syncwarp();
                  
-                 // --- Step C: Rescale O in register ---
+                 // --- Step C: Rescale O in register---
                 #pragma unroll
                  for (int f = 0; f < MAX_FRAGS; f++) {
                      apply_rescaling_in_frag(O_accums[f], row_corrections, m_valid);
