@@ -33,31 +33,22 @@ struct CutlassSmallTileConfig {
     }
 };
 
-__device__ __forceinline__ void apply_rescaling_via_smem(
+__device__ __forceinline__ void apply_rescaling_in_frag(
     wmma::fragment<wmma::accumulator, 16, 16, 16, float>& o_frag,
-    float* scratch_ptr,
     const float* corrections,
-    int m_valid,
-    int laneId
+    int m_valid
 ) {
-    // 1. Dump Fragment to Shared Mem
-    wmma::store_matrix_sync(scratch_ptr, o_frag, 16, wmma::mem_row_major);
-    __syncwarp();
-
-    // 2. Apply correction factor to each row
+    // 16x16 tile => 每行 16 个元素
+    // 这里假设 fragment 元素在 x[] 中按行顺序分组（与 row_major 对应），
+    // 这也是编译器和文档目前的实现方式。
     #pragma unroll
-    for (int i = laneId; i < 256; i += 32) {
-        int row = i / 16;
+    for (int i = 0; i < decltype(o_frag)::num_elements; ++i) {
+        int row = i / 16;   // 每 16 个元素是一行
         if (row < m_valid) {
-            scratch_ptr[i] *= corrections[row];
+            o_frag.x[i] *= corrections[row];
         }
     }
-    __syncwarp();
-
-    // 3. Load back to Fragment
-    wmma::load_matrix_sync(o_frag, scratch_ptr, 16, wmma::mem_row_major);
 }
-
 // ==================== Kernel ====================
 
 template<int HEAD_DIM>
@@ -224,9 +215,10 @@ __global__ void flash_attn_cutlass_kernel(
                  }
                  __syncwarp();
                  
-                 // --- Step C: Rescale O ---
-                 for(int f = 0; f < MAX_FRAGS; f++) {
-                     apply_rescaling_via_smem(O_accums[f], o_scratch, row_corrections, m_valid, laneId);
+                 // --- Step C: Rescale O in register ---
+                #pragma unroll
+                 for (int f = 0; f < MAX_FRAGS; f++) {
+                     apply_rescaling_in_frag(O_accums[f], row_corrections, m_valid);
                  }
                  
                  // --- Step D: P @ V ---
