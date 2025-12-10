@@ -56,10 +56,15 @@ struct TestConfig {
     // Calculate total flops for forward pass
     // Q@K^T: batch * num_heads * seq_len * seq_len * head_dim * 2
     // P@V:   batch * num_heads * seq_len * seq_len * head_dim * 2
-    // Total: batch * num_heads * seq_len * seq_len * head_dim * 4
+    // Softmax: ~6 FLOPs per score (scale, subtract max, exp, sum, normalize, etc.)
+    //   Total: batch * num_heads * seq_len * seq_len * 6
+    // Total: batch * num_heads * seq_len * seq_len * head_dim * 4 + 
+    //        batch * num_heads * seq_len * seq_len * 6
     long long flops() const {
         long long seq_ops = (long long)seq_len * seq_len;
-        return (long long)batch_size * num_heads * seq_ops * head_dim * 4;
+        long long flops_matmul = (long long)batch_size * num_heads * seq_ops * head_dim * 4;
+        long long flops_softmax = (long long)batch_size * num_heads * seq_ops * 6;
+        return flops_matmul + flops_softmax;
     }
     
     // Memory traffic (bytes)
